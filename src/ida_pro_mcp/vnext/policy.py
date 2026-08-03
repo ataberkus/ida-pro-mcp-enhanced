@@ -167,6 +167,7 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
     registry.register(
         ToolPolicy(
             name="mutation_commit",
+            scopes=frozenset({SafetyScope.MODIFY}),
             read_only=False,
             destructive=True,
             idempotent=False,
@@ -176,6 +177,7 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
     registry.register(
         ToolPolicy(
             name="mutation_rollback",
+            scopes=frozenset({SafetyScope.MODIFY}),
             read_only=False,
             destructive=True,
             idempotent=False,

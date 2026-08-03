@@ -7,6 +7,10 @@ debugger, and Python scopes remain opt-in. Legacy tools remain registered for
 migrated configurations and the `legacy` profile, but new installations do not
 advertise them.
 
+The in-IDA page at `http://127.0.0.1:13337/config.html` provides Read only,
+Annotate, and Modify quick profile buttons. Modify enables IDB mutation scopes;
+filesystem, debugger, and Python scopes remain disabled until explicitly enabled.
+
 ## Safety and transport
 
 Safety is expressed as scopes: `read`, `annotate`, `modify`, `filesystem`,

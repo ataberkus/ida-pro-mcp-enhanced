@@ -305,6 +305,9 @@ debugger, and Python scopes remain explicit opt-ins. Existing GUI selections
 retain their effective access and legacy aliases for the compatibility release.
 Bundled profiles are in [`profiles/`](profiles/): `canonical`, `annotate`,
 `modify`, `debug`, `python`, and `legacy`.
+For a live database, `http://127.0.0.1:13337/config.html` also provides Read only,
+Annotate, and Modify quick buttons. Modify enables IDB mutation scopes without
+enabling filesystem, debugger, or Python access.
 
 All IDB writes use `mutation_preview` followed by `mutation_commit`. A preview
 is tied to the active database revision and expires; GUI edits or automation

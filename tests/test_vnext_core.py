@@ -19,6 +19,11 @@ from ida_pro_mcp.vnext.contracts import (
 from ida_pro_mcp.vnext.investigations import InvestigationManager
 from ida_pro_mcp.vnext.jobs import JobManager
 from ida_pro_mcp.vnext.policy import CANONICAL_TOOLS, ToolPolicyRegistry, register_builtin_policies
+from ida_pro_mcp.vnext.profiles import (
+    DEFAULT_PROFILE_SCOPES,
+    default_profile_enabled,
+    quick_profile_selection,
+)
 from ida_pro_mcp.vnext.transactions import RevisionTracker, TransactionManager
 
 
@@ -46,6 +51,50 @@ def test_policy_enforces_scopes_and_emits_annotations():
     assert registry.get("patch").annotations()["destructiveHint"] is True
     assert registry.visible("list_funcs") is False
     assert registry.visible("list_funcs", legacy=True) is True
+
+
+def test_quick_profiles_bound_tools_and_scopes():
+    registry = ToolPolicyRegistry()
+    register_builtin_policies(registry)
+    tools = {
+        "decompile": object(),
+        "investigation_add_finding": object(),
+        "patch": object(),
+        "idb_save": object(),
+        "debug_state": object(),
+        "python_execute": object(),
+        "mutation_commit": object(),
+        "rename": object(),
+    }
+
+    read_tools, read_scopes = quick_profile_selection(" READ ", tools, registry)
+    assert read_scopes == set()
+    assert read_tools["decompile"] is True
+    assert read_tools["investigation_add_finding"] is False
+    assert read_tools["patch"] is False
+    assert read_tools["idb_save"] is False
+    assert read_tools["debug_state"] is False
+    assert read_tools["python_execute"] is False
+    assert read_tools["mutation_commit"] is False
+    assert read_tools["rename"] is False  # legacy tools are never quick-profile enabled
+
+    annotate_tools, annotate_scopes = quick_profile_selection(
+        "annotate", tools, registry
+    )
+    assert annotate_scopes == {SafetyScope.ANNOTATE}
+    assert annotate_tools["investigation_add_finding"] is True
+    assert annotate_tools["patch"] is False
+
+    modify_tools, modify_scopes = quick_profile_selection("modify", tools, registry)
+    assert modify_scopes == set(DEFAULT_PROFILE_SCOPES - {SafetyScope.READ})
+    assert modify_tools["mutation_commit"] is True
+    assert modify_tools["idb_save"] is False
+    assert modify_tools["debug_state"] is False
+    assert modify_tools["python_execute"] is False
+    assert default_profile_enabled("mutation_commit", registry) is True
+
+    with pytest.raises(ValueError, match="Choose read, annotate, or modify"):
+        quick_profile_selection("unknown", tools, registry)
 
 
 def test_remote_auth_fails_closed_and_loopback_remains_frictionless():

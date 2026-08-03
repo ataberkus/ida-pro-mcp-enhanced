@@ -56,6 +56,6 @@ def test_readonly_profile_hides_commit_debug_and_python_tools():
     rpc.configure_tool_policy(scopes={"read"}, legacy_tools=False)
     names = {tool["name"] for tool in call_rpc(rpc.MCP_SERVER, "tools/list")["tools"]}
     assert "mutation_preview" in names
-    assert "mutation_commit" in names  # commit performs operation-level scope validation
+    assert "mutation_commit" not in names
     assert "debug_session" not in names
     assert "python_execute" not in names

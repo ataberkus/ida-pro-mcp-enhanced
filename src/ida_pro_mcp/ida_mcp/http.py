@@ -19,7 +19,10 @@ from .rpc import (
     get_cached_output,
 )
 from ida_pro_mcp.vnext.contracts import SafetyScope
-from ida_pro_mcp.vnext.policy import CANONICAL_TOOLS
+from ida_pro_mcp.vnext.profiles import (
+    default_profile_enabled,
+    quick_profile_selection,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -64,7 +67,7 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     is_new_install = stored_tools is None
     enabled_tools = (
         {
-            name: _default_profile_enabled(name)
+            name: default_profile_enabled(name, MCP_POLICY)
             for name in original_tools
         }
         if is_new_install
@@ -117,16 +120,6 @@ def _configure_scopes(
 DEFAULT_CORS_POLICY = "local"
 # The enhanced checkout opts into IDB annotation and modification by default.
 # Filesystem, debugger, and Python scopes remain explicit opt-ins.
-DEFAULT_PROFILE_SCOPES = frozenset(
-    {SafetyScope.READ, SafetyScope.ANNOTATE, SafetyScope.MODIFY}
-)
-
-
-def _default_profile_enabled(name: str) -> bool:
-    policy = MCP_POLICY.get(name)
-    return name in CANONICAL_TOOLS and policy.scopes <= DEFAULT_PROFILE_SCOPES
-
-
 def get_cors_policy(port: int) -> str:
     """Retrieve the current CORS policy from configuration."""
     match config_json_get("cors_policy", DEFAULT_CORS_POLICY):
@@ -377,6 +370,20 @@ input[type="submit"]:hover {
   opacity: 0.9;
 }
 
+button.profile {
+  margin: 0.25rem 0.35rem 0.25rem 0;
+  padding: 0.45rem 0.8rem;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+button.profile:hover {
+  opacity: 0.9;
+}
+
 .tooltip {
   border-bottom: 1px dotted var(--text);
 }
@@ -433,6 +440,16 @@ input[type="submit"]:hover {
             '<a href="/profile.txt" download>Export as --profile file</a>'
             "</p>"
         )
+        body += (
+            "<h3>Quick profile</h3>"
+            '<p style="font-size: 0.9rem; margin: 0.5rem 0;">'
+            "Apply a bounded profile immediately. Modify enables IDB annotation and "
+            "mutation tools; filesystem, debugger, and Python scopes remain disabled."
+            "</p>"
+            "<button class='profile' type='submit' name='quick_profile' value='read'>Read only</button>"
+            "<button class='profile' type='submit' name='quick_profile' value='annotate'>Annotate</button>"
+            "<button class='profile' type='submit' name='quick_profile' value='modify'>Modify</button>"
+        )
         body += quick_select
         for name, func in ORIGINAL_TOOLS.items():
             description = (
@@ -479,7 +496,16 @@ input[type="submit"]:hover {
         self.update_cors_policy()
 
         # Update the server's tools
-        if "apply_profile" in postvars:
+        quick_profile = postvars.get("quick_profile", [None])[0]
+        if quick_profile:
+            try:
+                enabled_tools, explicit_scopes = quick_profile_selection(
+                    quick_profile, ORIGINAL_TOOLS, MCP_POLICY
+                )
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+        elif "apply_profile" in postvars:
             profile_text = postvars.get("profile_text", [""])[0]
             whitelist = parse_profile(profile_text)
             explicit_scopes = parse_profile_scopes(profile_text)
