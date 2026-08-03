@@ -27,16 +27,45 @@ Instead of forcing an agent through hundreds of tiny read calls, vNext combines 
 
 ## Install
 
-Clone the private repository and install the plugin plus Codex stdio configuration from the checkout:
+Clone the private repository, create the bridge environment, and install the IDA plugin plus global Codex stdio configuration:
 
 ```powershell
 git clone https://github.com/ataberkus/ida-pro-mcp-enhanced.git
 cd ida-pro-mcp-enhanced
-uv sync
-uv run ida-pro-mcp --install codex --scope global --transport stdio
+uv sync --all-groups
+uv run --no-sync ida-pro-mcp --install codex --scope global --transport stdio
 ```
 
-Completely restart IDA and the MCP client after installation.
+`--no-sync` is intentional: installation only copies the already-synchronized checkout and avoids replacing a bridge executable that Windows may have open. Completely restart IDA and Codex after installation.
+
+Verify the global client entry:
+
+```powershell
+codex mcp get ida-pro-mcp
+```
+
+The expected transport is `stdio`, with the command and bridge path pointing into this checkout.
+
+### Update an existing installation
+
+Fully quit Codex and other MCP clients before synchronizing so Windows releases the bridge executable:
+
+```powershell
+cd path\to\ida-pro-mcp-enhanced
+git pull --ff-only
+uv sync --all-groups
+uv run --no-sync ida-pro-mcp --install codex --scope global --transport stdio
+```
+
+Then restart IDA and Codex. Running the installer again safely refreshes the loader, plugin package, vNext support package, and Codex configuration.
+
+If `uv` reports `failed to remove ... Scripts/ida-pro-mcp.exe: Access denied`, a Codex/bridge process still has the executable open. Either fully quit Codex before rerunning `uv sync`, or refresh the plugin immediately without environment synchronization:
+
+```powershell
+uv run --no-sync ida-pro-mcp --install codex --scope global --transport stdio
+```
+
+Do not delete `.venv` while its bridge is running.
 
 If IDA was launched from a Python virtual-environment terminal, inherited variables can make IDAPython select the wrong runtime. On Windows, use the included clean launcher:
 
@@ -93,10 +122,10 @@ Current Windows/IDA 9.4 release checks:
 ## Development
 
 ```powershell
-uv sync
-uv run pytest tests -q -p no:cacheprovider
-uv run pytest tests_bridge -q -p no:cacheprovider
-uv run ruff check src/ida_pro_mcp/ida_mcp/api_core.py src/ida_pro_mcp/ida_mcp/api_survey.py src/ida_pro_mcp/ida_mcp/compat.py src/ida_pro_mcp/ida_mcp/hexrays_dataflow.py
+uv sync --all-groups
+uv run --no-sync pytest tests -q -p no:cacheprovider
+uv run --no-sync pytest tests_bridge -q -p no:cacheprovider
+uv run --no-sync ruff check src/ida_pro_mcp/ida_mcp/api_core.py src/ida_pro_mcp/ida_mcp/api_survey.py src/ida_pro_mcp/ida_mcp/compat.py src/ida_pro_mcp/ida_mcp/hexrays_dataflow.py
 uv build
 ```
 
