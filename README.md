@@ -300,10 +300,11 @@ Worker controls:
 ## vNext API and safety profiles
 
 New installations advertise a bounded 35-tool canonical API and start with
-only the `read` safety scope. Existing GUI selections retain their effective
-access and legacy aliases for the compatibility release. Bundled profiles are
-in [`profiles/`](profiles/): `canonical`, `annotate`, `modify`, `debug`,
-`python`, and `legacy`.
+the `modify` profile (`read`, `annotate`, and `modify` scopes). Filesystem,
+debugger, and Python scopes remain explicit opt-ins. Existing GUI selections
+retain their effective access and legacy aliases for the compatibility release.
+Bundled profiles are in [`profiles/`](profiles/): `canonical`, `annotate`,
+`modify`, `debug`, `python`, and `legacy`.
 
 All IDB writes use `mutation_preview` followed by `mutation_commit`. A preview
 is tied to the active database revision and expires; GUI edits or automation

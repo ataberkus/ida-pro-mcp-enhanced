@@ -64,10 +64,7 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     is_new_install = stored_tools is None
     enabled_tools = (
         {
-            name: (
-                name in CANONICAL_TOOLS
-                and MCP_POLICY.get(name).scopes == frozenset({SafetyScope.READ})
-            )
+            name: _default_profile_enabled(name)
             for name in original_tools
         }
         if is_new_install
@@ -118,6 +115,16 @@ def _configure_scopes(
 
 
 DEFAULT_CORS_POLICY = "local"
+# The enhanced checkout opts into IDB annotation and modification by default.
+# Filesystem, debugger, and Python scopes remain explicit opt-ins.
+DEFAULT_PROFILE_SCOPES = frozenset(
+    {SafetyScope.READ, SafetyScope.ANNOTATE, SafetyScope.MODIFY}
+)
+
+
+def _default_profile_enabled(name: str) -> bool:
+    policy = MCP_POLICY.get(name)
+    return name in CANONICAL_TOOLS and policy.scopes <= DEFAULT_PROFILE_SCOPES
 
 
 def get_cors_policy(port: int) -> str:

@@ -1,14 +1,17 @@
 # IDA Pro MCP vNext
 
 vNext exposes a shared, versioned contract from both the in-IDA plugin and the
-`idalib-mcp` supervisor. The default profile contains exactly 35 canonical
-tools. Legacy tools remain registered for migrated configurations and the
-`legacy` profile, but new installations do not advertise them.
+`idalib-mcp` supervisor. The default profile contains the canonical analysis
+and IDB mutation tools with `read`, `annotate`, and `modify` scopes. Filesystem,
+debugger, and Python scopes remain opt-in. Legacy tools remain registered for
+migrated configurations and the `legacy` profile, but new installations do not
+advertise them.
 
 ## Safety and transport
 
 Safety is expressed as scopes: `read`, `annotate`, `modify`, `filesystem`,
-`debug`, and `python`. New installations receive only `read`. A tool call is
+`debug`, and `python`. New installations receive `read`, `annotate`, and
+`modify`. A tool call is
 authorized against its declared scopes before IDA dispatch, and the MCP schema
 includes standard read-only, destructive, idempotent, and open-world
 annotations plus `ida_mcp` capability metadata.
