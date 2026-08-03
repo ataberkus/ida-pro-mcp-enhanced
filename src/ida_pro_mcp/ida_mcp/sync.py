@@ -3,6 +3,7 @@ import queue
 import functools
 import os
 import sys
+import threading
 import time
 import idaapi
 import idc
@@ -38,6 +39,15 @@ class CancelledError(RequestCancelledError):
 logger = logging.getLogger(__name__)
 _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
 _DEFAULT_TOOL_TIMEOUT_SEC = 60.0
+
+# Per-tool monotonic deadline (or None if no timeout). Tools can read this to
+# self-monitor and return partial results before the hard timeout fires.
+_deadline_state = threading.local()
+
+
+def get_tool_deadline() -> float | None:
+    """Return the monotonic deadline for the current tool call, or None."""
+    return getattr(_deadline_state, "deadline", None)
 
 
 def _get_tool_timeout_seconds() -> float:
@@ -119,10 +129,12 @@ def sync_wrapper(ff, timeout_override: float | None = None):
 
             old_profile = sys.getprofile()
             sys.setprofile(profilefunc)
+            _deadline_state.deadline = deadline
             try:
                 return ff()
             finally:
                 sys.setprofile(old_profile)
+                _deadline_state.deadline = None
 
         timed_ff.__name__ = ff.__name__
         return _sync_wrapper(timed_ff)

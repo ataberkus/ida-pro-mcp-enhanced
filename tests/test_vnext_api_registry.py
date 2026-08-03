@@ -97,3 +97,87 @@ def test_vnext_internal_legacy_call_dispatches_preserved_method_map():
             del rpc.MCP_SERVER.tools._all_methods
         else:
             rpc.MCP_SERVER.tools._all_methods = previous
+
+
+def test_memory_read_normalizes_string_byte_queries():
+    _rpc, api_vnext = _load_vnext_api()
+    assert api_vnext._normalize_memory_queries("bytes", ["0x401000"]) == [
+        {"addr": "0x401000", "size": 16}
+    ]
+    assert api_vnext._normalize_memory_queries(
+        "bytes", [{"addr": "0x401000", "size": 4}]
+    ) == [{"addr": "0x401000", "size": 4}]
+    assert api_vnext._normalize_memory_queries("string", ["0x401000"]) == ["0x401000"]
+    with pytest.raises(VNextError, match=r"\{addr, ty\}"):
+        api_vnext._normalize_memory_queries("integer", ["0x401000"])
+
+
+def test_text_search_uses_and_returns_canonical_cursor(monkeypatch):
+    _rpc, api_vnext = _load_vnext_api()
+    calls = []
+
+    def fake_legacy_call(name, arguments=None):
+        calls.append((name, arguments))
+        return {"n": 1, "hits": [], "cursor": {"next": "0x401010"}}
+
+    monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
+    incoming = api_vnext._encode_cursor(0x401000)
+    result = api_vnext.search("text", ["needle"], 10, incoming)
+
+    assert calls == [
+        (
+            "search_text",
+            {
+                "pattern": "needle",
+                "limit": 10,
+                "start": "0x401000",
+                "end": "",
+                "regex": False,
+                "case_sensitive": False,
+                "include": "all",
+                "code_only": False,
+            },
+        )
+    ]
+    assert result["truncated"] is True
+    assert result["next_cursor"] == api_vnext._encode_cursor(0x401010)
+
+
+def test_mutation_aliases_reshape_set_name_and_rename_func():
+    _rpc, api_vnext = _load_vnext_api()
+    ops = api_vnext._parse_operations(
+        [
+            {
+                "kind": "set_name",
+                "arguments": {"addr": "0x401000", "name": "foo"},
+            },
+            {
+                "kind": "rename_func",
+                "arguments": {"addr": "0x402000", "name": "bar"},
+            },
+            {
+                "kind": "rename",
+                "arguments": {"func": [{"addr": "0x403000", "name": "baz"}]},
+            },
+        ]
+    )
+    assert [op.kind for op in ops] == ["rename", "rename", "rename"]
+    assert ops[0].arguments == {"func": [{"addr": "0x401000", "name": "foo"}]}
+    assert ops[1].arguments == {"func": [{"addr": "0x402000", "name": "bar"}]}
+    assert ops[2].arguments == {"func": [{"addr": "0x403000", "name": "baz"}]}
+
+
+def test_bridge_legacy_backends_are_defined_in_source():
+    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "ida_pro_mcp" / "ida_mcp"
+    expected = {
+        "api_core.py": "def search_text(",
+        "api_debug.py": "def dbg_status(",
+        "api_modify.py": ("def add_bookmark(", "def set_op_type(", "def make_data("),
+        "api_python.py": "def py_exec_file(",
+    }
+    for filename, needles in expected.items():
+        text = (root / filename).read_text(encoding="utf-8")
+        if isinstance(needles, str):
+            needles = (needles,)
+        for needle in needles:
+            assert needle in text, f"{filename} missing {needle}"

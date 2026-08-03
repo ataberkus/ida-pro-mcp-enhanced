@@ -11,7 +11,9 @@ Instead of forcing an agent through hundreds of tiny read calls, vNext combines 
 - **Investigation, not just lookup.** `analysis_run`, `investigation_start`, `graph_query`, `dataflow_trace`, and `taint_analyze` help an agent reconstruct behavior across whole code paths.
 - **Smaller and stronger tool surface.** A bounded 35-tool canonical API replaces legacy tool sprawl while retaining proven implementations internally.
 - **Fewer round trips.** Batch-first queries, bounded responses, cached strings, and combined analysis results reduce tool-call churn on large databases.
+- **Search the analysis, not only the binary.** Deadline-aware listing search finds rendered instructions and analyst comments across selected ranges with resumable cursors.
 - **Safe autonomous editing.** Renames, types, comments, and other IDB changes use preview/commit transactions, revision checks, recovery checkpoints, and rollback support.
+- **Sharper IDB refinement.** Agents can add bookmarks, set operand display and structure-offset types, and create typed data through the transactional mutation path.
 - **Multiple IDA databases at once.** The stdio bridge discovers live IDA processes and routes each call to the right database.
 - **Real safety controls.** Read, annotate, modify, debugger, filesystem, and Python capabilities are independently scoped.
 - **IDA 9.4-first runtime.** Current function, segment, decompiler, and microcode APIs are used without the deprecated-call noise found in older integrations.
@@ -52,6 +54,8 @@ The advertised vNext API is deliberately focused:
 - `dataflow_trace` follows values forward or backward from an address or a symbol such as `main`.
 - `taint_analyze` traces source-to-sink influence with explicit bounds.
 - `decompile`, `disassemble`, `search`, `memory_read`, and `type_query` provide targeted evidence when deeper inspection is needed.
+- `search` now covers rendered disassembly and comments, while `memory_read` accepts agent-friendly address forms and produces bounded results.
+- Opt-in debugger and Python scopes include debugger-state inspection and execution of workspace-restricted analysis scripts.
 - Mutation tools preview a batch, validate the active database revision, create a checkpoint, and then commit atomically.
 
 Legacy tools are currently hidden from MCP clients so the vNext interface can be tested as a complete workflow. Their implementations remain available internally where vNext orchestration depends on them.
@@ -80,7 +84,7 @@ A direct connection to `http://127.0.0.1:13337/mcp` still works, but it connects
 
 Current Windows/IDA 9.4 release checks:
 
-- Portable suite: **231 passed, 114 subtests passed**.
+- Portable suite: **235 passed, 114 subtests passed**.
 - Multi-instance bridge suite: **14 passed**.
 - Targeted Ruff checks, `compileall`, package build, isolated installation, and CLI smoke pass.
 - Live IDA 9.4 registration, resource reads, tool listing, function analysis, transactional mutation, and IDB save have been exercised.

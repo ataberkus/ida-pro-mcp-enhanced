@@ -385,6 +385,21 @@ def _decode_cursor(cursor: str | None) -> int:
     return max(0, offset)
 
 
+def _search_next_cursor(result: Any) -> str | None:
+    """Convert a legacy search cursor into the canonical opaque cursor."""
+    if not isinstance(result, dict):
+        return None
+    legacy_cursor = result.get("cursor")
+    if not isinstance(legacy_cursor, dict) or "next" not in legacy_cursor:
+        return None
+    value = legacy_cursor["next"]
+    try:
+        offset = int(value, 0) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        return None
+    return _encode_cursor(offset)
+
+
 @tool
 def server_capabilities() -> dict[str, Any]:
     """Return runtime, IDA, safety, analysis-engine, and schema capabilities."""
@@ -406,7 +421,19 @@ def search(
     if normalized == "text":
         if len(targets) != 1:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Text search accepts one pattern")
-        result = _legacy_call("search_text", {"pattern": targets[0], "limit": limit, "start": None, "end": None, "regex": False, "case_sensitive": False, "include": "all", "code_only": False})
+        result = _legacy_call(
+            "search_text",
+            {
+                "pattern": targets[0],
+                "limit": limit,
+                "start": hex(offset) if cursor else "",
+                "end": "",
+                "regex": False,
+                "case_sensitive": False,
+                "include": "all",
+                "code_only": False,
+            },
+        )
     elif normalized == "regex":
         if len(targets) != 1:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Regex search accepts one pattern")
@@ -417,13 +444,55 @@ def search(
         result = _legacy_call("find", {"type": normalized, "targets": targets, "limit": limit, "offset": offset})
     else:
         raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported search kind: {kind}")
-    return ToolEnvelope(result, provenance={"legacy_tool": normalized}).to_dict()
+    next_cursor = _search_next_cursor(result)
+    return ToolEnvelope(
+        result,
+        provenance={"legacy_tool": normalized},
+        truncated=next_cursor is not None,
+        next_cursor=next_cursor,
+    ).to_dict()
+
+
+_DEFAULT_BYTES_READ_SIZE = 16
+
+
+def _normalize_memory_queries(kind: str, queries: list[dict[str, Any]] | list[str]) -> list[Any]:
+    """Normalize memory_read queries to the shapes expected by legacy tools."""
+    if kind == "bytes":
+        normalized: list[Any] = []
+        for item in queries:
+            if isinstance(item, str):
+                normalized.append({"addr": item, "size": _DEFAULT_BYTES_READ_SIZE})
+            elif isinstance(item, dict):
+                normalized.append(item)
+            else:
+                raise VNextError(
+                    ErrorCode.INVALID_OPERATION,
+                    "bytes queries must be address strings or {addr, size} objects",
+                )
+        return normalized
+
+    if kind == "integer":
+        for item in queries:
+            if isinstance(item, str):
+                raise VNextError(
+                    ErrorCode.INVALID_OPERATION,
+                    "integer queries require objects of shape {addr, ty}",
+                )
+        return list(queries)
+
+    # string / global accept bare address/name strings.
+    return list(queries)
 
 
 @tool
 def memory_read(
     kind: Annotated[str, "bytes, integer, string, or global"],
-    queries: Annotated[list[dict[str, Any]] | list[str], "Address or region queries"],
+    queries: Annotated[
+        list[dict[str, Any]] | list[str],
+        "Address queries. bytes: '0x...' (size defaults to 16) or {addr,size}; "
+        "integer: {addr,ty}; string/global: address or name strings",
+    ],
 ) -> dict[str, Any]:
     """Read static database bytes, integers, strings, or globals."""
 
@@ -436,7 +505,11 @@ def memory_read(
     if kind not in mapping:
         raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported memory read kind: {kind}")
     name, argument_name = mapping[kind]
-    return ToolEnvelope(_legacy_call(name, {argument_name: queries}), provenance={"legacy_tool": name}).to_dict()
+    normalized = _normalize_memory_queries(kind, queries)
+    return ToolEnvelope(
+        _legacy_call(name, {argument_name: normalized}),
+        provenance={"legacy_tool": name},
+    ).to_dict()
 
 
 @tool
@@ -803,15 +876,44 @@ _OPERATION_TARGETS: dict[str, tuple[str, str, SafetyScope]] = {
     "save_database": ("idb_save", "path", SafetyScope.FILESYSTEM),
 }
 
+_MUTATION_KIND_ALIASES = {
+    "set_name": "rename",
+    "rename_func": "rename",
+    "rename_function": "rename",
+}
+
+_RENAME_BATCH_KEYS = frozenset({"func", "data", "global", "globals", "local", "stack"})
+
+
+def _reshape_mutation_arguments(kind: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Normalize agent-friendly mutation kinds/args into canonical forms."""
+    canonical = _MUTATION_KIND_ALIASES.get(kind, kind)
+    args = dict(arguments)
+
+    if canonical == "rename":
+        if any(key in args for key in _RENAME_BATCH_KEYS):
+            return canonical, args
+        addr = args.get("addr") or args.get("func_addr") or args.get("ea")
+        name = args.get("name") or args.get("new") or args.get("new_name")
+        if addr and name:
+            return canonical, {"func": [{"addr": str(addr), "name": str(name)}]}
+
+    return canonical, args
+
 
 def _parse_operations(values: list[dict[str, Any]]) -> list[MutationOperation]:
     operations = []
     for value in values:
-        kind = str(value.get("kind", ""))
+        raw_kind = str(value.get("kind", ""))
+        kind, arguments = _reshape_mutation_arguments(raw_kind, dict(value.get("arguments", {})))
         target = _OPERATION_TARGETS.get(kind)
         if target is None:
-            raise VNextError(ErrorCode.INVALID_OPERATION, f"Unsupported mutation kind: {kind}")
-        operations.append(MutationOperation(kind, dict(value.get("arguments", {})), target[2]))
+            allowed = ", ".join(sorted(_OPERATION_TARGETS))
+            raise VNextError(
+                ErrorCode.INVALID_OPERATION,
+                f"Unsupported mutation kind: {raw_kind}. Allowed: {allowed}",
+            )
+        operations.append(MutationOperation(kind, arguments, target[2]))
     return operations
 
 
@@ -964,7 +1066,13 @@ def _debug_trace_export(path: str, description: str) -> dict[str, Any]:
 
 @tool
 def mutation_preview(
-    operations: Annotated[list[dict[str, Any]], "Discriminated mutation operations"],
+    operations: Annotated[
+        list[dict[str, Any]],
+        "Discriminated mutation operations. kind is one of: rename, comment, "
+        "append_comment, bookmark, declare_type, set_type, patch_bytes, write_integer, "
+        "patch_asm, define_function, define_code, undefine, set_operand_type, make_data, "
+        "declare_stack, delete_stack, save_database. Aliases set_name/rename_func map to rename.",
+    ],
 ) -> dict[str, Any]:
     """Validate and stage a mutation batch without changing the database."""
 

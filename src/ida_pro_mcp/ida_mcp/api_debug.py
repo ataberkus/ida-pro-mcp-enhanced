@@ -9,7 +9,7 @@ This module provides comprehensive debugging functionality including:
 """
 
 import os
-from typing import Annotated
+from typing import Annotated, TypedDict
 
 import ida_dbg
 import ida_entry
@@ -36,6 +36,18 @@ from .utils import (
 # ============================================================================
 # Constants and Helper Functions
 # ============================================================================
+
+
+class DebugControlResult(TypedDict, total=False):
+    ip: str
+    started: bool
+    continued: bool
+    running: bool
+    suspended: bool
+    exited: bool
+    state: str
+    error: str
+
 
 GENERAL_PURPOSE_REGISTERS = {
     "EAX",
@@ -74,6 +86,33 @@ def dbg_ensure_running() -> "ida_idd.debugger_t":
     if ida_dbg.get_ip_val() is None:
         raise IDAError("Debugger not running")
     return dbg
+
+
+def _get_process_state_name() -> str:
+    if not ida_dbg.is_debugger_on():
+        return "not_running"
+
+    state = ida_dbg.get_process_state()
+    if state == ida_dbg.DSTATE_SUSP:
+        return "suspended"
+    if state == ida_dbg.DSTATE_RUN:
+        return "running"
+    if state == ida_dbg.DSTATE_NOTASK:
+        return "not_running"
+    return f"unknown({state})"
+
+
+def _get_debug_state_result() -> DebugControlResult:
+    state = _get_process_state_name()
+    result: DebugControlResult = {"state": state}
+    if state == "running":
+        result["running"] = True
+    elif state == "suspended":
+        result["suspended"] = True
+        ip = ida_dbg.get_ip_val()
+        if ip is not None:
+            result["ip"] = hex(ip)
+    return result
 
 
 def _get_registers_for_thread(dbg: "ida_idd.debugger_t", tid: int) -> ThreadRegisters:
@@ -155,6 +194,15 @@ def list_breakpoints():
 # ============================================================================
 # Debugger Control Operations
 # ============================================================================
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_status() -> DebugControlResult:
+    """Return debugger lifecycle state and current IP if suspended."""
+    return _get_debug_state_result()
 
 
 @ext("dbg")
