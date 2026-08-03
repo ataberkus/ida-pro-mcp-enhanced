@@ -12,7 +12,7 @@ from typing import Any
 
 from ida_pro_mcp.vnext.contracts import AnalysisEngine, AnalysisGraph, ErrorCode, VNextError
 
-from .sync import idasync
+from .sync import IDAError, idasync
 from .utils import parse_address
 
 
@@ -28,6 +28,20 @@ def _has_common(left: Any, right: Any) -> bool:
         return bool(left.has_common(right))
     except Exception:
         return False
+
+
+def _resolve_trace_address(addr: str | int) -> int:
+    """Resolve a numeric address or IDA function/name to an effective address."""
+
+    try:
+        return parse_address(addr)
+    except IDAError:
+        import idaapi
+
+        ea = idaapi.get_name_ea(idaapi.BADADDR, str(addr))
+        if ea == idaapi.BADADDR:
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"Address/name not found: {addr!r}")
+        return int(ea)
 
 
 def _predecessors(block: Any) -> list[int]:
@@ -103,7 +117,7 @@ def trace_microcode(
     except ImportError as exc:
         raise VNextError(ErrorCode.NOT_SUPPORTED, "Hex-Rays APIs are not installed") from exc
 
-    ea = parse_address(addr)
+    ea = _resolve_trace_address(addr)
     function = ida_funcs.get_func(ea)
     if function is None:
         raise VNextError(ErrorCode.INVALID_OPERATION, f"Address is not inside a function: {addr}")

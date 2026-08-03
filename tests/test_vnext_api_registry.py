@@ -4,7 +4,10 @@ import importlib.util
 import pathlib
 import sys
 
+import pytest
+
 from _mcp_spec_support import call_rpc, load_ida_rpc_module
+from ida_pro_mcp.vnext.contracts import VNextError
 from ida_pro_mcp.vnext.policy import CANONICAL_TOOLS
 
 
@@ -76,3 +79,21 @@ def test_vnext_only_profile_hides_legacy_commit_debug_and_python_tools():
     finally:
         rpc.MCP_SERVER.tools.methods.pop("legacy_probe", None)
         rpc.configure_tool_policy(scopes={"read"}, legacy_tools=False)
+
+
+def test_vnext_internal_legacy_call_dispatches_preserved_method_map():
+    rpc, api_vnext = _load_vnext_api()
+    marker = object()
+    previous = getattr(rpc.MCP_SERVER.tools, "_all_methods", marker)
+    rpc.MCP_SERVER.tools._all_methods = {
+        "legacy_probe": lambda value: {"value": value},
+    }
+    try:
+        assert api_vnext._legacy_call("legacy_probe", {"value": 7}) == {"value": 7}
+        with pytest.raises(VNextError, match="not registered"):
+            api_vnext._legacy_call("missing_legacy_probe")
+    finally:
+        if previous is marker:
+            del rpc.MCP_SERVER.tools._all_methods
+        else:
+            rpc.MCP_SERVER.tools._all_methods = previous

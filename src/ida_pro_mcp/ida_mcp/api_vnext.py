@@ -126,8 +126,19 @@ def _legacy_call(name: str, arguments: dict[str, Any] | None = None) -> Any:
     # registry, while vNext workflows still use selected legacy implementations
     # internally.  Dispatch against the preserved implementation registry so
     # profile filtering does not break canonical analysis jobs.
-    implementation_registry = getattr(MCP_SERVER.tools, "_all_methods", MCP_SERVER.tools)
-    response = implementation_registry.dispatch(
+    implementation_methods = getattr(MCP_SERVER.tools, "_all_methods", None)
+    if isinstance(implementation_methods, dict):
+        implementation = implementation_methods.get(name)
+        if implementation is None:
+            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool is not registered: {name}")
+        try:
+            return implementation(**(arguments or {}))
+        except VNextError:
+            raise
+        except Exception as exc:
+            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool failed: {name}: {exc}") from exc
+
+    response = MCP_SERVER.tools.dispatch(
         {"jsonrpc": "2.0", "method": name, "params": arguments or {}, "id": None}
     )
     if response and "error" in response:
