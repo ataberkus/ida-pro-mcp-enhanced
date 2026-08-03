@@ -23,12 +23,14 @@ def test_framework_assert_shape_with_optional_and_list_of():
     value = {
         "addr": "0x123e",
         "items": [{"name": "main"}, {"name": "check_pw"}],
+        "error": None,
     }
     assert_shape(
         value,
         {
             "addr": is_hex_address,
             "items": list_of({"name": str}, min_length=2),
+            "error": optional(str),
         },
     )
 
@@ -62,7 +64,7 @@ def test_framework_assert_typed_dict():
 @test(binary="crackme03.elf")
 def test_framework_assert_ok_and_error_helpers():
     """assert_ok and assert_error capture success/error response contracts."""
-    assert_ok({"value": 1}, "value")
+    assert_ok({"error": None, "value": 1}, "value")
     assert_error({"error": "boom"}, contains="boom")
 
 

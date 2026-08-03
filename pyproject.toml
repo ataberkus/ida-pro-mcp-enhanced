@@ -8,6 +8,7 @@ authors = [
     { name = "mrexodia" },
     { name = "can1357" },
     { name = "IDA Pro MCP Contributors" },
+    { name = "ataberkus" },
 ]
 keywords = ["ida", "mcp", "llm", "plugin"]
 classifiers = [
@@ -32,15 +33,16 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/mrexodia/ida-pro-mcp"
-Issues = "https://github.com/mrexodia/ida-pro-mcp/issues"
+Repository = "https://github.com/ataberkus/ida-pro-mcp-enhanced"
+Issues = "https://github.com/ataberkus/ida-pro-mcp-enhanced/issues"
+Upstream = "https://github.com/mrexodia/ida-pro-mcp"
 
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project.scripts]
-ida-pro-mcp = "ida_pro_mcp.server:main"
+ida-pro-mcp = "ida_pro_mcp.bridge_server:main"
 idalib-mcp = "ida_pro_mcp.idalib_supervisor:main"
 ida-mcp-test = "ida_pro_mcp.test:main"
 ida-mcp-trace-dump = "ida_pro_mcp.trace_dump:main"

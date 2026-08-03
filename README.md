@@ -1,6 +1,57 @@
-# IDA Pro MCP
+# IDA Pro MCP Enhanced
 
 Simple [MCP Server](https://modelcontextprotocol.io/introduction) to allow vibe reversing in IDA Pro.
+
+> [!IMPORTANT]
+> This is a private derivative of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp),
+> based on upstream commit `f82e6e2`. The original MIT license and contributor
+> attribution are retained. This branch publishes the working AppData plugin
+> snapshot with multi-instance routing and additional investigation tools.
+
+## Enhanced branch status
+
+- Bridge unit tests and packaging are verified before each published revision.
+- The IDA plugin automatically starts after a database loads and registers the
+  process in the host-local instance registry.
+- One live IDA instance keeps the original unprefixed tool names.
+- Two or more instances expose `<database_prefix>__<tool>` names and
+  `ida_list_instances` reports the current prefix-to-database mapping.
+- Same-name databases receive a short instance-derived disambiguator.
+- Closed or crashed IDA processes are removed when the bridge refreshes discovery.
+- The separate `feat/vnext-foundation` experiment is intentionally not included.
+
+### Validation snapshot (2026-08-03)
+
+- Enhanced bridge suite: `13 passed`.
+- Portable upstream compatibility suite: `209 passed, 114 subtests passed`.
+- Source compilation, wheel build, isolated wheel installation, and CLI entry
+  point smoke passed.
+- No reachable live IDA server was available during repository publication, so
+  single- and two-instance GUI acceptance remains pending.
+
+## Multi-instance client configuration
+
+Multi-instance routing is provided by the stdio bridge. Install this checkout,
+then configure the MCP client to launch the packaged command:
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-mcp-enhanced": {
+      "command": "ida-pro-mcp"
+    }
+  }
+}
+```
+
+Direct connections to `http://127.0.0.1:13337/mcp` still work for one IDA
+instance, but they bypass discovery and therefore cannot route among multiple
+instances. Use `ida_list_instances` before prefixed calls when more than one
+database is open.
+
+The enhanced investigation surface includes the `investigate` workflow and its
+supporting analysis helpers. The implementation design and test notes are under
+`devdocs/multi-instance/`.
 
 https://github.com/user-attachments/assets/6ebeaa92-a9db-43fa-b756-eececce2aca0
 

@@ -38,24 +38,7 @@ def test_utils_parse_address_and_detection():
         parse_address("xyz")
         assert False, "expected parse_address to fail"
     except IDAError as e:
-        assert "Not found" in str(e)
-
-
-@test(binary="crackme03.elf")
-def test_utils_parse_address_resolves_names():
-    """parse_address resolves known symbol names to their addresses."""
-    assert parse_address("main") == 0x123E
-    assert parse_address("check_pw") == 0x11A9
-
-
-@test()
-def test_utils_parse_address_unknown_name():
-    """parse_address raises IDAError for names that don't exist in the IDB."""
-    try:
-        parse_address("nonexistent_symbol_xyz_42")
-        assert False, "expected parse_address to fail on unknown name"
-    except IDAError as e:
-        assert "Not found" in str(e)
+        assert "Failed to parse address" in str(e)
 
 
 @test(binary="crackme03.elf")
@@ -112,13 +95,9 @@ def test_utils_stack_frame_and_decompile_helpers():
     names = {v["name"] for v in vars_}
     assert {"rhs_handle", "lhs_handle"}.issubset(names)
 
-    code, err = decompile_function_safe(0x1013DC0)
+    code = decompile_function_safe(0x1013DC0)
     assert code is not None
-    assert err is None
     assert "sum_point" in code
-    # Address annotations (/*0x....*/) are added via get_line_item; passing None
-    # for the phead/ptail output params could crash IDA via null-pointer write.
-    assert any("/*0x" in line for line in code.splitlines())
 
 
 @test(binary="typed_fixture.elf")

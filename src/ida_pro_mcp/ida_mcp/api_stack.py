@@ -4,13 +4,12 @@ This module provides batch operations for managing stack frame variables,
 including reading, creating, and deleting stack variables in functions.
 """
 
-from typing import Annotated, NotRequired, TypedDict
+from typing import Annotated
 import ida_typeinf
 import ida_frame
 import idaapi
 
-from .compat import tinfo_get_udm
-from .rpc import tool
+from .rpc import tool, unsafe
 from .sync import idasync
 from .utils import (
     normalize_list_input,
@@ -19,21 +18,8 @@ from .utils import (
     get_type_by_name,
     StackVarDecl,
     StackVarDelete,
-    StackFrameVariable,
     get_stack_frame_variables_internal,
 )
-
-
-class StackFrameResult(TypedDict):
-    addr: str
-    vars: list[StackFrameVariable] | None
-    error: NotRequired[str]
-
-
-class StackMutationResult(TypedDict):
-    addr: str
-    name: str
-    error: NotRequired[str]
 
 
 # ============================================================================
@@ -43,9 +29,7 @@ class StackMutationResult(TypedDict):
 
 @tool
 @idasync
-def stack_frame(
-    addrs: Annotated[list[str] | str, "Address(es)"]
-) -> list[StackFrameResult]:
+def stack_frame(addrs: Annotated[list[str] | str, "Address(es)"]) -> list[dict]:
     """Return stack variables for function address(es)."""
     addrs = normalize_list_input(addrs)
     results = []
@@ -63,9 +47,10 @@ def stack_frame(
 
 @tool
 @idasync
+@unsafe
 def declare_stack(
     items: list[StackVarDecl] | StackVarDecl,
-) -> list[StackMutationResult]:
+):
     """Create stack variables from typed stack declarations."""
     items = normalize_dict_list(items)
     results = []
@@ -99,7 +84,7 @@ def declare_stack(
                 )
                 continue
 
-            results.append({"addr": fn_addr, "name": var_name})
+            results.append({"addr": fn_addr, "name": var_name, "ok": True})
         except Exception as e:
             results.append({"addr": fn_addr, "name": var_name, "error": str(e)})
 
@@ -108,9 +93,10 @@ def declare_stack(
 
 @tool
 @idasync
+@unsafe
 def delete_stack(
     items: list[StackVarDelete] | StackVarDelete,
-) -> list[StackMutationResult]:
+):
     """Delete stack variables by name or offset."""
 
     items = normalize_dict_list(items)
@@ -134,7 +120,7 @@ def delete_stack(
                 )
                 continue
 
-            idx, udm = tinfo_get_udm(frame_tif, var_name)
+            idx, udm = frame_tif.get_udm(var_name)
             if not udm:
                 results.append(
                     {
@@ -176,7 +162,7 @@ def delete_stack(
                 )
                 continue
 
-            results.append({"addr": fn_addr, "name": var_name})
+            results.append({"addr": fn_addr, "name": var_name, "ok": True})
         except Exception as e:
             results.append({"addr": fn_addr, "name": var_name, "error": str(e)})
 

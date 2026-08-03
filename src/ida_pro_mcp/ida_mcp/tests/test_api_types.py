@@ -29,7 +29,6 @@ from ..api_types import (
 TEST_STRUCT_NAME = "__TestStruct__"
 NAME_RESOLUTION_STRUCT = "__NameResolutionTest__"
 CRACKME_DSO_HANDLE = "0x4008"
-CRACKME_CHECK_PW = "0x11a9"
 TYPE_APPLY_SIGNATURE = "int"
 TYPED_FIXTURE_SUM_POINT = "0x1013c10"
 TYPED_FIXTURE_USE_WRAPPER = "0x1013dc0"
@@ -57,7 +56,7 @@ def create_test_struct(name: str = TEST_STRUCT_NAME) -> bool:
         return False
 
     entry = result[0]
-    if "error" not in entry:
+    if entry.get("ok"):
         return True
 
     search_result = search_structs(name)
@@ -182,72 +181,6 @@ def test_read_struct_without_type_info_fails_cleanly():
     assert_error(result[0], contains="could not auto-detect")
 
 
-def _find_bss_addr() -> int | None:
-    """Locate an address whose byte is not loaded (BSS or similar)."""
-    import ida_bytes
-    import idaapi
-    import idautils
-
-    for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
-        if seg is None:
-            continue
-        if seg.type == idaapi.SEG_BSS:
-            return seg.start_ea
-
-    for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
-        if seg is None:
-            continue
-        if not ida_bytes.is_loaded(seg.start_ea):
-            return seg.start_ea
-
-    return None
-
-
-@test()
-def test_read_struct_bss_members_are_zero():
-    """read_struct reports zero for every member when the struct lives in BSS.
-
-    BSS bytes are unloaded in the IDB but zero-initialized at runtime. Before
-    the BSS-aware read, members would come back as 0xff-filled garbage.
-    """
-    bss_ea = _find_bss_addr()
-    if bss_ea is None:
-        skip_test("binary has no BSS / unloaded region")
-
-    if not create_test_struct(TEST_STRUCT_NAME):
-        skip_test("failed to declare test struct")
-
-    result = read_struct({"addr": hex(bss_ea), "struct": TEST_STRUCT_NAME})
-    assert_is_list(result, min_length=1)
-    entry = result[0]
-    assert_ok(entry, "members")
-
-    failures = []
-    for member in entry["members"]:
-        value_str = member["value"]
-        # Integer members render as "0xNN (N)"; pointer as "0xNN...";
-        # longer shapes render as "[NN NN ...]".
-        if "(" in value_str:
-            hex_part = value_str.split()[0]
-            numeric = int(hex_part, 16)
-        elif value_str.startswith("0x"):
-            numeric = int(value_str, 16)
-        elif value_str.startswith("["):
-            inner = value_str.strip("[]").replace("...", "").split()
-            numeric = sum(int(b, 16) for b in inner)
-        else:
-            failures.append(f"{member['name']}: unparseable value {value_str!r}")
-            continue
-        if numeric != 0:
-            failures.append(
-                f"{member['name']}: expected 0 at BSS, got {value_str!r}"
-            )
-
-    assert not failures, "\n".join(failures)
-
-
 @test()
 def test_search_structs_finds_declared_structs():
     """search_structs returns the previously declared deterministic struct."""
@@ -296,6 +229,7 @@ def test_type_query():
     assert "data" in page
     assert "next_offset" in page
     assert "total" in page
+    assert "error" in page
     if page["data"]:
         assert "ordinal" in page["data"][0]
         assert "name" in page["data"][0]
@@ -315,7 +249,7 @@ def test_type_inspect():
     r = result[0]
     assert r["name"] == tname
     assert r["exists"] is True
-    assert "error" not in r
+    assert r["error"] is None
     assert r.get("member_count", 0) >= 0
 
 
@@ -356,11 +290,11 @@ def test_enum_upsert_creates_and_replays_idempotently():
             }
         )
         assert_is_list(first, min_length=1)
-        assert "error" not in first[0]
+        assert first[0].get("ok") is True
         assert first[0].get("created") is True
         assert first[0]["summary"]["created"] == 2
         assert_is_list(second, min_length=1)
-        assert "error" not in second[0]
+        assert second[0].get("ok") is True
         assert second[0]["summary"]["skipped"] == 2
     finally:
         enum_id = idc.get_enum(enum_name)
@@ -382,7 +316,7 @@ def test_enum_upsert_reports_conflicting_member_value():
         enum_upsert({"name": enum_name, "members": [{"name": "__TEST_ENUM_CONFLICT__", "value": 1}]})
         result = enum_upsert({"name": enum_name, "members": [{"name": "__TEST_ENUM_CONFLICT__", "value": 2}]})
         assert_is_list(result, min_length=1)
-        assert "error" in result[0]
+        assert result[0].get("ok") is False
         assert result[0]["summary"]["conflicts"] == 1
         assert "conflict" in (result[0]["members"][0].get("error") or "").lower()
     finally:
@@ -398,7 +332,7 @@ def test_set_type_applies_named_global_type():
     assert_is_list(result, min_length=1)
     entry = result[0]
     assert entry["edit"]["addr"] == CRACKME_DSO_HANDLE
-    assert "error" not in entry
+    assert entry.get("ok") is True or entry.get("error") is None
 
 
 @test()
@@ -414,7 +348,7 @@ def test_set_type_global_by_name_branch():
     """set_type(kind=global) can resolve the target by symbol name instead of address."""
     result = set_type({"name": "g_point", "ty": "Point", "kind": "global"})
     assert_is_list(result, min_length=1)
-    assert "error" not in result[0]
+    assert result[0].get("ok") is True
 
 
 @test(binary="typed_fixture.elf")
@@ -429,7 +363,7 @@ def test_set_type_global_invalid_type_name():
 def test_type_apply_batch():
     """type_apply_batch applies edits and returns summary counters"""
     result = type_apply_batch({"edits": [{"addr": _require_any_function(), "ty": TYPE_APPLY_SIGNATURE}]})
-    assert "error" not in result
+    assert "ok" in result
     assert "applied" in result
     assert "failed" in result
     assert "stopped" in result
@@ -453,29 +387,6 @@ def test_set_type_function_not_found_branch():
     )
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="Function not found")
-
-
-@test(binary="crackme03.elf")
-def test_set_type_function_undefined_referenced_type():
-    """set_type(kind=function) explains apply failures for undeclared referenced types."""
-    result = set_type(
-        {
-            "addr": CRACKME_CHECK_PW,
-            "kind": "function",
-            "signature": "UndefinedStruct __fastcall check_pw(const char *s)",
-        }
-    )
-    assert_is_list(result, min_length=1)
-    entry = result[0]
-    if entry.get("ok"):
-        skip_test("IDA accepted an undefined referenced type in this environment")
-    assert_error(entry)
-    assert entry["error"] != "Failed to apply function type"
-    assert (
-        "declared" in entry["error"].lower()
-        or "parse" in entry["error"].lower()
-        or "function type" in entry["error"].lower()
-    )
 
 
 @test(binary="crackme03.elf")
@@ -526,7 +437,7 @@ def test_set_type_function_branch():
         }
     )
     assert_is_list(result, min_length=1)
-    assert "error" not in result[0]
+    assert result[0].get("ok") is True
 
 
 @test(binary="typed_fixture.elf")
@@ -556,9 +467,8 @@ def test_set_type_local_branch():
     )
     assert_is_list(result, min_length=1)
     assert (
-        "error" not in result[0]
-        or result[0].get("ok") is True
-        or "Failed to apply type" in (result[0].get("error") or "")
+        result[0].get("ok") is True
+        or result[0].get("error") == "Failed to apply local variable type"
     )
 
 
@@ -589,7 +499,7 @@ def test_set_type_stack_branch():
         }
     )
     assert_is_list(result, min_length=1)
-    assert "error" not in result[0]
+    assert result[0].get("ok") is True
 
 
 @test(binary="typed_fixture.elf")
@@ -629,4 +539,4 @@ def test_infer_types_invalid_text_address_errors_cleanly():
     """infer_types reports parse failures for symbolic garbage addresses."""
     result = infer_types("InvalidAddressName123")
     assert_is_list(result, min_length=1)
-    assert_error(result[0], contains="Not found")
+    assert_error(result[0], contains="Failed to parse address")

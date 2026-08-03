@@ -1,4 +1,4 @@
-from typing import Annotated, Any, TypedDict
+from typing import Annotated
 
 import idc
 import ida_typeinf
@@ -8,7 +8,7 @@ import ida_bytes
 import ida_frame
 import idaapi
 
-from .rpc import tool
+from .rpc import tool, unsafe
 from .sync import idasync
 from .utils import (
     normalize_list_input,
@@ -19,9 +19,6 @@ from .utils import (
     get_type_by_name,
     parse_decls_ctypes,
     my_modifier_t,
-    hexrays_local_var_exists,
-    read_bytes_bss_safe,
-    read_int_bss_safe,
     StructRead,
     TypeEdit,
     TypeInspectQuery,
@@ -30,124 +27,6 @@ from .utils import (
     EnumUpsert,
 )
 from . import compat
-from .compat import tinfo_get_udm
-
-
-class DeclareTypeResult(TypedDict, total=False):
-    decl: str
-    error: str
-
-
-class EnumMemberUpsertResult(TypedDict, total=False):
-    name: str
-    value: int
-    created: bool
-    skipped: bool
-    error: str
-
-
-class EnumUpsertSummaryResult(TypedDict):
-    created: int
-    skipped: int
-    conflicts: int
-
-
-class EnumUpsertResult(TypedDict, total=False):
-    name: str
-    enum_id: str
-    created: bool
-    bitfield: bool
-    members: list[EnumMemberUpsertResult]
-    summary: EnumUpsertSummaryResult
-    error: str
-
-
-class StructMemberValueResult(TypedDict):
-    offset: str
-    type: str
-    name: str
-    size: int
-    value: str
-
-
-class ReadStructResult(TypedDict, total=False):
-    addr: str | None
-    struct: str | None
-    members: list[StructMemberValueResult] | None
-    error: str
-
-
-class SearchStructResult(TypedDict):
-    name: str
-    size: int
-    cardinality: int
-    is_union: bool
-    ordinal: int
-
-
-class TypeCatalogMemberResult(TypedDict):
-    name: str
-    offset: str
-    size: int
-    type: str
-
-
-class TypeCatalogRow(TypedDict, total=False):
-    ordinal: int
-    name: str
-    size: int
-    kind: str
-    declaration: str
-    member_count: int
-    members: list[TypeCatalogMemberResult]
-    members_truncated: bool
-    related_count: int
-    related_types: list[str]
-    related_truncated: bool
-
-
-class TypeQueryResult(TypedDict):
-    kind: str
-    data: list[TypeCatalogRow]
-    next_offset: int | None
-    total: int
-
-
-class TypeInspectResult(TypedDict, total=False):
-    name: str
-    exists: bool
-    declaration: str
-    size: int
-    is_func: bool
-    is_ptr: bool
-    is_enum: bool
-    is_udt: bool
-    members: list[TypeCatalogMemberResult] | None
-    member_count: int
-    error: str
-
-
-class SetTypeResult(TypedDict, total=False):
-    edit: dict[str, Any]
-    kind: str
-    ok: bool
-    error: str
-
-
-class TypeApplyBatchResult(TypedDict):
-    ok: bool
-    applied: int
-    failed: int
-    stopped: bool
-    results: list[SetTypeResult]
-
-
-class InferTypeResult(TypedDict, total=False):
-    addr: str
-    inferred_type: str | None
-    method: str | None
-    confidence: str
-    error: str
 
 
 # ============================================================================
@@ -157,9 +36,10 @@ class InferTypeResult(TypedDict, total=False):
 
 @tool
 @idasync
+@unsafe
 def declare_type(
     decls: Annotated[list[str] | str, "C type declarations"],
-) -> list[DeclareTypeResult]:
+) -> list[dict]:
     """Declare C type definitions in local type library."""
     decls = normalize_list_input(decls)
     results = []
@@ -175,7 +55,7 @@ def declare_type(
                     {"decl": decl, "error": f"Failed to parse:\n{pretty_messages}"}
                 )
             else:
-                results.append({"decl": decl})
+                results.append({"decl": decl, "ok": True})
         except Exception as e:
             results.append({"decl": decl, "error": str(e)})
 
@@ -184,12 +64,13 @@ def declare_type(
 
 @tool
 @idasync
+@unsafe
 def enum_upsert(
     queries: Annotated[
         list[EnumUpsert] | EnumUpsert,
         "Create enums if missing and upsert enum members without destructive replacement",
     ],
-) -> list[EnumUpsertResult]:
+) -> list[dict]:
     """Create or extend local enums in an idempotent way."""
     queries = normalize_dict_list(queries)
     results = []
@@ -250,7 +131,7 @@ def enum_upsert(
                     existing_value = idc.get_enum_member_value(existing_member_id)
                     if existing_enum == enum_id and existing_value == value:
                         member_results.append(
-                            {"name": member_name, "value": value, "skipped": True}
+                            {"name": member_name, "value": value, "ok": True, "skipped": True}
                         )
                         skipped_count += 1
                         continue
@@ -272,7 +153,7 @@ def enum_upsert(
                     existing_name = idc.get_enum_member_name(existing_const) or ""
                     if existing_name == member_name:
                         member_results.append(
-                            {"name": member_name, "value": value, "skipped": True}
+                            {"name": member_name, "value": value, "ok": True, "skipped": True}
                         )
                         skipped_count += 1
                         continue
@@ -293,24 +174,24 @@ def enum_upsert(
                     )
                     conflict_count += 1
                     continue
-                member_results.append({"name": member_name, "value": value, "created": True})
+                member_results.append({"name": member_name, "value": value, "ok": True, "created": True})
                 created_count += 1
 
-            result_dict: dict = {
-                "name": enum_name,
-                "enum_id": hex(enum_id),
-                "created": created,
-                "bitfield": bitfield,
-                "members": member_results,
-                "summary": {
-                    "created": created_count,
-                    "skipped": skipped_count,
-                    "conflicts": conflict_count,
-                },
-            }
-            if conflict_count > 0:
-                result_dict["error"] = f"{conflict_count} member conflict(s)"
-            results.append(result_dict)
+            results.append(
+                {
+                    "name": enum_name,
+                    "enum_id": hex(enum_id),
+                    "ok": conflict_count == 0,
+                    "created": created,
+                    "bitfield": bitfield,
+                    "members": member_results,
+                    "summary": {
+                        "created": created_count,
+                        "skipped": skipped_count,
+                        "conflicts": conflict_count,
+                    },
+                }
+            )
         except Exception as exc:
             results.append({"name": enum_name, "error": str(exc)})
 
@@ -335,9 +216,7 @@ def _parse_enum_value(value: int | str | None) -> int:
 
 @tool
 @idasync
-def read_struct(
-    queries: list[StructRead] | StructRead,
-) -> list[ReadStructResult]:
+def read_struct(queries: list[StructRead] | StructRead) -> list[dict]:
     """Read struct fields from memory at address; auto-detect type when possible."""
 
     queries = normalize_dict_list(queries)
@@ -424,21 +303,38 @@ def read_struct(
                 member_name = member.name
                 member_size = member.type.get_size()
 
-                # Read memory value at member address (BSS-aware: unloaded
-                # bytes resolve to zero, matching runtime zero-init).
+                # Read memory value at member address
                 member_addr = addr + offset
                 try:
                     if member.type.is_ptr():
-                        ptr_size = 8 if compat.inf_is_64bit() else 4
-                        value = read_int_bss_safe(member_addr, ptr_size)
-                        value_str = f"0x{value:0{ptr_size * 2}X}"
-                    elif member_size in (1, 2, 4, 8):
-                        value = read_int_bss_safe(member_addr, member_size)
-                        value_str = f"0x{value:0{member_size * 2}X} ({value})"
+                        is_64bit = compat.inf_is_64bit()
+                        if is_64bit:
+                            value = idaapi.get_qword(member_addr)
+                            value_str = f"0x{value:016X}"
+                        else:
+                            value = idaapi.get_dword(member_addr)
+                            value_str = f"0x{value:08X}"
+                    elif member_size == 1:
+                        value = idaapi.get_byte(member_addr)
+                        value_str = f"0x{value:02X} ({value})"
+                    elif member_size == 2:
+                        value = idaapi.get_word(member_addr)
+                        value_str = f"0x{value:04X} ({value})"
+                    elif member_size == 4:
+                        value = idaapi.get_dword(member_addr)
+                        value_str = f"0x{value:08X} ({value})"
+                    elif member_size == 8:
+                        value = idaapi.get_qword(member_addr)
+                        value_str = f"0x{value:016X} ({value})"
                     else:
-                        capped = min(member_size, 16)
-                        raw = read_bytes_bss_safe(member_addr, capped)
-                        bytes_data = [f"{b:02X}" for b in raw]
+                        bytes_data = []
+                        for i in range(min(member_size, 16)):
+                            try:
+                                bytes_data.append(
+                                    f"{idaapi.get_byte(member_addr + i):02X}"
+                                )
+                            except Exception:
+                                break
                         value_str = f"[{' '.join(bytes_data)}{'...' if member_size > 16 else ''}]"
                 except Exception:
                     value_str = "<failed to read>"
@@ -475,7 +371,7 @@ def search_structs(
     filter: Annotated[
         str, "Case-insensitive substring to search for in structure names"
     ],
-) -> list[SearchStructResult]:
+) -> list[dict]:
     """Search local structs/unions by name pattern."""
     results = []
     limit = compat.get_ordinal_limit()
@@ -562,12 +458,26 @@ def _type_matches_kind(kind: str, tif: ida_typeinf.tinfo_t) -> bool:
 @idasync
 def type_query(
     queries: Annotated[
-        list[TypeQuery] | TypeQuery,
+        list[TypeQuery] | TypeQuery | str,
         "Type catalog query with filtering, pagination, and optional relationships",
     ],
-) -> list[TypeQueryResult]:
+) -> list[dict]:
     """Query local types with structured filters/projection-friendly output."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries,
+        lambda s: {
+            "filter": s,
+            "kind": "any",
+            "offset": 0,
+            "count": 100,
+            "sort_by": "name",
+            "descending": False,
+            "include_decl": True,
+            "include_members": False,
+            "max_members": 64,
+            "include_relationships": False,
+        },
+    )
 
     # Build one local catalog and page/filter it per query.
     catalog: list[dict] = []
@@ -699,6 +609,7 @@ def type_query(
                 "data": page["data"],
                 "next_offset": page["next_offset"],
                 "total": len(output_rows),
+                "error": None,
             }
         )
 
@@ -709,12 +620,15 @@ def type_query(
 @idasync
 def type_inspect(
     queries: Annotated[
-        list[TypeInspectQuery] | TypeInspectQuery,
+        list[TypeInspectQuery] | TypeInspectQuery | str,
         "Inspect named types and optionally include member layout",
     ],
-) -> list[TypeInspectResult]:
+) -> list[dict]:
     """Inspect named types (size/kind/declaration/members)."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries,
+        lambda s: {"name": s, "include_members": False, "max_members": 128},
+    )
     results = []
 
     for query in queries:
@@ -755,6 +669,7 @@ def type_inspect(
                 "is_udt": tif.is_udt(),
                 "members": None,
                 "member_count": 0,
+                "error": None,
             }
 
             if include_members and tif.is_udt():
@@ -826,8 +741,7 @@ def _parse_type_tinfo(type_text: str) -> ida_typeinf.tinfo_t:
         for candidate in candidates:
             tif = ida_typeinf.tinfo_t()
             try:
-                # parse_decl returns '' on success in IDA 9.0, check is not None
-                if parse_decl(tif, None, candidate, flags) is not None and not tif.empty():
+                if parse_decl(tif, None, candidate, flags):
                     return tif
             except Exception:
                 continue
@@ -861,8 +775,7 @@ def _parse_function_tinfo(signature_text: str) -> ida_typeinf.tinfo_t:
         for candidate in candidates:
             tif = ida_typeinf.tinfo_t()
             try:
-                # parse_decl returns '' on success in IDA 9.0, check is not None
-                if parse_decl(tif, None, candidate, flags) is not None and tif.is_func():
+                if parse_decl(tif, None, candidate, flags) and tif.is_func():
                     return tif
             except Exception:
                 continue
@@ -893,7 +806,7 @@ def _infer_type_edit_kind(edit: dict) -> str:
             if fn:
                 frame_tif = ida_typeinf.tinfo_t()
                 if ida_frame.get_func_frame(frame_tif, fn):
-                    _, udm = tinfo_get_udm(frame_tif, str(edit["name"]))
+                    _, udm = frame_tif.get_udm(str(edit["name"]))
                     if udm:
                         return "stack"
         except Exception:
@@ -902,7 +815,7 @@ def _infer_type_edit_kind(edit: dict) -> str:
     return "global"
 
 
-def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
+def _apply_type_edit(edit: dict) -> dict:
     try:
         kind = _infer_type_edit_kind(edit)
         type_text = _resolve_type_text(edit)
@@ -918,14 +831,12 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
             signature = str(edit.get("signature") or type_text).strip()
             tif = _parse_function_tinfo(signature)
             ok = ida_typeinf.apply_tinfo(func.start_ea, tif, ida_typeinf.PT_SIL)
-            result = {"edit": edit, "kind": kind, "ok": ok}
-            if not ok:
-                result["error"] = (
-                    f"Failed to apply function type at {hex(func.start_ea)} for signature "
-                    f"{signature!r}; ensure all referenced types are declared in the local "
-                    "type library"
-                )
-            return result
+            return {
+                "edit": edit,
+                "kind": kind,
+                "ok": ok,
+                "error": None if ok else "Failed to apply function type",
+            }
 
         if kind == "global":
             ea = idaapi.BADADDR
@@ -944,12 +855,12 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
 
             tif = _parse_type_tinfo(type_text)
             ok = ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.PT_SIL)
-            result = {"edit": edit, "kind": kind, "ok": ok}
-            if not ok:
-                result["error"] = (
-                    f"Failed to apply global type at {hex(ea)} for type {type_text!r}"
-                )
-            return result
+            return {
+                "edit": edit,
+                "kind": kind,
+                "ok": ok,
+                "error": None if ok else "Failed to apply global type",
+            }
 
         if kind == "local":
             addr_text = str(edit.get("addr", "")).strip()
@@ -964,21 +875,14 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
                 return {"edit": edit, "kind": kind, "error": "Function not found"}
 
             new_tif = _parse_type_tinfo(type_text)
-
             modifier = my_modifier_t(var_name, new_tif)
             ok = ida_hexrays.modify_user_lvars(func.start_ea, modifier)
-            result = {"edit": edit, "kind": kind, "ok": ok}
-            if not ok:
-                if not hexrays_local_var_exists(func.start_ea, var_name):
-                    result["error"] = (
-                        f"Local variable {var_name!r} not found in function at "
-                        f"{hex(func.start_ea)}"
-                    )
-                else:
-                    result["error"] = (
-                        f"Failed to apply type {type_text!r} to local variable {var_name!r}"
-                    )
-            return result
+            return {
+                "edit": edit,
+                "kind": kind,
+                "ok": ok,
+                "error": None if ok else "Failed to apply local variable type",
+            }
 
         if kind == "stack":
             addr_text = str(edit.get("addr", "")).strip()
@@ -996,7 +900,7 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
             if not ida_frame.get_func_frame(frame_tif, func):
                 return {"edit": edit, "kind": kind, "error": "No frame available"}
 
-            idx, udm = tinfo_get_udm(frame_tif, stack_name)
+            idx, udm = frame_tif.get_udm(stack_name)
             if not udm:
                 return {
                     "edit": edit,
@@ -1011,13 +915,12 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
 
             tif = _parse_type_tinfo(type_text)
             ok = ida_frame.set_frame_member_type(func, offset, tif)
-            result = {"edit": edit, "kind": kind, "ok": ok}
-            if not ok:
-                result["error"] = (
-                    f"Failed to set stack member type for {stack_name!r} at offset "
-                    f"{offset} in function at {hex(func.start_ea)}"
-                )
-            return result
+            return {
+                "edit": edit,
+                "kind": kind,
+                "ok": ok,
+                "error": None if ok else "Failed to set stack member type",
+            }
 
         return {"edit": edit, "kind": kind, "error": f"Unknown kind: {kind}"}
     except Exception as e:
@@ -1026,7 +929,8 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
 
 @tool
 @idasync
-def set_type(edits: list[TypeEdit] | TypeEdit) -> list[SetTypeResult]:
+@unsafe
+def set_type(edits: list[TypeEdit] | TypeEdit) -> list[dict]:
     """Apply types (function/global/local/stack)"""
     normalized_edits = normalize_dict_list(edits, _parse_addr_type_shorthand)
     return [_apply_type_edit(edit) for edit in normalized_edits]
@@ -1034,17 +938,22 @@ def set_type(edits: list[TypeEdit] | TypeEdit) -> list[SetTypeResult]:
 
 @tool
 @idasync
+@unsafe
 def type_apply_batch(
     batch: Annotated[
-        TypeApplyBatch,
+        TypeApplyBatch | list[TypeEdit] | TypeEdit,
         "Batch type edits with optional stop_on_error behavior",
     ],
-) -> TypeApplyBatchResult:
+) -> dict:
     """Apply multiple type edits and return aggregate status."""
-    normalized_edits = normalize_dict_list(
-        batch.get("edits", []), _parse_addr_type_shorthand
-    )
-    stop_on_error = bool(batch.get("stop_on_error", False))
+    if isinstance(batch, dict) and "edits" in batch:
+        normalized_edits = normalize_dict_list(
+            batch.get("edits", []), _parse_addr_type_shorthand
+        )
+        stop_on_error = bool(batch.get("stop_on_error", False))
+    else:
+        normalized_edits = normalize_dict_list(batch, _parse_addr_type_shorthand)
+        stop_on_error = False
 
     results: list[dict] = []
     for edit in normalized_edits:
@@ -1068,7 +977,7 @@ def type_apply_batch(
 @idasync
 def infer_types(
     addrs: Annotated[list[str] | str, "Addresses to infer types for"],
-) -> list[InferTypeResult]:
+) -> list[dict]:
     """Infer and apply likely types at target addresses."""
     addrs = normalize_list_input(addrs)
     results = []

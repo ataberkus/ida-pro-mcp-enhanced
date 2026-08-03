@@ -1,27 +1,21 @@
 """Core API Functions - IDB metadata and basic queries"""
 
-import logging
 import re
 import time
-from typing import Annotated, Any, NotRequired, TypedDict
+from typing import Annotated
 
 import ida_auto
-import ida_bytes
 import idaapi
 import ida_funcs
 import ida_hexrays
-import ida_kernwin
-import ida_lines
-import ida_search
-import ida_segment
 import idautils
 import ida_loader
 import ida_nalt
 import ida_typeinf
 import idc
 
-from .rpc import tool
-from .sync import idasync, get_tool_deadline
+from .rpc import tool, unsafe
+from .sync import idasync
 from .utils import (
     ConvertedNumber,
     EntityQuery,
@@ -40,104 +34,6 @@ from .utils import (
     paginate,
     pattern_filter,
 )
-
-
-logger = logging.getLogger(__name__)
-
-
-class ServerHealthResult(TypedDict):
-    status: str
-    uptime_sec: float
-    idb_path: str | None
-    module: str
-    input_path: str
-    imagebase: str
-    auto_analysis_ready: bool | None
-    hexrays_ready: bool
-    strings_cache_ready: bool
-    strings_cache_size: int
-
-
-class ServerWarmupStep(TypedDict, total=False):
-    step: str
-    ok: bool
-    ms: float
-    error: str
-
-
-class ServerWarmupResult(TypedDict):
-    ok: bool
-    steps: list[ServerWarmupStep]
-    health: ServerHealthResult
-
-
-class LookupFuncResult(TypedDict):
-    query: str
-    fn: Function | None
-    error: str | None
-
-
-class IntConvertResult(TypedDict):
-    input: str
-    result: ConvertedNumber | None
-    error: str | None
-
-
-class FunctionQueryRow(Function, total=False):
-    has_type: bool
-    size_int: int
-
-
-class FunctionQueryPage(TypedDict, total=False):
-    data: list[FunctionQueryRow]
-    next_offset: int | None
-    error: str | None
-
-
-class EntityQueryPage(TypedDict, total=False):
-    kind: str
-    data: list[dict[str, Any]]
-    next_offset: int | None
-    total: int
-    error: str | None
-
-
-class ImportsQueryPage(TypedDict):
-    data: list[Import]
-    next_offset: int | None
-
-
-class IdbSaveResult(TypedDict):
-    ok: bool
-    path: str | None
-    error: NotRequired[str]
-
-
-class FindRegexResult(TypedDict, total=False):
-    n: int
-    matches: list[dict[str, Any]]
-    cursor: dict[str, Any]
-    error: str | None
-
-
-class SearchTextLine(TypedDict, total=False):
-    kind: str  # "disasm" | "comment"
-    text: str
-
-
-class SearchTextHit(TypedDict, total=False):
-    addr: str
-    function: str
-    segment: str
-    matches: list[SearchTextLine]
-
-
-class SearchTextResult(TypedDict, total=False):
-    n: int
-    hits: list[SearchTextHit]
-    cursor: dict[str, Any]
-    error: str
-
 
 # Cached strings list: [(ea, text), ...]
 _strings_cache: list[tuple[int, str]] | None = None
@@ -163,7 +59,7 @@ def init_caches():
     t0 = time.perf_counter()
     strings = _get_strings_cache()
     t1 = time.perf_counter()
-    logger.info("[MCP] Cached %d strings in %.0fms", len(strings), (t1 - t0) * 1000)
+    print(f"[MCP] Cached {len(strings)} strings in {(t1 - t0) * 1000:.0f}ms")
 
 
 # ============================================================================
@@ -375,53 +271,42 @@ def _build_health_payload() -> dict:
 
 @tool
 @idasync
-def server_health() -> ServerHealthResult:
+def server_health() -> dict:
     """Health/ready probe for MCP server and current IDB state."""
     return _build_health_payload()
 
 
+@tool
 @idasync
 def server_warmup(
-    wait_auto_analysis: bool = True,
-    build_caches: bool = True,
-    init_hexrays: bool = True,
-) -> ServerWarmupResult:
-    """Warm up IDA subsystems. Called by idb_open; no longer exposed as an MCP tool."""
+    wait_auto_analysis: Annotated[bool, "Wait for auto analysis queue"] = True,
+    build_caches: Annotated[bool, "Build core caches (currently strings)"] = True,
+    init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler plugin"] = True,
+) -> dict:
+    """Warm up IDA subsystems to reduce first-call latency and transient failures."""
     steps = []
 
     if wait_auto_analysis:
         t0 = time.perf_counter()
         ida_auto.auto_wait()
-        steps.append(
-            {
-                "step": "auto_wait",
-                "ok": True,
-                "ms": round((time.perf_counter() - t0) * 1000, 2),
-            }
-        )
+        steps.append({"step": "auto_wait", "ok": True, "ms": round((time.perf_counter() - t0) * 1000, 2)})
 
     if build_caches:
         t0 = time.perf_counter()
         init_caches()
-        steps.append(
-            {
-                "step": "init_caches",
-                "ok": True,
-                "ms": round((time.perf_counter() - t0) * 1000, 2),
-            }
-        )
+        steps.append({"step": "init_caches", "ok": True, "ms": round((time.perf_counter() - t0) * 1000, 2)})
 
     if init_hexrays:
         t0 = time.perf_counter()
         ok = bool(ida_hexrays.init_hexrays_plugin())
-        step = {
-            "step": "init_hexrays",
-            "ok": ok,
-            "ms": round((time.perf_counter() - t0) * 1000, 2),
-        }
-        if not ok:
-            step["error"] = "Hex-Rays unavailable"
-        steps.append(step)
+        steps.append(
+            {
+                "step": "init_hexrays",
+                "ok": ok,
+                "ms": round((time.perf_counter() - t0) * 1000, 2),
+                "error": None if ok else "Hex-Rays unavailable",
+            }
+        )
 
     return {
         "ok": all(bool(step.get("ok")) for step in steps),
@@ -434,7 +319,7 @@ def server_warmup(
 @idasync
 def lookup_funcs(
     queries: Annotated[list[str] | str, "Address(es) or name(s)"],
-) -> list[LookupFuncResult]:
+) -> list[dict]:
     """Get functions by address or name (auto-detects)"""
     queries = normalize_list_input(queries)
 
@@ -479,7 +364,7 @@ def int_convert(
         list[NumberConversion] | NumberConversion,
         "Convert numbers to various formats (hex, decimal, binary, ascii)",
     ],
-) -> list[IntConvertResult]:
+) -> list[dict]:
     """Convert numbers to different formats"""
     inputs = normalize_dict_list(inputs, lambda s: {"text": s, "size": 64})
 
@@ -546,12 +431,14 @@ def int_convert(
 @idasync
 def list_funcs(
     queries: Annotated[
-        list[ListQuery] | ListQuery,
+        list[ListQuery] | ListQuery | str,
         "List functions with optional filtering and pagination",
     ],
 ) -> list[Page[Function]]:
     """List functions with optional filtering and offset/count pagination."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries, lambda s: {"offset": 0, "count": 50, "filter": s}
+    )
     all_functions = [get_function(addr) for addr in idautils.Functions()]
 
     results = []
@@ -574,12 +461,21 @@ def list_funcs(
 @idasync
 def func_query(
     queries: Annotated[
-        list[FunctionQuery] | FunctionQuery,
+        list[FunctionQuery] | FunctionQuery | str,
         "Richer function query (size/type/name filters + pagination)",
     ],
-) -> list[FunctionQueryPage]:
+) -> list[dict]:
     """Query functions with richer filtering than list_funcs."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries,
+        lambda s: {
+            "filter": s,
+            "offset": 0,
+            "count": 50,
+            "sort_by": "addr",
+            "descending": False,
+        },
+    )
 
     all_functions: list[dict] = []
     for addr in idautils.Functions():
@@ -656,12 +552,14 @@ def func_query(
 @idasync
 def list_globals(
     queries: Annotated[
-        list[ListQuery] | ListQuery,
+        list[ListQuery] | ListQuery | str,
         "List global variables with optional filtering and pagination",
     ],
 ) -> list[Page[Global]]:
     """List globals with optional filtering and offset/count pagination."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries, lambda s: {"offset": 0, "count": 50, "filter": s}
+    )
     all_globals: list[Global] = []
     for addr, name in idautils.Names():
         if not idaapi.get_func(addr) and name is not None:
@@ -687,12 +585,15 @@ def list_globals(
 @idasync
 def entity_query(
     queries: Annotated[
-        list[EntityQuery] | EntityQuery,
+        list[EntityQuery] | EntityQuery | str,
         "Generic entity query with filtering, projection, and pagination",
     ],
-) -> list[EntityQueryPage]:
+) -> list[dict]:
     """Query IDB entities with typed filters, projection, and pagination."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries,
+        lambda s: {"kind": s, "offset": 0, "count": 100, "sort_by": "addr"},
+    )
     results: list[dict] = []
 
     for query in queries:
@@ -802,12 +703,14 @@ def imports(
 @idasync
 def imports_query(
     queries: Annotated[
-        list[ImportQuery] | ImportQuery,
+        list[ImportQuery] | ImportQuery | str,
         "Import query with import/module filters and pagination",
     ],
-) -> list[ImportsQueryPage]:
+) -> list[dict]:
     """Query imports with richer filtering than imports(offset,count)."""
-    queries = normalize_dict_list(queries)
+    queries = normalize_dict_list(
+        queries, lambda s: {"filter": s, "offset": 0, "count": 100}
+    )
     all_imports = _collect_imports()
     results = []
 
@@ -830,34 +733,24 @@ def imports_query(
 
 @tool
 @idasync
+@unsafe
 def idb_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
-) -> IdbSaveResult:
-    """Save active IDB to disk, optionally to a provided path.
-
-    The open database is backed by loose working files (.id0/.id1/.id2/.nam/.til)
-    that IDA actively manages, headless included. Killing them out from under the
-    open database corrupts it (issues #446, #498), so DBFL_KILL is never used
-    here: an in-place save uses IDA's native save (Ctrl+W), and an explicit
-    different destination gets a compressed copy while the working files stay.
-    """
+) -> dict:
+    """Save active IDB to disk, optionally to a provided path."""
     try:
         save_path = path.strip() if path else ""
-        current = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
         if not save_path:
-            save_path = current
+            save_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
         if not save_path:
             return {"ok": False, "path": None, "error": "Could not resolve IDB path"}
 
-        if save_path != current:
-            ok = bool(ida_loader.save_database(save_path, ida_loader.DBFL_COMP))
-        else:
-            ok = bool(ida_loader.save_database(None, 0))
-
-        result: dict = {"ok": ok, "path": save_path}
-        if not ok:
-            result["error"] = "save_database returned false"
-        return result
+        ok = bool(ida_loader.save_database(save_path, 0))
+        return {
+            "ok": ok,
+            "path": save_path,
+            "error": None if ok else "save_database returned false",
+        }
     except Exception as e:
         return {"ok": False, "path": path or None, "error": str(e)}
 
@@ -868,7 +761,7 @@ def find_regex(
     pattern: Annotated[str, "Regex pattern to search for in strings"],
     limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
-) -> FindRegexResult:
+) -> dict:
     """Search strings by case-insensitive regex with offset/limit pagination."""
     if limit <= 0:
         limit = 30
@@ -896,222 +789,3 @@ def find_regex(
         "matches": matches,
         "cursor": {"next": offset + limit} if more else {"done": True},
     }
-
-
-_COMMENT_SCOLORS = (
-    ida_lines.SCOLOR_REGCMT,
-    ida_lines.SCOLOR_RPTCMT,
-    ida_lines.SCOLOR_AUTOCMT,
-    ida_lines.SCOLOR_COLLAPSED,
-)
-
-
-def _line_is_comment(tagged: str) -> bool:
-    """A rendered listing line is a comment if it carries any comment SCOLOR tag."""
-    if not tagged:
-        return False
-    for sc in _COMMENT_SCOLORS:
-        if ida_lines.COLOR_ON + sc in tagged:
-            return True
-    return False
-
-
-def _classify_hit_lines(
-    ea: int,
-    matcher,
-    want_disasm: bool,
-    want_comments: bool,
-    max_lines: int = 32,
-) -> list[SearchTextLine]:
-    """Render the listing for `ea` once, classify each line, return matching lines."""
-    out: list[SearchTextLine] = []
-    try:
-        result = ida_lines.generate_disassembly(ea, max_lines, False, False)
-    except Exception:
-        return out
-    # Bindings vary: (n, lineno, lines) or (lines, lineno).
-    lines = None
-    if isinstance(result, tuple):
-        for item in result:
-            if isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
-                lines = list(item)
-                break
-    if lines is None:
-        return out
-
-    for tagged in lines:
-        text = ida_lines.tag_remove(tagged) or ""
-        if not text or not matcher(text):
-            continue
-        is_cmt = _line_is_comment(tagged)
-        kind = "comment" if is_cmt else "disasm"
-        if kind == "disasm" and not want_disasm:
-            continue
-        if kind == "comment" and not want_comments:
-            continue
-        out.append({"kind": kind, "text": text})
-    return out
-
-
-def _exec_segments() -> list[tuple[int, int]]:
-    """Return [(start, end)] for executable segments in address order."""
-    ranges: list[tuple[int, int]] = []
-    for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
-        if not seg:
-            continue
-        if not (seg.perm & idaapi.SEGPERM_EXEC):
-            continue
-        ranges.append((seg.start_ea, seg.end_ea))
-    return ranges
-
-
-def _all_segments() -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
-    for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
-        if seg:
-            ranges.append((seg.start_ea, seg.end_ea))
-    return ranges
-
-
-@tool
-@idasync
-def search_text(
-    pattern: Annotated[str, "Text to search for in the rendered listing (literal substring by default)"],
-    limit: Annotated[int, "Max hits per page (default: 30, max: 500)"] = 30,
-    start: Annotated[str, "Lower bound (hex or symbol). Empty = first segment."] = "",
-    end: Annotated[str, "Upper bound (hex or symbol, exclusive). Empty = last segment."] = "",
-    regex: Annotated[bool, "Treat pattern as a Python regex"] = False,
-    case_sensitive: Annotated[bool, "Case-sensitive match (default: false)"] = False,
-    include: Annotated[str, "'disasm' | 'comments' | 'all' (default: all)"] = "all",
-    code_only: Annotated[bool, "Restrict search to executable segments (default: true)"] = True,
-) -> SearchTextResult:
-    """Search the rendered listing for `pattern` over [start, end).
-
-    Iterates `idautils.Heads()` in pure Python and renders each via
-    `ida_lines.generate_disassembly()`. Per-head iteration is cheap and
-    yields between heads, so the per-tool deadline (sync_wrapper) and the
-    UI Cancel button both interrupt the walk reliably — unlike the C-level
-    `ida_search.find_text()` it replaced, which on huge .text segments
-    could run for minutes without polling `user_cancelled()`.
-
-    Use `start`/`end` to scope the work for predictable performance on
-    large binaries; without them the scan covers the whole image.
-    """
-    if limit <= 0:
-        limit = 30
-    if limit > 500:
-        limit = 500
-
-    include = (include or "all").lower()
-    if include not in ("disasm", "comments", "all"):
-        return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid include: {include!r}"}
-
-    want_disasm = include in ("disasm", "all")
-    want_comments = include in ("comments", "all")
-
-    # Per-line matcher (Python re or substring; case folding done here).
-    if regex:
-        try:
-            flags = 0 if case_sensitive else re.IGNORECASE
-            rx = re.compile(pattern, flags)
-        except re.error as e:
-            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid regex: {e}"}
-        matcher = lambda s: bool(rx.search(s))
-    elif case_sensitive:
-        needle = pattern
-        matcher = lambda s: needle in s
-    else:
-        needle = pattern.lower()
-        matcher = lambda s: needle in s.lower()
-
-    segments = _exec_segments() if code_only else _all_segments()
-    if not segments:
-        return {"n": 0, "hits": [], "cursor": {"done": True}}
-
-    if start:
-        try:
-            start_ea = parse_address(start)
-        except Exception as e:
-            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid start: {e}"}
-    else:
-        start_ea = segments[0][0]
-
-    if end:
-        try:
-            end_ea = parse_address(end)
-        except Exception as e:
-            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid end: {e}"}
-    else:
-        end_ea = segments[-1][1]
-
-    if end_ea <= start_ea:
-        return {"n": 0, "hits": [], "cursor": {"done": True}}
-
-    hits: list[SearchTextHit] = []
-    next_cursor: int | None = None
-    cancelled = False
-    # Chunk the address space into fixed-size windows and call Heads() per
-    # chunk. This bounds each Heads()/next_head() C call to one CHUNK_BYTES
-    # scan — without it, a single next_head over a huge undefined gap can
-    # run for tens of seconds without yielding to Python, so neither the
-    # tool deadline nor the cancel flag can interrupt it.
-    #
-    # Between chunks we check (a) our own monotonic deadline directly
-    # (independent of sync.py's Timer, which can be starved by GIL contention
-    # on big binaries), and (b) the global cancel flag for UI-driven cancels.
-    # Either path returns a partial result with cursor.cancelled=True.
-    CHUNK_BYTES = 65536
-    deadline = get_tool_deadline()
-
-    for seg_start, seg_end in segments:
-        if cancelled or len(hits) >= limit:
-            break
-        if seg_end <= start_ea:
-            continue
-        if seg_start >= end_ea:
-            break
-        walk_start = max(seg_start, start_ea)
-        walk_end = min(seg_end, end_ea)
-        chunk_ea = walk_start
-        while chunk_ea < walk_end:
-            if cancelled or len(hits) >= limit:
-                break
-            if (deadline is not None and time.monotonic() >= deadline) \
-                    or ida_kernwin.user_cancelled():
-                cancelled = True
-                next_cursor = chunk_ea
-                break
-            chunk_end = min(chunk_ea + CHUNK_BYTES, walk_end)
-            for head_ea in idautils.Heads(chunk_ea, chunk_end):
-                lines = _classify_hit_lines(head_ea, matcher, want_disasm, want_comments)
-                if not lines:
-                    continue
-                entry: SearchTextHit = {"addr": hex(head_ea), "matches": lines}
-                func = idaapi.get_func(head_ea)
-                if func is not None:
-                    fname = ida_funcs.get_func_name(func.start_ea)
-                    if fname:
-                        entry["function"] = fname
-                seg = idaapi.getseg(head_ea)
-                if seg is not None:
-                    sname = ida_segment.get_segm_name(seg)
-                    if sname:
-                        entry["segment"] = sname
-                hits.append(entry)
-                if len(hits) >= limit:
-                    size = max(1, idaapi.get_item_size(head_ea))
-                    next_cursor = head_ea + size
-                    break
-            chunk_ea = chunk_end
-
-    cursor: dict[str, Any]
-    if cancelled:
-        cursor = {"next": hex(next_cursor), "cancelled": True}
-    elif next_cursor is not None:
-        cursor = {"next": hex(next_cursor)}
-    else:
-        cursor = {"done": True}
-
-    return {"n": len(hits), "hits": hits, "cursor": cursor}

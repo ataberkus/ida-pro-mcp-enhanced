@@ -6,11 +6,11 @@ granularities (bytes, integers, strings) and patching binary data.
 
 import re
 
-from typing import Annotated, NotRequired, TypedDict
+from typing import Annotated
 import ida_bytes
 import idaapi
 
-from .rpc import tool
+from .rpc import tool, unsafe
 from .sync import idasync
 from .utils import (
     IntRead,
@@ -19,47 +19,7 @@ from .utils import (
     MemoryRead,
     normalize_list_input,
     parse_address,
-    read_bytes_bss_safe,
-    read_int_bss_safe,
 )
-
-
-class BytesReadResult(TypedDict):
-    addr: str | None
-    data: str | None
-    error: NotRequired[str]
-
-
-class IntReadResult(TypedDict):
-    addr: str
-    ty: str
-    value: int | None
-    error: NotRequired[str]
-
-
-class StringReadResult(TypedDict):
-    addr: str
-    value: str | None
-    error: NotRequired[str]
-
-
-class GlobalValueResult(TypedDict):
-    query: str
-    value: str | None
-    error: NotRequired[str]
-
-
-class PatchResult(TypedDict):
-    addr: str | None
-    size: int
-    error: NotRequired[str]
-
-
-class IntWriteResult(TypedDict):
-    addr: str
-    ty: str
-    value: str | None
-    error: NotRequired[str]
 
 
 # ============================================================================
@@ -69,7 +29,7 @@ class IntWriteResult(TypedDict):
 
 @tool
 @idasync
-def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[BytesReadResult]:
+def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[dict]:
     """Read bytes from memory addresses"""
     if isinstance(regions, dict):
         regions = [regions]
@@ -81,8 +41,7 @@ def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[BytesReadResult]:
 
         try:
             ea = parse_address(addr)
-            raw = read_bytes_bss_safe(ea, size)
-            data = " ".join(f"{x:#02x}" for x in raw)
+            data = " ".join(f"{x:#02x}" for x in ida_bytes.get_bytes(ea, size))
             results.append({"addr": addr, "data": data})
         except Exception as e:
             results.append({"addr": addr, "data": None, "error": str(e)})
@@ -133,7 +92,7 @@ def get_int(
         list[IntRead] | IntRead,
         "Integer read requests (ty, addr). ty: i8/u64/i16le/i16be/etc",
     ],
-) -> list[IntReadResult]:
+) -> list[dict]:
     """Read integer values from memory addresses"""
     if isinstance(queries, dict):
         queries = [queries]
@@ -147,13 +106,13 @@ def get_int(
             bits, signed, byte_order, normalized = _parse_int_class(ty)
             ea = parse_address(addr)
             size = bits // 8
-            data = read_bytes_bss_safe(ea, size)
-            if len(data) != size:
+            data = ida_bytes.get_bytes(ea, size)
+            if not data or len(data) != size:
                 raise ValueError(f"Failed to read {size} bytes at {addr}")
 
             value = int.from_bytes(data, byte_order, signed=signed)
             results.append(
-                {"addr": addr, "ty": normalized, "value": value}
+                {"addr": addr, "ty": normalized, "value": value, "error": None}
             )
         except Exception as e:
             results.append({"addr": addr, "ty": ty, "value": None, "error": str(e)})
@@ -165,7 +124,7 @@ def get_int(
 @idasync
 def get_string(
     addrs: Annotated[list[str] | str, "Addresses to read strings from"],
-) -> list[StringReadResult]:
+) -> list[dict]:
     """Read strings from memory addresses"""
     addrs = normalize_list_input(addrs)
     results = []
@@ -210,10 +169,16 @@ def get_global_variable_value_internal(ea: int) -> str:
             return '""'
         return_string = raw.decode("utf-8", errors="replace").strip()
         return f'"{return_string}"'
-
-    if size in (1, 2, 4, 8):
-        return hex(read_int_bss_safe(ea, size))
-    return " ".join(hex(b) for b in read_bytes_bss_safe(ea, size))
+    elif size == 1:
+        return hex(ida_bytes.get_byte(ea))
+    elif size == 2:
+        return hex(ida_bytes.get_word(ea))
+    elif size == 4:
+        return hex(ida_bytes.get_dword(ea))
+    elif size == 8:
+        return hex(ida_bytes.get_qword(ea))
+    else:
+        return " ".join(hex(x) for x in ida_bytes.get_bytes(ea, size))
 
 
 @tool
@@ -222,7 +187,7 @@ def get_global_value(
     queries: Annotated[
         list[str] | str, "Global variable addresses or names to read values from"
     ],
-) -> list[GlobalValueResult]:
+) -> list[dict]:
     """Read global variable values by address or symbol name."""
     from .utils import looks_like_address
 
@@ -249,7 +214,7 @@ def get_global_value(
                 continue
 
             value = get_global_variable_value_internal(ea)
-            results.append({"query": query, "value": value})
+            results.append({"query": query, "value": value, "error": None})
         except Exception as e:
             results.append({"query": query, "value": None, "error": str(e)})
 
@@ -263,7 +228,8 @@ def get_global_value(
 
 @tool
 @idasync
-def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[PatchResult]:
+@unsafe
+def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[dict]:
     """Patch bytes at memory addresses with hex data"""
     if isinstance(patches, dict):
         patches = [patches]
@@ -280,7 +246,7 @@ def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[PatchResult]:
 
             ida_bytes.patch_bytes(ea, data)
             results.append(
-                {"addr": patch["addr"], "size": len(data)}
+                {"addr": patch["addr"], "size": len(data), "ok": True, "error": None}
             )
 
         except Exception as e:
@@ -291,12 +257,13 @@ def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[PatchResult]:
 
 @tool
 @idasync
+@unsafe
 def put_int(
     items: Annotated[
         list[IntWrite] | IntWrite,
         "Integer write requests (ty, addr, value). value is a string; supports 0x.. and negatives",
     ],
-) -> list[IntWriteResult]:
+) -> list[dict]:
     """Write integer values to memory addresses"""
     if isinstance(items, dict):
         items = [items]
@@ -325,6 +292,8 @@ def put_int(
                     "addr": addr,
                     "ty": normalized,
                     "value": str(value_text),
+                    "ok": True,
+                    "error": None,
                 }
             )
         except Exception as e:
@@ -333,6 +302,7 @@ def put_int(
                     "addr": addr,
                     "ty": ty,
                     "value": str(value_text) if value_text is not None else None,
+                    "ok": False,
                     "error": str(e),
                 }
             )
