@@ -15,6 +15,7 @@ import ida_segment
 import ida_typeinf
 import idc
 
+from . import compat
 from .rpc import tool, unsafe
 from .sync import idasync
 from .utils import (
@@ -134,12 +135,7 @@ def _segment_name_for_ea(ea: int) -> str | None:
 
 def _get_func(ea: int):
     """Return function entry/range info without IDA 9.x deprecation warnings."""
-    try:
-        return ida_funcs.get_func(ea)
-    except (AttributeError, TypeError):
-        # IDA 7.x/8.x compatibility.
-        pass
-    return idaapi.get_func(ea)
+    return compat.get_func(ea)
 
 
 def _primary_text_key(kind: str) -> str:

@@ -121,7 +121,7 @@ def _build_statistics(func_eas: list[int], string_count: int, segment_count: int
     for ea in func_eas:
         name = idc.get_name(ea, 0) or ""
         func = compat.get_func(ea)
-        flags = func.flags if func else 0
+        flags = compat.get_func_flags(func)
 
         if name.startswith("sub_"):
             unnamed += 1
@@ -175,7 +175,7 @@ def _classify_func(ea: int, func, name: str, callee_count: int) -> str:
     """Classify function as thunk/wrapper/leaf/dispatcher/complex."""
     import idaapi
 
-    flags = func.flags
+    flags = compat.get_func_flags(func)
     size = func.end_ea - func.start_ea
     if flags & idaapi.FUNC_THUNK or size <= 8:
         return "thunk"
@@ -200,7 +200,7 @@ def _build_interesting_functions(func_eas: list[int], truncated: bool) -> list[d
         if not func:
             continue
         name = idc.get_name(ea, 0) or ""
-        flags = func.flags
+        flags = compat.get_func_flags(func)
 
         if _is_library_func(ea, name, flags):
             continue

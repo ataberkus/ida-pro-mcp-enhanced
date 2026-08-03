@@ -152,13 +152,32 @@ def inf_is_64bit() -> bool:
 
 
 def get_func(ea: int):
-    """Return the function containing *ea* without IDA 9.x warnings."""
+    """Return the function containing *ea* without IDA 9.x warnings.
+
+    On IDA 9.4+, prefer func_entry_info_t via get_func_entry_info().
+    Falls back to legacy get_func()/idaapi.get_func() on older IDA.
+    """
+    try:
+        info = ida_funcs.func_entry_info_t()
+        if ida_funcs.get_func_entry_info(info, ea):
+            return info
+        return None
+    except (AttributeError, TypeError):
+        # IDA <9.4: func_entry_info_t / get_func_entry_info unavailable.
+        pass
     try:
         return ida_funcs.get_func(ea)
     except (AttributeError, TypeError):
-        # IDA 7.x/8.x compatibility.  This branch is intentionally kept
-        # isolated so IDA 9.x never calls the deprecated idaapi wrapper.
         return idaapi.get_func(ea)
+
+
+def get_func_flags(func) -> int:
+    """Return function flags from func_t or func_entry_info_t."""
+    if func is None:
+        return 0
+    if hasattr(func, "get_flags"):
+        return int(func.get_flags())
+    return int(getattr(func, "flags", 0) or 0)
 
 
 def get_segment_info(ea: int):
@@ -182,17 +201,21 @@ def get_segment_name(ea: int) -> str | None:
         return idaapi.get_segm_name(seg) if seg else None
 
 
-def get_func_name(func: ida_funcs.func_t) -> str | None:
-    # func_t.get_name() introduced in 8.5
-    if IDA_GE_85:
-        return func.get_name()
+def get_func_name(func) -> str | None:
+    """Return function name; accepts func_t or func_entry_info_t."""
+    # Address-based lookup works for both func_t and func_entry_info_t.
+    # func_entry_info_t.get_name() only works when fetched with GFI_NAME.
     return ida_funcs.get_func_name(func.start_ea)
 
 
-def get_func_prototype(func: ida_funcs.func_t) -> ida_typeinf.tinfo_t | None:
-    # func_t.get_prototype() introduced in 8.5
-    if IDA_GE_85:
-        return func.get_prototype()
+def get_func_prototype(func) -> ida_typeinf.tinfo_t | None:
+    """Return function prototype; accepts func_t or func_entry_info_t."""
+    # func_t.get_prototype() introduced in 8.5; unavailable on entry-info.
+    if IDA_GE_85 and hasattr(func, "get_prototype"):
+        try:
+            return func.get_prototype()
+        except Exception:
+            pass
 
     tif = ida_typeinf.tinfo_t()
     if ida_nalt.get_tinfo(tif, func.start_ea) and tif.is_func():
