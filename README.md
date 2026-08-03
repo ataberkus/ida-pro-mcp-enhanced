@@ -1,499 +1,107 @@
 # IDA Pro MCP Enhanced
 
-Simple [MCP Server](https://modelcontextprotocol.io/introduction) to allow vibe reversing in IDA Pro.
+> Turn IDA into an agentic reverse-engineering workspace—not just a remote decompiler.
 
-> [!IMPORTANT]
-> This is a private derivative of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp),
-> based on upstream commit `f82e6e2`. The original MIT license and contributor
-> attribution are retained. This branch publishes the working AppData plugin
-> snapshot with multi-instance routing and additional investigation tools.
+IDA Pro MCP Enhanced is a vNext-first derivative of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp). It gives AI agents a compact, high-leverage interface for navigating binaries, following control and data flow, building evidence, and safely improving the IDB.
 
-## Enhanced branch status
+Instead of forcing an agent through hundreds of tiny read calls, vNext combines structured investigation, graph traversal, data-flow tracing, taint analysis, batch operations, and transactional edits. The result is a faster analysis loop, less context waste, and substantially deeper reverse engineering than the legacy one-tool-at-a-time workflow.
 
-- Bridge unit tests and packaging are verified before each published revision.
-- The IDA plugin automatically starts after a database loads and registers the
-  process in the host-local instance registry.
-- One live IDA instance keeps the original unprefixed tool names.
-- Two or more instances expose `<database_prefix>__<tool>` names and
-  `ida_list_instances` reports the current prefix-to-database mapping.
-- Same-name databases receive a short instance-derived disambiguator.
-- Closed or crashed IDA processes are removed when the bridge refreshes discovery.
-- The separate `feat/vnext-foundation` experiment is intentionally not included.
+## Why it feels different
 
-### Validation snapshot (2026-08-03)
+- **Investigation, not just lookup.** `analysis_run`, `investigation_start`, `graph_query`, `dataflow_trace`, and `taint_analyze` help an agent reconstruct behavior across whole code paths.
+- **Smaller and stronger tool surface.** A bounded 35-tool canonical API replaces legacy tool sprawl while retaining proven implementations internally.
+- **Fewer round trips.** Batch-first queries, bounded responses, cached strings, and combined analysis results reduce tool-call churn on large databases.
+- **Safe autonomous editing.** Renames, types, comments, and other IDB changes use preview/commit transactions, revision checks, recovery checkpoints, and rollback support.
+- **Multiple IDA databases at once.** The stdio bridge discovers live IDA processes and routes each call to the right database.
+- **Real safety controls.** Read, annotate, modify, debugger, filesystem, and Python capabilities are independently scoped.
+- **IDA 9.4-first runtime.** Current function, segment, decompiler, and microcode APIs are used without the deprecated-call noise found in older integrations.
 
-- Enhanced bridge suite: `13 passed`.
-- Portable upstream compatibility suite: `209 passed, 114 subtests passed`.
-- Source compilation, wheel build, isolated wheel installation, and CLI entry
-  point smoke passed.
-- No reachable live IDA server was available during repository publication, so
-  single- and two-instance GUI acceptance remains pending.
+## Requirements
 
-## Multi-instance client configuration
+- **IDA Professional 9.4+ is strongly recommended and is the primary target.** IDA Free is not supported.
+- Older IDA releases may work through compatibility fallbacks, but this enhanced release is tested and optimized for IDA 9.4+.
+- Python 3.11+ and [uv](https://docs.astral.sh/uv/) for the standalone bridge.
+- IDAPython must be pinned to a Python runtime compatible with the IDA installation. Use `idapyswitch` if IDA reports a libpython mismatch.
 
-Multi-instance routing is provided by the stdio bridge. Install this checkout,
-then configure the MCP client to launch the packaged command:
+## Install
 
-```json
-{
-  "mcpServers": {
-    "ida-pro-mcp-enhanced": {
-      "command": "ida-pro-mcp"
-    }
-  }
-}
+Clone the private repository and install the plugin plus Codex stdio configuration from the checkout:
+
+```powershell
+git clone https://github.com/ataberkus/ida-pro-mcp-enhanced.git
+cd ida-pro-mcp-enhanced
+uv sync
+uv run ida-pro-mcp --install codex --scope global --transport stdio
 ```
 
-Direct connections to `http://127.0.0.1:13337/mcp` still work for one IDA
-instance, but they bypass discovery and therefore cannot route among multiple
-instances. Use `ida_list_instances` before prefixed calls when more than one
-database is open.
+Completely restart IDA and the MCP client after installation.
 
-The enhanced investigation surface includes the `investigate` workflow and its
-supporting analysis helpers. The implementation design and test notes are under
-`devdocs/multi-instance/`.
+If IDA was launched from a Python virtual-environment terminal, inherited variables can make IDAPython select the wrong runtime. On Windows, use the included clean launcher:
 
-https://github.com/user-attachments/assets/6ebeaa92-a9db-43fa-b756-eececce2aca0
-
-The binaries and prompt for the video are available in the [mcp-reversing-dataset](https://github.com/mrexodia/mcp-reversing-dataset) repository.
-
-## Prerequisites
-
-- [Python](https://www.python.org/downloads/) (**3.11 or higher**)
-  - Use `idapyswitch` to switch to the newest Python version
-- [IDA Pro](https://hex-rays.com/ida-pro) (8.3 or higher, 9 recommended), **IDA Free is not supported**
-- Supported MCP Client (pick one you like)
-  - [Amazon Q Developer CLI](https://aws.amazon.com/q/developer/)
-  - [Augment Code](https://www.augmentcode.com/)
-  - [Claude](https://claude.ai/download)
-  - [Claude Code](https://www.anthropic.com/code)
-  - [Cline](https://cline.bot)
-  - [Codex](https://github.com/openai/codex)
-  - [Copilot CLI](https://docs.github.com/en/copilot)
-  - [Crush](https://github.com/charmbracelet/crush)
-  - [Cursor](https://cursor.com)
-  - [Gemini CLI](https://google-gemini.github.io/gemini-cli/)
-  - [Kilo Code](https://kilo.ai/)
-  - [Kiro](https://kiro.dev/)
-  - [LM Studio](https://lmstudio.ai/)
-  - [Opencode](https://opencode.ai/)
-  - [Qodo Gen](https://www.qodo.ai/)
-  - [Qwen Coder](https://qwenlm.github.io/qwen-code-docs/)
-  - [Roo Code](https://roocode.com)
-  - [Trae](https://trae.ai/)
-  - [VS Code](https://code.visualstudio.com/)
-  - [VS Code Insiders](https://code.visualstudio.com/insiders)
-  - [Warp](https://www.warp.dev/)
-  - [Windsurf](https://windsurf.com)
-  - [Zed](https://zed.dev/)
-  - [Kimi Code](https://moonshotai.github.io/kimi-code/en/)
-  - [Other MCP Clients](https://modelcontextprotocol.io/clients#example-clients): Run `ida-pro-mcp --config` to get the JSON config for your client.
-
-**Note**: This requires having idalib activated globally and [uv](https://astral.sh/uv) installed:
-
-```bash
-# windows
-uv run "C:\Program Files\IDA Professional 9.3\idalib\python\py-activate-idalib.py"
-# macos
-uv run "/Applications/IDA Professional 9.3.app/Contents/MacOS/idalib/python/py-activate-idalib.py"
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start_ida_clean.ps1
 ```
 
-## Installation (Claude Code)
+## Agentic analysis surface
 
-To install the latest IDA Pro MCP in Claude Code:
+The advertised vNext API is deliberately focused:
 
-```bash
-claude plugin marketplace add mrexodia/claude-marketplace
-claude plugin uninstall ida-pro-mcp@mrexodia
-claude plugin install ida-pro-mcp@mrexodia
-```
+- `analysis_run` collects decompilation, disassembly, references, strings, constants, callees, callers, blocks, and risk signals in one bounded result.
+- `investigation_start` and `investigation_get` maintain an evidence-driven investigation instead of losing findings between calls.
+- `graph_query` explores callers, callees, paths, neighborhoods, and cross-reference relationships.
+- `dataflow_trace` follows values forward or backward from an address or a symbol such as `main`.
+- `taint_analyze` traces source-to-sink influence with explicit bounds.
+- `decompile`, `disassemble`, `search`, `memory_read`, and `type_query` provide targeted evidence when deeper inspection is needed.
+- Mutation tools preview a batch, validate the active database revision, create a checkpoint, and then commit atomically.
 
-## Installation (Codex)
+Legacy tools are currently hidden from MCP clients so the vNext interface can be tested as a complete workflow. Their implementations remain available internally where vNext orchestration depends on them.
 
-To install the latest IDA Pro MCP in Codex:
+## Safety profiles
 
-```bash
-codex plugin marketplace add mrexodia/codex-marketplace
-codex plugin remove ida-pro-mcp@mrexodia
-codex plugin add ida-pro-mcp@mrexodia
-```
+New installations default to the **Modify** profile: read, annotation, and IDB mutation are enabled, while debugger, filesystem, and arbitrary Python access remain opt-in.
 
-## Installation (Kimi Code)
+With IDA running, open [http://127.0.0.1:13337/config.html](http://127.0.0.1:13337/config.html) to switch quickly between Read only, Annotate, and Modify. Additional canonical, debug, Python, and legacy profiles live in [`profiles/`](profiles/).
 
-To install the latest IDA Pro MCP in Kimi Code, run this slash command in the chat:
+Every mutation preview expires and is tied to an IDB revision. If the database changes before commit, the operation fails with `STALE_REVISION` instead of silently applying an outdated plan.
 
-```
-/plugins install https://github.com/mrexodia/ida-pro-mcp/tree/main
-/reload
-```
+## Multi-instance routing
 
-This installs the `idalib` MCP server and the `idapython` skill. Plugins are copied to
-`$KIMI_CODE_HOME/plugins/managed/`, so `uv` must be on your `PATH`. The first session after
-installing is slower, because `uv` resolves the dependencies before the server responds.
+The stdio bridge is the recommended transport:
 
-## Installation (GUI)
+- With one IDA instance, tools retain normal unprefixed names.
+- With multiple instances, tools become `<database_prefix>__<tool>`.
+- `ida_list_instances` reports live processes, database paths, and routing prefixes.
+- Databases with colliding names receive an instance-derived disambiguator.
+- Closing or crashing IDA invalidates the stale routing target during discovery refresh.
 
-**Note**: the MCP plugin is no longer recommended and will eventually be deprecated. Use `idalib-mcp` instead.
+A direct connection to `http://127.0.0.1:13337/mcp` still works, but it connects to only that single IDA process and bypasses multi-instance discovery.
 
-If you want to configure the MCP server manually from the IDA GUI:
+## Verification status
 
-```sh
-pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
-```
+Current Windows/IDA 9.4 release checks:
 
-Configure the MCP servers and install the IDA Plugin:
-
-```
-ida-pro-mcp --install
-```
-
-**Important**: Make sure you completely restart IDA and your MCP client for the installation to take effect. Some clients (like Claude) run in the background and need to be quit from the tray icon.
-
-## Prompt Engineering
-
-LLMs are prone to hallucinations and you need to be specific with your prompting. For reverse engineering the conversion between integers and bytes are especially problematic. Below is a minimal example prompt, feel free to start a discussion or open an issue if you have good results with a different prompt:
-
-```md
-Your task is to analyze a crackme in IDA Pro. You can use the MCP tools to retrieve information. In general use the following strategy:
-
-- Inspect the decompilation and add comments with your findings
-- Rename variables to more sensible names
-- Change the variable and argument types if necessary (especially pointer and array types)
-- Change function names to be more descriptive
-- If more details are necessary, disassemble the function and add comments with your findings
-- NEVER convert number bases yourself. Use the `int_convert` MCP tool if needed!
-- Do not attempt brute forcing, derive any solutions purely from the disassembly and simple python scripts
-- Create a report.md with your findings and steps taken at the end
-- When you find a solution, prompt to user for feedback with the password you found
-```
-
-This prompt was just the first experiment, please share if you found ways to improve the output!
-
-Another prompt by [@can1357](https://github.com/can1357):
-
-```md
-Your task is to create a complete and comprehensive reverse engineering analysis. Reference AGENTS.md to understand the project goals and ensure the analysis serves our purposes.
-
-Use the following systematic methodology:
-
-1. **Decompilation Analysis**
-   - Thoroughly inspect the decompiler output
-   - Add detailed comments documenting your findings
-   - Focus on understanding the actual functionality and purpose of each component (do not rely on old, incorrect comments)
-
-2. **Improve Readability in the Database**
-   - Rename variables to sensible, descriptive names
-   - Correct variable and argument types where necessary (especially pointers and array types)
-   - Update function names to be descriptive of their actual purpose
-
-3. **Deep Dive When Needed**
-   - If more details are necessary, examine the disassembly and add comments with findings
-   - Document any low-level behaviors that aren't clear from the decompilation alone
-   - Use sub-agents to perform detailed analysis
-
-4. **Important Constraints**
-   - NEVER convert number bases yourself - use the int_convert MCP tool if needed
-   - Use MCP tools to retrieve information as necessary
-   - Derive all conclusions from actual analysis, not assumptions
-
-5. **Documentation**
-   - Produce comprehensive RE/*.md files with your findings
-   - Document the steps taken and methodology used
-   - When asked by the user, ensure accuracy over previous analysis file
-   - Organize findings in a way that serves the project goals outlined in AGENTS.md or CLAUDE.md
-```
-
-Live stream discussing prompting and showing some real-world malware analysis:
-
-[![](https://img.youtube.com/vi/iFxNuk3kxhk/0.jpg)](https://www.youtube.com/watch?v=iFxNuk3kxhk)
-
-## Tips for Enhancing LLM Accuracy
-
-Large Language Models (LLMs) are powerful tools, but they can sometimes struggle with complex mathematical calculations or exhibit "hallucinations" (making up facts). Make sure to tell the LLM to use the `int_convert` MCP tool and you might also need [math-mcp](https://github.com/EthanHenrickson/math-mcp) for certain operations.
-
-Another thing to keep in mind is that LLMs will not perform well on obfuscated code. Before trying to use an LLM to solve the problem, take a look around the binary and spend some time (automatically) removing the following things:
-
-- String encryption
-- Import hashing
-- Control flow flattening
-- Code encryption
-- Anti-decompilation tricks
-
-You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
-
-## Transports & Headless MCP
-
-You can run an SSE server to connect to the user interface like this:
-
-```sh
-uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
-```
-
-After installing [`idalib`](https://docs.hex-rays.com/core/idalib/getting-started) you can also run a headless MCP server. You can start with an initial binary:
-
-```sh
-uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/executable
-```
-
-Or start without a binary and open arbitrary files later with `idb_open(...)`:
-
-```sh
-uv run idalib-mcp --host 127.0.0.1 --port 8745
-```
-
-For stdio-based clients, use:
-
-```sh
-uv run idalib-mcp --stdio
-```
-
-Database workers are isolated processes protected by supervisor-generated,
-ephemeral bearer credentials. Supervisor-owned workers are terminated with
-the supervisor; GUI instances can still be adopted through host-local
-discovery. Workers also retain an idle-timeout safety net.
-
-_Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
-
-## Headless idalib Session Model
-
-`idalib-mcp` is a supervisor that keeps each open database in its own authenticated idalib worker process. Call `idb_close` to release a worker eagerly (freeing a slot toward `--max-workers`). Adopted GUI instances are detached rather than killed.
-
-`idb_open` picks the backend via its `mode` parameter:
-
-- `prefer_headless` (default): spawn an isolated idalib worker.
-- `force_headless`: same, but never adopt a running GUI even if one has the file.
-- `prefer_gui`: adopt a running GUI for the file; otherwise spawn an idalib worker.
-- `force_gui`: adopt a running GUI for the file; otherwise launch a new IDA GUI process.
-
-Every tool call must carry an explicit `database` argument. There is no implicit "current database" — callers name the session they want to operate on.
-
-```sh
-uv run idalib-mcp --stdio --max-workers 4
-```
-
-Typical flow:
-
-```python
-idb_open("/path/to/binary_a.exe", preferred_session_id="binary_a")
-idb_open("/path/to/library.dll", preferred_session_id="library")
-
-decompile("main", database="binary_a")
-xrefs_to("ImportantExport", database="library")
-```
-
-`database` must be the session ID returned by `idb_open` (or shown in `idb_list`); filenames and paths are not accepted.
-
-### Management tools
-
-- `idb_open(input_path, mode="prefer_headless", run_auto_analysis=True, build_caches=True, init_hexrays=True, preferred_session_id="")`: Open a binary, warm up subsystems (strings cache, Hex-Rays), and return its session ID. GUI-preferred modes can adopt a running GUI for the path.
-- `idb_list()`: List open sessions and running GUI IDA instances. Each entry has `adopted` (True if this supervisor manages it, False for GUIs/workers discovered but not yet opened via `idb_open`), `backend` (`worker` or `gui`), `is_active`, and process IDs.
-- `idb_close(database, save=True)`: Save (optionally), unregister the session, and terminate its owned worker, freeing a slot toward `--max-workers`. Adopted GUI/worker instances are detached, not killed.
-- `idb_save(session_id, path="")`: Save a session's IDB to disk. Forwarded as a regular worker tool (`database=<id>` injected) — same signature in both backends.
-- Per-database health: call `server_health(database=<id>)` (forwarded). `idb_list()` reports `is_active` from the supervisor's TCP/RPC probe.
-
-Worker controls:
-
-- `--max-workers N`: maximum simultaneous database workers (`0` = unlimited, default `4`).
-- `IDA_MCP_MAX_WORKERS`: environment default for `--max-workers`.
-
-## vNext API and safety profiles
-
-New installations advertise a bounded 35-tool canonical API and start with
-the `modify` profile (`read`, `annotate`, and `modify` scopes). Filesystem,
-debugger, and Python scopes remain explicit opt-ins. Stored GUI selections are
-constrained to canonical tools in this vNext-first test branch.
-Bundled profiles are in [`profiles/`](profiles/): `canonical`, `annotate`,
-`modify`, `debug`, `python`, and `legacy`.
-For a live database, `http://127.0.0.1:13337/config.html` also provides Read only,
-Annotate, and Modify quick buttons. Modify enables IDB mutation scopes without
-enabling filesystem, debugger, or Python access.
-This vNext-first test branch keeps legacy implementations available only as
-internal workflow primitives; legacy tools are not advertised to MCP clients.
-
-All IDB writes use `mutation_preview` followed by `mutation_commit`. A preview
-is tied to the active database revision and expires; GUI edits or automation
-make stale previews fail with `STALE_REVISION`. Commit creates a recovery
-checkpoint before applying operations. Live debugger writes and Python
-execution remain explicitly scoped and are not presented as rollbackable.
-
-Non-loopback HTTP requires bearer authentication. Create a local token with:
-
-```sh
-ida-pro-mcp auth init
-```
-
-Pass `--auth-token-file` to HTTP servers and use repeatable
-`--workspace-root` arguments to restrict file open/save/execute/export paths.
-The complete compatibility and schema contract is documented in
-[`devdocs/vnext.md`](devdocs/vnext.md).
-
-
-## MCP Resources
-
-**Resources** represent browsable state (read-only data) following MCP's philosophy.
-
-**Core IDB State:**
-- `ida://idb/metadata` - IDB file info (path, arch, base, size, hashes)
-- `ida://idb/segments` - Memory segments with permissions
-- `ida://idb/entrypoints` - Entry points (main, TLS callbacks, etc.)
-
-**UI State:**
-- `ida://cursor` - Current cursor position and function
-- `ida://selection` - Current selection range
-
-**Type Information:**
-- `ida://types` - All local types
-- `ida://structs` - All structures/unions
-- `ida://struct/{name}` - Structure definition with fields
-
-**Lookups:**
-- `ida://import/{name}` - Import details by name
-- `ida://export/{name}` - Export details by name
-- `ida://xrefs/from/{addr}` - Cross-references from address
-
-## Core Functions
-
-- `lookup_funcs(queries)`: Get function(s) by address or name (auto-detects, accepts list or comma-separated string).
-- `int_convert(inputs)`: Convert numbers to different formats (decimal, hex, bytes, ASCII, binary).
-- `list_funcs(queries)`: List functions (paginated, filtered).
-- `list_globals(queries)`: List global variables (paginated, filtered).
-- `imports(offset, count)`: List all imported symbols with module names (paginated).
-- `decompile(addr)`: Decompile function at the given address.
-- `disasm(addr)`: Disassemble function with full details (arguments, stack frame, etc).
-- `xrefs_to(addrs)`: Get all cross-references to address(es).
-- `xrefs_to_field(queries)`: Get cross-references to specific struct field(s).
-- `callees(addrs)`: Get functions called by function(s) at address(es).
-
-## Modification Operations
-
-- `add_bookmark(addr, name, prefix)`: Add or replace the IDA bookmark at an address; set `prefix=""` for no prefix.
-- `set_comments(items)`: Set comments at address(es) in both disassembly and decompiler views.
-- `patch_asm(items)`: Patch assembly instructions at address(es).
-- `declare_type(decls)`: Declare C type(s) in the local type library.
-- `define_func(items)`: Define function(s) at address(es). Optionally specify `end` for explicit bounds.
-- `define_code(items)`: Convert bytes to code instruction(s) at address(es).
-- `undefine(items)`: Undefine item(s) at address(es), converting back to raw bytes. Optionally specify `end` or `size`.
-
-## Memory Reading Operations
-
-- `get_bytes(addrs)`: Read raw bytes at address(es).
-- `get_int(queries)`: Read integer values using ty (i8/u64/i16le/i16be/etc).
-- `get_string(addrs)`: Read null-terminated string(s).
-- `get_global_value(queries)`: Read global variable value(s) by address or name (auto-detects, compile-time values).
-
-## Stack Frame Operations
-
-- `stack_frame(addrs)`: Get stack frame variables for function(s).
-- `declare_stack(items)`: Create stack variable(s) at specified offset(s).
-- `delete_stack(items)`: Delete stack variable(s) by name.
-
-## Structure Operations
-
-- `read_struct(queries)`: Read structure field values at specific address(es).
-- `search_structs(filter)`: Search structures by name pattern.
-
-## Debugger Operations (Extension)
-
-Debugger tools are hidden by default. Enable with `?ext=dbg` query parameter:
-
-```
-http://127.0.0.1:13337/mcp?ext=dbg
-```
-
-**Control:**
-- `dbg_start()`: Start debugger process.
-- `dbg_exit()`: Exit debugger process.
-- `dbg_continue()`: Continue execution.
-- `dbg_run_to(addr)`: Run to address.
-- `dbg_step_into()`: Step into instruction.
-- `dbg_step_over()`: Step over instruction.
-
-**Breakpoints:**
-- `dbg_bps()`: List all breakpoints.
-- `dbg_add_bp(addrs)`: Add breakpoint(s).
-- `dbg_delete_bp(addrs)`: Delete breakpoint(s).
-- `dbg_toggle_bp(items)`: Enable/disable breakpoint(s).
-
-**Registers:**
-- `dbg_regs()`: All registers, current thread.
-- `dbg_regs_all()`: All registers, all threads.
-- `dbg_regs_remote(tids)`: All registers, specific thread(s).
-- `dbg_gpregs()`: GP registers, current thread.
-- `dbg_gpregs_remote(tids)`: GP registers, specific thread(s).
-- `dbg_regs_named(names)`: Named registers, current thread.
-- `dbg_regs_named_remote(tid, names)`: Named registers, specific thread.
-
-**Stack & Memory:**
-- `dbg_stacktrace()`: Call stack with module/symbol info.
-- `dbg_read(regions)`: Read memory from debugged process.
-- `dbg_write(regions)`: Write memory to debugged process.
-
-## Advanced Analysis Operations
-
-- `py_eval(code)`: Execute arbitrary Python code in IDA context (returns dict with result/stdout/stderr, supports Jupyter-style evaluation).
-- `analyze_funcs(addrs)`: Comprehensive function analysis (decompilation, assembly, xrefs, callees, callers, strings, constants, basic blocks).
-
-## Pattern Matching & Search
-
-- `find_regex(queries)`: Search strings with case-insensitive regex (paginated).
-- `find_bytes(patterns, limit=1000, offset=0)`: Find byte pattern(s) in binary (e.g., "48 8B ?? ??"). Max limit: 10000.
-- `find_insns(sequences, limit=1000, offset=0)`: Find instruction sequence(s) in code. Max limit: 10000.
-- `find(type, targets, limit=1000, offset=0)`: Advanced search (immediate values, strings, data/code references). Max limit: 10000.
-
-## Control Flow Analysis
-
-- `basic_blocks(addrs)`: Get basic blocks with successors and predecessors.
-
-## Type Operations
-
-- `set_type(edits)`: Apply type(s) to functions, globals, locals, or stack variables.
-- `infer_types(addrs)`: Infer types at address(es) using Hex-Rays or heuristics.
-
-## Export Operations
-
-- `export_funcs(addrs, format)`: Export function(s) in specified format (json, c_header, or prototypes).
-
-## Graph Operations
-
-- `callgraph(roots, max_depth)`: Build call graph from root function(s) with configurable depth.
-
-## Batch Operations
-
-- `rename(batch)`: Unified batch rename operation for functions, globals, locals, and stack variables (accepts dict with optional `func`, `data`, `local`, `stack` keys).
-- `patch(patches)`: Patch multiple byte sequences at once.
-- `put_int(items)`: Write integer values using ty (i8/u64/i16le/i16be/etc).
-
-**Key Features:**
-
-- **Type-safe API**: All functions use strongly-typed parameters with TypedDict schemas for better IDE support and LLM structured outputs
-- **Batch-first design**: Most operations accept both single items and lists
-- **Consistent error handling**: All batch operations return `[{..., error: null|string}, ...]`
-- **Cursor-based pagination**: Search functions return `cursor: {next: offset}` or `{done: true}` (default limit: 1000, enforced max: 10000 to prevent token overflow)
-- **Performance**: Strings are cached with MD5-based invalidation to avoid repeated `build_strlist` calls in large projects
+- Portable suite: **231 passed, 114 subtests passed**.
+- Multi-instance bridge suite: **14 passed**.
+- Targeted Ruff checks, `compileall`, package build, isolated installation, and CLI smoke pass.
+- Live IDA 9.4 registration, resource reads, tool listing, function analysis, transactional mutation, and IDB save have been exercised.
+- Multi-instance routing is unit verified; final two-GUI live acceptance remains pending.
 
 ## Development
 
-Adding new features is a super easy and streamlined process. All you have to do is add a new `@tool` function to the modular API files in `src/ida_pro_mcp/ida_mcp/api_*.py` and your function will be available in the MCP server without any additional boilerplate! Below is a video where I add the `get_metadata` function in less than 2 minutes (including testing):
-
-https://github.com/user-attachments/assets/951de823-88ea-4235-adcb-9257e316ae64
-
-To test the MCP server itself:
-
-```sh
-npx -y @modelcontextprotocol/inspector
+```powershell
+uv sync
+uv run pytest tests -q -p no:cacheprovider
+uv run pytest tests_bridge -q -p no:cacheprovider
+uv run ruff check src/ida_pro_mcp/ida_mcp/api_core.py src/ida_pro_mcp/ida_mcp/api_survey.py src/ida_pro_mcp/ida_mcp/compat.py src/ida_pro_mcp/ida_mcp/hexrays_dataflow.py
+uv build
 ```
 
-This will open a web interface at http://localhost:5173 and allow you to interact with the MCP tools for testing.
+The vNext contract is documented in [`devdocs/vnext.md`](devdocs/vnext.md). Multi-instance design and acceptance notes are under [`devdocs/multi-instance/`](devdocs/multi-instance/).
 
-For testing I create a symbolic link to the IDA plugin and then POST a JSON-RPC request directly to `http://localhost:13337/mcp`. After [enabling symbolic links](https://learn.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development) you can run the following command:
+## Upstream and license
 
-```sh
-uv run ida-pro-mcp --install
-```
+This repository preserves the upstream Git history and is based on upstream commit `f82e6e2`. It is maintained as a standalone private derivative so enhanced development can remain private while retaining clear attribution.
 
-Generate the changelog of direct commits to `main`:
+Upstream: [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)
 
-```sh
-git log --first-parent --no-merges 1.2.0..main "--pretty=- %s"
-```
+License: [MIT](LICENSE)
