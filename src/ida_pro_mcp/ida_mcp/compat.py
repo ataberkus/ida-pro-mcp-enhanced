@@ -20,6 +20,7 @@ import idaapi
 import ida_bytes
 import ida_funcs
 import ida_nalt
+import ida_segment
 import ida_typeinf
 
 # ============================================================================
@@ -148,6 +149,37 @@ def inf_is_64bit() -> bool:
 # ============================================================================
 # Function info compatibility
 # ============================================================================
+
+
+def get_func(ea: int):
+    """Return the function containing *ea* without IDA 9.x warnings."""
+    try:
+        return ida_funcs.get_func(ea)
+    except (AttributeError, TypeError):
+        # IDA 7.x/8.x compatibility.  This branch is intentionally kept
+        # isolated so IDA 9.x never calls the deprecated idaapi wrapper.
+        return idaapi.get_func(ea)
+
+
+def get_segment_info(ea: int):
+    """Return modern segment info, with a legacy fallback."""
+    try:
+        info = ida_segment.segment_info_t()
+        if ida_segment.get_segment_info(info, ea):
+            return info
+        return None
+    except (AttributeError, TypeError):
+        return idaapi.getseg(ea)
+
+
+def get_segment_name(ea: int) -> str | None:
+    """Return a segment name by address without deprecated APIs."""
+    try:
+        name = ida_segment.get_segment_name(ea)
+        return name or None
+    except (AttributeError, TypeError):
+        seg = idaapi.getseg(ea)
+        return idaapi.get_segm_name(seg) if seg else None
 
 
 def get_func_name(func: ida_funcs.func_t) -> str | None:

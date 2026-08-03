@@ -7,7 +7,7 @@ including reading, creating, and deleting stack variables in functions.
 from typing import Annotated
 import ida_typeinf
 import ida_frame
-import idaapi
+import ida_funcs
 
 from .rpc import tool, unsafe
 from .sync import idasync
@@ -61,7 +61,7 @@ def declare_stack(
         type_name = item.get("ty", "")
 
         try:
-            func = idaapi.get_func(parse_address(fn_addr))
+            func = ida_funcs.get_func(parse_address(fn_addr))
             if not func:
                 results.append(
                     {"addr": fn_addr, "name": var_name, "error": "No function found"}
@@ -106,7 +106,7 @@ def delete_stack(
         var_name = item.get("name", "")
 
         try:
-            func = idaapi.get_func(parse_address(fn_addr))
+            func = ida_funcs.get_func(parse_address(fn_addr))
             if not func:
                 results.append(
                     {"addr": fn_addr, "name": var_name, "error": "No function found"}

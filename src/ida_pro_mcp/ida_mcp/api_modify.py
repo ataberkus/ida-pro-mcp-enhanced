@@ -137,7 +137,7 @@ def append_comments(items: list[CommentAppendOp] | CommentAppendOp):
                 results.append({"addr": addr_str, "error": f"Unsupported scope: {scope}"})
                 continue
 
-            fn = idaapi.get_func(ea)
+            fn = ida_funcs.get_func(ea)
             use_func_comment = scope == "func" or (scope == "auto" and fn is not None and fn.start_ea == ea)
 
             if use_func_comment:
@@ -339,7 +339,7 @@ def rename(batch: RenameBatch | dict) -> dict:
                     continue
 
                 ea = parse_address(addr_text)
-                func = idaapi.get_func(ea)
+                func = ida_funcs.get_func(ea)
                 if not func:
                     result = {
                         "addr": addr_text,
@@ -476,7 +476,7 @@ def rename(batch: RenameBatch | dict) -> dict:
                         break
                     continue
 
-                func = idaapi.get_func(parse_address(func_addr))
+                func = ida_funcs.get_func(parse_address(func_addr))
                 if not func:
                     result = {
                         "func_addr": func_addr,
@@ -541,7 +541,7 @@ def rename(batch: RenameBatch | dict) -> dict:
                         break
                     continue
 
-                func = idaapi.get_func(parse_address(func_addr))
+                func = ida_funcs.get_func(parse_address(func_addr))
                 if not func:
                     result = {
                         "func_addr": func_addr,
@@ -729,7 +729,7 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[dict]:
             end_ea = parse_address(end_str) if end_str else idaapi.BADADDR
 
             # Check if already a function
-            existing = idaapi.get_func(start_ea)
+            existing = ida_funcs.get_func(start_ea)
             if existing and existing.start_ea == start_ea:
                 results.append(
                     {
@@ -742,7 +742,7 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[dict]:
 
             success = ida_funcs.add_func(start_ea, end_ea)
             if success:
-                func = idaapi.get_func(start_ea)
+                func = ida_funcs.get_func(start_ea)
                 results.append(
                     {
                         "addr": addr_str,

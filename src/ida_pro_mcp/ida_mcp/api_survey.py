@@ -72,27 +72,27 @@ def _build_metadata() -> dict:
 
 
 def _build_segments() -> list[dict]:
-    import idaapi
     import idautils
     import ida_segment
 
     segments = []
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
+        seg = compat.get_segment_info(seg_ea)
         if not seg:
             continue
+        perm = seg.get_perm() if hasattr(seg, "get_perm") else seg.perm
         perms = []
-        if seg.perm & idaapi.SEGPERM_READ:
+        if perm & ida_segment.SEGPERM_READ:
             perms.append("r")
-        if seg.perm & idaapi.SEGPERM_WRITE:
+        if perm & ida_segment.SEGPERM_WRITE:
             perms.append("w")
-        if seg.perm & idaapi.SEGPERM_EXEC:
+        if perm & ida_segment.SEGPERM_EXEC:
             perms.append("x")
         segments.append({
-            "name": ida_segment.get_segm_name(seg),
+            "name": compat.get_segment_name(seg_ea),
             "start": hex(seg.start_ea),
             "end": hex(seg.end_ea),
-            "size": hex(seg.size()),
+            "size": hex(seg.end_ea - seg.start_ea),
             "permissions": "".join(perms) or "---",
         })
     return segments
@@ -120,7 +120,7 @@ def _build_statistics(func_eas: list[int], string_count: int, segment_count: int
 
     for ea in func_eas:
         name = idc.get_name(ea, 0) or ""
-        func = idaapi.get_func(ea)
+        func = compat.get_func(ea)
         flags = func.flags if func else 0
 
         if name.startswith("sub_"):
@@ -196,7 +196,7 @@ def _build_interesting_functions(func_eas: list[int], truncated: bool) -> list[d
     candidates: list[tuple[int, int, str, int, int]] = []
 
     for ea in func_eas:
-        func = idaapi.get_func(ea)
+        func = compat.get_func(ea)
         if not func:
             continue
         name = idc.get_name(ea, 0) or ""
@@ -215,7 +215,7 @@ def _build_interesting_functions(func_eas: list[int], truncated: bool) -> list[d
 
     result = []
     for xref_count, ea, name, size, _flags in top:
-        func = idaapi.get_func(ea)
+        func = compat.get_func(ea)
         callee_count = 0
         for item_ea in idautils.FuncItems(ea):
             for xref in idautils.XrefsFrom(item_ea, 0):

@@ -22,6 +22,7 @@ import ida_funcs
 import ida_hexrays
 import ida_kernwin
 import ida_nalt
+import ida_segment
 import ida_typeinf
 import idaapi
 import idautils
@@ -706,7 +707,7 @@ def get_function(addr: int, *, raise_error: Literal[False]) -> Optional[Function
 def get_function(addr, *, raise_error=True):
     from . import compat
 
-    fn = idaapi.get_func(addr)
+    fn = ida_funcs.get_func(addr)
     if fn is None:
         if raise_error:
             raise IDAError(f"No function found at address {hex(addr)}")
@@ -930,7 +931,10 @@ def refresh_decompiler_ctext(fn_addr: int):
     if not ida_hexrays.init_hexrays_plugin():
         return
     error = ida_hexrays.hexrays_failure_t()
-    cfunc: ida_hexrays.cfunc_t = ida_hexrays.decompile_func(
+    decompile_function = getattr(ida_hexrays, "decompile_function", None)
+    if decompile_function is None:
+        decompile_function = ida_hexrays.decompile_func
+    cfunc: ida_hexrays.cfunc_t = decompile_function(
         fn_addr, error, ida_hexrays.DECOMP_WARNINGS
     )
     if cfunc:
@@ -996,7 +1000,7 @@ def get_stack_frame_variables_internal(
     if ida_major < 9:
         return []
 
-    func = idaapi.get_func(fn_addr)
+    func = ida_funcs.get_func(fn_addr)
     if not func:
         if raise_error:
             raise IDAError(f"No function found at address {fn_addr}")
@@ -1082,15 +1086,14 @@ def decompile_function_safe(ea: int) -> Optional[str]:
 
 def get_assembly_lines(ea: int) -> str:
     """Get assembly lines for a function in compact string format"""
-    func = idaapi.get_func(ea)
+    func = ida_funcs.get_func(ea)
     if not func:
         return ""
 
     func_name: str = ida_funcs.get_func_name(func.start_ea) or "<unnamed>"
 
     # Get segment from first instruction
-    first_seg = idaapi.getseg(func.start_ea)
-    segment_name = idaapi.get_segm_name(first_seg) if first_seg else "UNKNOWN"
+    segment_name = ida_segment.get_segment_name(func.start_ea) or "UNKNOWN"
 
     # Build compact string format
     lines_str = f"{func_name} ({segment_name} @ {hex(func.start_ea)}):"
@@ -1124,7 +1127,7 @@ def get_all_xrefs(ea: int) -> dict:
 
 def get_all_comments(ea: int) -> dict:
     """Get all comments for an address"""
-    func = idaapi.get_func(ea)
+    func = ida_funcs.get_func(ea)
     if not func:
         return {}
 
@@ -1145,7 +1148,7 @@ def get_callees(addr: str) -> list[dict]:
     """Get callees for a single function address"""
     try:
         func_start = parse_address(addr)
-        func = idaapi.get_func(func_start)
+        func = ida_funcs.get_func(func_start)
         if not func:
             return []
         func_end = idc.find_func_end(func_start)
@@ -1160,7 +1163,7 @@ def get_callees(addr: str) -> list[dict]:
                 if target_type in [idaapi.o_mem, idaapi.o_near, idaapi.o_far]:
                     func_type = (
                         "internal"
-                        if idaapi.get_func(target) is not None
+                        if ida_funcs.get_func(target) is not None
                         else "external"
                     )
                     func_name = idc.get_name(target)
@@ -1225,7 +1228,7 @@ def get_xrefs_from_internal(ea: int) -> list[Xref]:
 
 def extract_function_strings(ea: int) -> list[String]:
     """Extract string references from a function"""
-    func = idaapi.get_func(ea)
+    func = ida_funcs.get_func(ea)
     if not func:
         return []
 
@@ -1254,7 +1257,7 @@ def extract_function_strings(ea: int) -> list[String]:
 
 def extract_function_constants(ea: int) -> list[dict]:
     """Extract immediate constants from a function"""
-    func = idaapi.get_func(ea)
+    func = ida_funcs.get_func(ea)
     if not func:
         return []
 

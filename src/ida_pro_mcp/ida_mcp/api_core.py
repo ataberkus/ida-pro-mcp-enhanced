@@ -127,27 +127,17 @@ def _collect_imports() -> list[Import]:
 
 def _segment_name_for_ea(ea: int) -> str | None:
     try:
-        # IDA 9.x replaced idaapi.getseg()/get_segm_name() with the structured
-        # segment-info API.  Keep the compatibility fallback for older IDA.
-        info = ida_segment.segment_info_t()
-        if ida_segment.get_segment_info(info, ea, ida_segment.GSI_NAME):
-            return info.get_name() or info.visible_name()
-    except Exception:
-        pass
-    try:
-        seg = idaapi.getseg(ea)
-        return idaapi.get_segm_name(seg) if seg else None
-    except Exception:
+        return ida_segment.get_segment_name(ea) or None
+    except (AttributeError, TypeError):
         return None
 
 
 def _get_func(ea: int):
     """Return function entry/range info without IDA 9.x deprecation warnings."""
     try:
-        info = ida_funcs.func_entry_info_t()
-        if ida_funcs.get_func_entry_info(info, ea):
-            return info
+        return ida_funcs.get_func(ea)
     except (AttributeError, TypeError):
+        # IDA 7.x/8.x compatibility.
         pass
     return idaapi.get_func(ea)
 

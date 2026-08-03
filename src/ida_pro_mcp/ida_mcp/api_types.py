@@ -6,6 +6,7 @@ import ida_hexrays
 import ida_nalt
 import ida_bytes
 import ida_frame
+import ida_funcs
 import idaapi
 
 from .rpc import tool, unsafe
@@ -802,7 +803,7 @@ def _infer_type_edit_kind(edit: dict) -> str:
     if "addr" in edit and "name" in edit and _resolve_type_text(edit):
         # Heuristic: addr + frame name usually indicates stack variable updates.
         try:
-            fn = idaapi.get_func(parse_address(edit["addr"]))
+            fn = ida_funcs.get_func(parse_address(edit["addr"]))
             if fn:
                 frame_tif = ida_typeinf.tinfo_t()
                 if ida_frame.get_func_frame(frame_tif, fn):
@@ -824,7 +825,7 @@ def _apply_type_edit(edit: dict) -> dict:
             addr_text = str(edit.get("addr", "")).strip()
             if not addr_text:
                 return {"edit": edit, "kind": kind, "error": "Function address is required"}
-            func = idaapi.get_func(parse_address(addr_text))
+            func = ida_funcs.get_func(parse_address(addr_text))
             if not func:
                 return {"edit": edit, "kind": kind, "error": "Function not found"}
 
@@ -870,7 +871,7 @@ def _apply_type_edit(edit: dict) -> dict:
             if not var_name:
                 return {"edit": edit, "kind": kind, "error": "Local variable name is required"}
 
-            func = idaapi.get_func(parse_address(addr_text))
+            func = ida_funcs.get_func(parse_address(addr_text))
             if not func:
                 return {"edit": edit, "kind": kind, "error": "Function not found"}
 
@@ -892,7 +893,7 @@ def _apply_type_edit(edit: dict) -> dict:
             if not stack_name:
                 return {"edit": edit, "kind": kind, "error": "Stack variable name is required"}
 
-            func = idaapi.get_func(parse_address(addr_text))
+            func = ida_funcs.get_func(parse_address(addr_text))
             if not func:
                 return {"edit": edit, "kind": kind, "error": "No function found"}
 
