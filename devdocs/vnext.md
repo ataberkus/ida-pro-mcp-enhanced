@@ -3,13 +3,16 @@
 vNext exposes a shared, versioned contract from both the in-IDA plugin and the
 `idalib-mcp` supervisor. The default profile contains the canonical analysis
 and IDB mutation tools with `read`, `annotate`, and `modify` scopes. Filesystem,
-debugger, and Python scopes remain opt-in. Legacy tools remain registered for
-migrated configurations and the `legacy` profile, but new installations do not
-advertise them.
+debugger, and Python scopes remain opt-in. Legacy implementations remain
+registered for internal orchestration, but this test branch does not advertise
+them to external MCP clients.
 
 The in-IDA page at `http://127.0.0.1:13337/config.html` provides Read only,
 Annotate, and Modify quick profile buttons. Modify enables IDB mutation scopes;
 filesystem, debugger, and Python scopes remain disabled until explicitly enabled.
+This branch runs in vNext-only test mode: legacy implementations remain
+available to internal orchestration but are hidden from `tools/list` and direct
+legacy tool calls.
 
 ## Safety and transport
 

@@ -15,10 +15,12 @@ from .rpc import (
     MCP_SERVER,
     MCP_UNSAFE,
     MCP_POLICY,
+    LEGACY_TOOLS_ENABLED,
     configure_tool_policy,
     get_cached_output,
 )
 from ida_pro_mcp.vnext.contracts import SafetyScope
+from ida_pro_mcp.vnext.policy import CANONICAL_TOOLS
 from ida_pro_mcp.vnext.profiles import (
     default_profile_enabled,
     quick_profile_selection,
@@ -97,7 +99,7 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     }
     _configure_scopes(
         enabled_tools,
-        legacy_tools=not is_new_install,
+        legacy_tools=LEGACY_TOOLS_ENABLED,
         extra_scopes=stored_scopes,
     )
     return original_tools
@@ -435,6 +437,12 @@ button.profile:hover {
 </p>"""
 
         body += "<h2>Enabled Tools</h2>"
+        if not LEGACY_TOOLS_ENABLED:
+            body += (
+                '<p style="font-size: 0.9rem; margin: 0.5rem 0;">'
+                "vNext-only test mode is active; legacy tools are hidden."
+                "</p>"
+            )
         body += (
             '<p style="font-size: 0.9rem; margin: 0.5rem 0;">'
             '<a href="/profile.txt" download>Export as --profile file</a>'
@@ -452,6 +460,8 @@ button.profile:hover {
         )
         body += quick_select
         for name, func in ORIGINAL_TOOLS.items():
+            if not LEGACY_TOOLS_ENABLED and name not in CANONICAL_TOOLS:
+                continue
             description = (
                 (func.__doc__ or "No description").strip().splitlines()[0].strip()
             )
@@ -509,14 +519,22 @@ button.profile:hover {
             profile_text = postvars.get("profile_text", [""])[0]
             whitelist = parse_profile(profile_text)
             explicit_scopes = parse_profile_scopes(profile_text)
-            enabled_tools = {name: name in whitelist for name in ORIGINAL_TOOLS.keys()}
+            enabled_tools = {
+                name: name in whitelist
+                and (LEGACY_TOOLS_ENABLED or name in CANONICAL_TOOLS)
+                for name in ORIGINAL_TOOLS.keys()
+            }
         else:
             explicit_scopes = {
                 SafetyScope(value)
                 for value in config_json_get("enabled_scopes", [])
                 if value in {scope.value for scope in SafetyScope}
             }
-            enabled_tools = {name: name in postvars for name in ORIGINAL_TOOLS.keys()}
+            enabled_tools = {
+                name: name in postvars
+                and (LEGACY_TOOLS_ENABLED or name in CANONICAL_TOOLS)
+                for name in ORIGINAL_TOOLS.keys()
+            }
         self.mcp_server.tools.methods = {
             name: func
             for name, func in ORIGINAL_TOOLS.items()
@@ -527,7 +545,11 @@ button.profile:hover {
             "enabled_scopes",
             sorted(scope.value for scope in explicit_scopes if scope is not SafetyScope.READ),
         )
-        _configure_scopes(enabled_tools, legacy_tools=True, extra_scopes=explicit_scopes)
+        _configure_scopes(
+            enabled_tools,
+            legacy_tools=LEGACY_TOOLS_ENABLED,
+            extra_scopes=explicit_scopes,
+        )
 
         # Redirect back to the config page
         self.send_response(302)

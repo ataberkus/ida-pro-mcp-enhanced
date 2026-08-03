@@ -51,11 +51,28 @@ def test_vnext_prompts_and_resources_are_registered():
     assert any("/jobs/{job_id}" in resource["uriTemplate"] for resource in templates)
 
 
-def test_readonly_profile_hides_commit_debug_and_python_tools():
+def test_vnext_only_profile_hides_legacy_commit_debug_and_python_tools():
     rpc, _module = _load_vnext_api()
-    rpc.configure_tool_policy(scopes={"read"}, legacy_tools=False)
-    names = {tool["name"] for tool in call_rpc(rpc.MCP_SERVER, "tools/list")["tools"]}
-    assert "mutation_preview" in names
-    assert "mutation_commit" not in names
-    assert "debug_session" not in names
-    assert "python_execute" not in names
+    def legacy_probe():
+        return {"ok": True}
+
+    rpc.tool(legacy_probe)
+    try:
+        rpc.configure_tool_policy(scopes={"read"}, legacy_tools=True)
+        names = {tool["name"] for tool in call_rpc(rpc.MCP_SERVER, "tools/list")["tools"]}
+        assert names <= CANONICAL_TOOLS
+        assert "mutation_preview" in names
+        assert "mutation_commit" not in names
+        assert "debug_session" not in names
+        assert "python_execute" not in names
+        response = call_rpc(
+            rpc.MCP_SERVER,
+            "tools/call",
+            name="legacy_probe",
+            arguments={},
+        )
+        assert response["isError"] is True
+        assert response["structuredContent"]["error"]["code"] == "PROFILE_DENIED"
+    finally:
+        rpc.MCP_SERVER.tools.methods.pop("legacy_probe", None)
+        rpc.configure_tool_policy(scopes={"read"}, legacy_tools=False)

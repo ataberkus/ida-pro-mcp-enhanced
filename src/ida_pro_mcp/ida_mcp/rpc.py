@@ -16,6 +16,9 @@ from .zeromcp import (
 
 MCP_UNSAFE: set[str] = set()
 MCP_EXTENSIONS: dict[str, set[str]] = {}  # group -> set of function names
+# vNext-first test mode: keep legacy implementations available to internal
+# orchestration, but never advertise them as external MCP tools.
+LEGACY_TOOLS_ENABLED = False
 MCP_SERVER = McpServer("ida-pro-mcp", extensions=MCP_EXTENSIONS)
 MCP_POLICY = ToolPolicyRegistry()
 register_builtin_policies(MCP_POLICY)
@@ -44,7 +47,7 @@ def configure_tool_policy(
             SafetyScope(scope) for scope in (scopes or {SafetyScope.READ})
         }
         _active_scopes.add(SafetyScope.READ)
-        _legacy_tools_enabled = bool(legacy_tools)
+        _legacy_tools_enabled = bool(legacy_tools) and LEGACY_TOOLS_ENABLED
 
 
 def get_active_scopes() -> set[SafetyScope]:
@@ -343,6 +346,7 @@ __all__ = [
     "MCP_UNSAFE",
     "MCP_EXTENSIONS",
     "MCP_POLICY",
+    "LEGACY_TOOLS_ENABLED",
     "MCP_AUDIT",
     "tool",
     "unsafe",

@@ -24,7 +24,7 @@ from ida_pro_mcp.ida_mcp.api_core import (
 from ida_pro_mcp.ida_mcp.discovery import register_instance, unregister_instance
 from ida_pro_mcp.ida_mcp.http import IdaMcpHttpRequestHandler
 from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile, load_profile_scopes
-from ida_pro_mcp.ida_mcp.rpc import set_download_base_url, tool
+from ida_pro_mcp.ida_mcp.rpc import LEGACY_TOOLS_ENABLED, set_download_base_url, tool
 from ida_pro_mcp.idalib_session_manager import get_session_manager
 from ida_pro_mcp.worker_lifecycle import WorkerLifecycle
 from ida_pro_mcp.vnext.auth import AuthPolicy, WorkspacePolicy, default_token_path, load_token_file
@@ -206,7 +206,7 @@ def main():
         "--api-profile",
         choices=("canonical", "legacy"),
         default="canonical",
-        help="Advertise the bounded canonical API or all legacy tools.",
+        help="API profile (legacy is retained for CLI compatibility but disabled in vNext-only test mode).",
     )
     parser.add_argument(
         "--auth-token-file",
@@ -267,7 +267,8 @@ def main():
         scopes.update(SafetyScope)
     configure_tool_policy(
         scopes=scopes,
-        legacy_tools=args.api_profile == "legacy" or args.profile is not None,
+        legacy_tools=LEGACY_TOOLS_ENABLED
+        and (args.api_profile == "legacy" or args.profile is not None),
     )
 
     if args.verbose:
@@ -342,7 +343,7 @@ def main():
         for name in whitelist:
             scopes.update(MCP_POLICY.get(name).scopes)
         scopes.update(load_profile_scopes(args.profile))
-        configure_tool_policy(scopes=scopes, legacy_tools=True)
+        configure_tool_policy(scopes=scopes, legacy_tools=LEGACY_TOOLS_ENABLED)
         kept, unknown = apply_profile(
             MCP_SERVER.tools.methods,
             whitelist,

@@ -1538,7 +1538,7 @@ def main() -> None:
         "--api-profile",
         choices=("canonical", "legacy"),
         default="canonical",
-        help="Advertise the bounded canonical API or every legacy worker tool.",
+        help="API profile (legacy is retained for CLI compatibility but disabled in vNext-only test mode).",
     )
     parser.add_argument(
         "--auth-token-file",
