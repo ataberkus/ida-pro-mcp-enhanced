@@ -11,6 +11,7 @@ import ida_hexrays
 import idautils
 import ida_loader
 import ida_nalt
+import ida_segment
 import ida_typeinf
 import idc
 
@@ -125,13 +126,30 @@ def _collect_imports() -> list[Import]:
 
 
 def _segment_name_for_ea(ea: int) -> str | None:
-    seg = idaapi.getseg(ea)
-    if not seg:
-        return None
     try:
-        return idaapi.get_segm_name(seg)
+        # IDA 9.x replaced idaapi.getseg()/get_segm_name() with the structured
+        # segment-info API.  Keep the compatibility fallback for older IDA.
+        info = ida_segment.segment_info_t()
+        if ida_segment.get_segment_info(info, ea, ida_segment.GSI_NAME):
+            return info.get_name() or info.visible_name()
+    except Exception:
+        pass
+    try:
+        seg = idaapi.getseg(ea)
+        return idaapi.get_segm_name(seg) if seg else None
     except Exception:
         return None
+
+
+def _get_func(ea: int):
+    """Return function entry/range info without IDA 9.x deprecation warnings."""
+    try:
+        info = ida_funcs.func_entry_info_t()
+        if ida_funcs.get_func_entry_info(info, ea):
+            return info
+    except (AttributeError, TypeError):
+        pass
+    return idaapi.get_func(ea)
 
 
 def _primary_text_key(kind: str) -> str:
@@ -144,7 +162,7 @@ def _collect_entities(kind: str) -> list[dict]:
     if kind == "functions":
         rows: list[dict] = []
         for ea in idautils.Functions():
-            fn = idaapi.get_func(ea)
+            fn = _get_func(ea)
             if not fn:
                 continue
             size_int = fn.end_ea - fn.start_ea
@@ -164,7 +182,7 @@ def _collect_entities(kind: str) -> list[dict]:
     if kind == "globals":
         rows = []
         for ea, name in idautils.Names():
-            if idaapi.get_func(ea) or name is None:
+            if _get_func(ea) or name is None:
                 continue
             rows.append(
                 {
@@ -208,7 +226,7 @@ def _collect_entities(kind: str) -> list[dict]:
         rows = []
         imports_by_ea = {int(imp["addr"], 16): imp for imp in _collect_imports()}
         for ea, name in idautils.Names():
-            is_function = bool(idaapi.get_func(ea))
+            is_function = bool(_get_func(ea))
             is_import = ea in imports_by_ea
             rows.append(
                 {
@@ -479,7 +497,7 @@ def func_query(
 
     all_functions: list[dict] = []
     for addr in idautils.Functions():
-        fn = idaapi.get_func(addr)
+        fn = _get_func(addr)
         if not fn:
             continue
         size_int = fn.end_ea - fn.start_ea
@@ -562,7 +580,7 @@ def list_globals(
     )
     all_globals: list[Global] = []
     for addr, name in idautils.Names():
-        if not idaapi.get_func(addr) and name is not None:
+        if not _get_func(addr) and name is not None:
             all_globals.append(Global(addr=hex(addr), name=name))
 
     results = []

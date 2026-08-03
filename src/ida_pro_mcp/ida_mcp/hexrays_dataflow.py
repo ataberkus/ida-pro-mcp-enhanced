@@ -110,7 +110,12 @@ def trace_microcode(
 
     try:
         failure = ida_hexrays.hexrays_failure_t()
-        ranges = ida_hexrays.mba_ranges_t(function)
+        # IDA 9.x replaced mba_ranges_t with decomp_ranges_t for this API.
+        # Retain the old overload only for older IDA versions.
+        if hasattr(ida_hexrays, "decomp_ranges_t"):
+            ranges = ida_hexrays.decomp_ranges_t(ea)
+        else:
+            ranges = ida_hexrays.mba_ranges_t(function)
         mba = ida_hexrays.gen_microcode(
             ranges,
             failure,

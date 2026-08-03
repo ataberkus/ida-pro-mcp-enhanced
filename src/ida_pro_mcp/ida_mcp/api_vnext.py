@@ -122,7 +122,12 @@ def _investigations() -> InvestigationManager:
 
 
 def _legacy_call(name: str, arguments: dict[str, Any] | None = None) -> Any:
-    response = MCP_SERVER.tools.dispatch(
+    # The active profile removes legacy tools from the externally visible
+    # registry, while vNext workflows still use selected legacy implementations
+    # internally.  Dispatch against the preserved implementation registry so
+    # profile filtering does not break canonical analysis jobs.
+    implementation_registry = getattr(MCP_SERVER.tools, "_all_methods", MCP_SERVER.tools)
+    response = implementation_registry.dispatch(
         {"jsonrpc": "2.0", "method": name, "params": arguments or {}, "id": None}
     )
     if response and "error" in response:

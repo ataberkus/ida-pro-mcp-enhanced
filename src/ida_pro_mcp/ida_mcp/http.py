@@ -55,6 +55,11 @@ def config_json_set(key: str, value):
 def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     """Changed to registry to enable configured tools, returns original tools."""
     original_tools = registry.methods.copy()
+    # Keep the complete implementation registry available to vNext's internal
+    # orchestration.  Legacy tools remain hidden from external tools/list on a
+    # new installation, but canonical analysis workflows may still call them
+    # as implementation primitives (for example survey_binary during triage).
+    registry._all_methods = original_tools
     stored_tools = config_json_get(config_key, None)
     is_new_install = stored_tools is None
     enabled_tools = (
