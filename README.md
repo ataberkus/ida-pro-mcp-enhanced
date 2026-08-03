@@ -248,22 +248,20 @@ For stdio-based clients, use:
 uv run idalib-mcp --stdio
 ```
 
-Database workers are persistent: each one runs as a detached process that
-outlives the supervisor that spawned it. When a new supervisor (over stdio
-or HTTP) calls `idb_open` for a binary that is already open under a worker
-on this host, the supervisor adopts that worker transparently — there is
-no separate "shared" mode to enable. Workers self-exit when no request has
-hit them for an idle interval.
+Database workers are isolated processes protected by supervisor-generated,
+ephemeral bearer credentials. Supervisor-owned workers are terminated with
+the supervisor; GUI instances can still be adopted through host-local
+discovery. Workers also retain an idle-timeout safety net.
 
 _Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
 
 ## Headless idalib Session Model
 
-`idalib-mcp` is a supervisor that keeps each open database in its own idalib worker process. Workers register themselves in a host-local discovery directory and outlive the supervisor that spawned them; any subsequent supervisor that wants the same path adopts the running worker. A worker self-exits when no request has hit it for its idle TTL (default 1 hour). Call `idb_close` to release a worker eagerly (freeing a slot toward `--max-workers`), adopted GUI/worker instances are detached rather than killed.
+`idalib-mcp` is a supervisor that keeps each open database in its own authenticated idalib worker process. Call `idb_close` to release a worker eagerly (freeing a slot toward `--max-workers`). Adopted GUI instances are detached rather than killed.
 
 `idb_open` picks the backend via its `mode` parameter:
 
-- `prefer_headless` (default): spawn an idalib worker (or adopt one that already has the file open).
+- `prefer_headless` (default): spawn an isolated idalib worker.
 - `force_headless`: same, but never adopt a running GUI even if one has the file.
 - `prefer_gui`: adopt a running GUI for the file; otherwise spawn an idalib worker.
 - `force_gui`: adopt a running GUI for the file; otherwise launch a new IDA GUI process.
@@ -288,7 +286,7 @@ xrefs_to("ImportantExport", database="library")
 
 ### Management tools
 
-- `idb_open(input_path, mode="prefer_headless", run_auto_analysis=True, build_caches=True, init_hexrays=True, preferred_session_id="")`: Open a binary, warm up subsystems (strings cache, Hex-Rays), and return its session ID. If a worker or GUI for this path is already running on the host, that instance is adopted and `preferred_session_id` is ignored.
+- `idb_open(input_path, mode="prefer_headless", run_auto_analysis=True, build_caches=True, init_hexrays=True, preferred_session_id="")`: Open a binary, warm up subsystems (strings cache, Hex-Rays), and return its session ID. GUI-preferred modes can adopt a running GUI for the path.
 - `idb_list()`: List open sessions and running GUI IDA instances. Each entry has `adopted` (True if this supervisor manages it, False for GUIs/workers discovered but not yet opened via `idb_open`), `backend` (`worker` or `gui`), `is_active`, and process IDs.
 - `idb_close(database, save=True)`: Save (optionally), unregister the session, and terminate its owned worker, freeing a slot toward `--max-workers`. Adopted GUI/worker instances are detached, not killed.
 - `idb_save(session_id, path="")`: Save a session's IDB to disk. Forwarded as a regular worker tool (`database=<id>` injected) — same signature in both backends.
@@ -298,6 +296,31 @@ Worker controls:
 
 - `--max-workers N`: maximum simultaneous database workers (`0` = unlimited, default `4`).
 - `IDA_MCP_MAX_WORKERS`: environment default for `--max-workers`.
+
+## vNext API and safety profiles
+
+New installations advertise a bounded 35-tool canonical API and start with
+only the `read` safety scope. Existing GUI selections retain their effective
+access and legacy aliases for the compatibility release. Bundled profiles are
+in [`profiles/`](profiles/): `canonical`, `annotate`, `modify`, `debug`,
+`python`, and `legacy`.
+
+All IDB writes use `mutation_preview` followed by `mutation_commit`. A preview
+is tied to the active database revision and expires; GUI edits or automation
+make stale previews fail with `STALE_REVISION`. Commit creates a recovery
+checkpoint before applying operations. Live debugger writes and Python
+execution remain explicitly scoped and are not presented as rollbackable.
+
+Non-loopback HTTP requires bearer authentication. Create a local token with:
+
+```sh
+ida-pro-mcp auth init
+```
+
+Pass `--auth-token-file` to HTTP servers and use repeatable
+`--workspace-root` arguments to restrict file open/save/execute/export paths.
+The complete compatibility and schema contract is documented in
+[`devdocs/vnext.md`](devdocs/vnext.md).
 
 
 ## MCP Resources

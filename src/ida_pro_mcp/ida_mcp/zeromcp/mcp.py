@@ -5,7 +5,6 @@ import sys
 import time
 import uuid
 import json
-import gzip
 import zlib
 import ipaddress
 import inspect
@@ -26,16 +25,31 @@ logger = logging.getLogger(__name__)
 _request_context = threading.local()
 
 class McpToolError(Exception):
-    def __init__(self, message: str):
+    def __init__(self, message: str, *, code: str | None = None, details: dict | None = None):
+        self.code = code
+        self.details = details or {}
         super().__init__(message)
 
 class McpRpcRegistry(JsonRpcRegistry):
     """JSON-RPC registry with custom error handling for MCP tools"""
     def map_exception(self, e: Exception) -> JsonRpcError:
         if isinstance(e, McpToolError):
-            return {
+            error: JsonRpcError = {
                 "code": -32000,
                 "message": e.args[0] or "MCP Tool Error",
+            }
+            if e.code or e.details:
+                error["data"] = {
+                    "code": e.code or "TOOL_ERROR",
+                    "details": e.details,
+                }
+            return error
+        if hasattr(e, "to_dict") and hasattr(e, "code"):
+            data = e.to_dict()
+            return {
+                "code": -32000,
+                "message": str(e),
+                "data": data,
             }
         return super().map_exception(e)
 
@@ -258,7 +272,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", origin)
         if preflight:
             self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, Mcp-Session-Id, Mcp-Protocol-Version")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, X-Requested-With, Mcp-Session-Id, Mcp-Protocol-Version")
             if self.headers.get("Access-Control-Request-Private-Network") == "true":
                 self.send_header("Access-Control-Allow-Private-Network", "true")
 
@@ -295,6 +309,17 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         ):
             self.send_error(403, "Invalid Origin")
             return False
+
+        if self.mcp_server.http_authenticator is not None:
+            try:
+                self.mcp_server.http_authenticator(self.headers.get("Authorization"))
+            except Exception:
+                self.send_response(401)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("WWW-Authenticate", 'Bearer realm="ida-pro-mcp"')
+                self.end_headers()
+                self.wfile.write(b"Authentication required\n")
+                return False
 
         return True
 
@@ -333,20 +358,33 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _read_body(self) -> bytes | None:
-        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-            raw = self._read_chunked()
-        else:
-            content_length = int(self.headers.get("Content-Length", 0))
-            if content_length > self.mcp_server.post_body_limit:
+        try:
+            if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+                raw = self._read_chunked()
+            else:
+                content_length = int(self.headers.get("Content-Length", 0))
+                if content_length < 0:
+                    raise ValueError("negative Content-Length")
+                if content_length > self.mcp_server.post_body_limit:
+                    self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+                    return None
+                raw = self.rfile.read(content_length) if content_length > 0 else b""
+
+            if len(raw) > self.mcp_server.post_body_limit:
                 self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
                 return None
-            raw = self.rfile.read(content_length) if content_length > 0 else b""
 
-        if len(raw) > self.mcp_server.post_body_limit:
-            self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+            body = self._decompress_body(raw)
+            if len(body) > self.mcp_server.post_body_limit:
+                self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes after decompression")
+                return None
+            return body
+        except OverflowError:
+            self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes after decompression")
             return None
-
-        return self._decompress_body(raw)
+        except (ValueError, OSError, zlib.error) as exc:
+            self.send_error(400, f"Invalid request body: {exc}")
+            return None
 
     def _read_chunked(self) -> bytes:
         body = b""
@@ -367,14 +405,28 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def _decompress_body(self, data: bytes) -> bytes:
         encoding = self.headers.get("Content-Encoding", "").lower().strip()
+        if encoding in ("", "identity"):
+            return data
         if encoding in ("gzip", "x-gzip"):
-            return gzip.decompress(data)
+            window_bits = zlib.MAX_WBITS | 16
         elif encoding == "deflate":
-            if data[:1] == b'\x78':
-                return zlib.decompress(data)
-            else:
-                return zlib.decompress(data, -15)
-        return data
+            window_bits = zlib.MAX_WBITS if data[:1] == b"\x78" else -zlib.MAX_WBITS
+        else:
+            raise ValueError(f"unsupported Content-Encoding: {encoding}")
+
+        limit = self.mcp_server.post_body_limit
+        decompressor = zlib.decompressobj(window_bits)
+        result = decompressor.decompress(data, limit + 1)
+        if len(result) > limit or decompressor.unconsumed_tail:
+            raise OverflowError("decompressed request exceeds configured limit")
+        result += decompressor.flush()
+        if len(result) > limit:
+            raise OverflowError("decompressed request exceeds configured limit")
+        if not decompressor.eof:
+            raise ValueError("incomplete compressed body")
+        if decompressor.unused_data:
+            raise ValueError("trailing compressed data")
+        return result
 
     def _handle_sse_get(self):
         # Create SSE connection wrapper
@@ -566,6 +618,12 @@ class McpServer:
         self._sse_connections: dict[str, _McpSseConnection] = {}
         self._http_sessions: dict[str, float] = {}
         self._http_sessions_lock = threading.Lock()
+        self._resource_subscriptions: dict[str, set[str]] = {}
+        self._resource_subscriptions_lock = threading.Lock()
+        self._resource_notification_lock = threading.Lock()
+        self._resource_notification_last: dict[str, float] = {}
+        self._resource_notification_timers: dict[str, threading.Timer] = {}
+        self.resource_event_coalesce_sec = 0.1
         self.http_session_ttl_sec = 24 * 60 * 60
         self.http_session_max_count = 4096
         self._protocol_version = threading.local()
@@ -573,6 +631,13 @@ class McpServer:
         self._enabled_extensions = threading.local()  # set[str] per request
         self._extensions_registry = extensions if extensions is not None else {}  # group -> set of tool names
         self.require_streamable_http_session = False
+        self.http_authenticator: Callable[[str | None], None] | None = None
+        self.tool_visibility_filter: Callable[[str], bool] | None = None
+        self.tool_schema_enricher: Callable[[str, dict], dict] | None = None
+        self.tool_call_guard: Callable[[str, dict], None] | None = None
+        self.resource_subscriptions_supported = False
+        self.resource_list_changed_supported = False
+        self.tool_list_changed_supported = False
 
         # Register MCP protocol methods with correct names
         self.registry = JsonRpcRegistry()
@@ -583,6 +648,8 @@ class McpServer:
         self.registry.methods["resources/list"] = self._mcp_resources_list
         self.registry.methods["resources/templates/list"] = self._mcp_resource_templates_list
         self.registry.methods["resources/read"] = self._mcp_resources_read
+        self.registry.methods["resources/subscribe"] = self._mcp_resources_subscribe
+        self.registry.methods["resources/unsubscribe"] = self._mcp_resources_unsubscribe
         self.registry.methods["prompts/list"] = self._mcp_prompts_list
         self.registry.methods["prompts/get"] = self._mcp_prompts_get
         self.registry.methods["notifications/initialized"] = self._mcp_notifications_initialized
@@ -689,27 +756,63 @@ class McpServer:
     def stdio(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None):
         stdin = stdin or sys.stdin.buffer
         stdout = stdout or sys.stdout.buffer
-        while True:
+        write_lock = threading.Lock()
+        workers: set[threading.Thread] = set()
+        workers_lock = threading.Lock()
+
+        def dispatch_request(request: bytes) -> None:
+            response = None
             try:
-                request = stdin.readline()
-                if not request: # EOF
-                    break
-
-                # Strip whitespace (trailing newline) before parsing
-                request = request.strip()
-                if not request:
-                    continue
-
                 setattr(self._transport_session_id, "data", "stdio:default")
                 try:
                     response = self.registry.dispatch(request)
                 finally:
                     setattr(self._transport_session_id, "data", None)
+            except Exception as exc:
+                request_id = None
+                try:
+                    parsed = json.loads(request)
+                    if isinstance(parsed, dict):
+                        request_id = parsed.get("id")
+                except Exception:
+                    pass
+                response = {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32603, "message": f"Internal Error: {exc}"},
+                    "id": request_id,
+                }
+
+            try:
                 if response is not None:
-                    stdout.write(json.dumps(response).encode("utf-8") + b"\n")
-                    stdout.flush()
-            except (BrokenPipeError, KeyboardInterrupt): # Client disconnected
-                break
+                    payload = json.dumps(response).encode("utf-8") + b"\n"
+                    with write_lock:
+                        stdout.write(payload)
+                        stdout.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                with workers_lock:
+                    workers.discard(threading.current_thread())
+
+        try:
+            while True:
+                request = stdin.readline()
+                if not request:
+                    break
+                request = request.strip()
+                if not request:
+                    continue
+                worker = threading.Thread(target=dispatch_request, args=(request,), daemon=True)
+                with workers_lock:
+                    workers.add(worker)
+                worker.start()
+        except (BrokenPipeError, KeyboardInterrupt):
+            pass
+        finally:
+            with workers_lock:
+                pending = list(workers)
+            for worker in pending:
+                worker.join()
 
     def get_current_transport_session_id(self) -> str | None:
         return getattr(self._transport_session_id, "data", None)
@@ -761,10 +864,10 @@ class McpServer:
         return {
             "protocolVersion": getattr(self._protocol_version, "data", protocolVersion),
             "capabilities": {
-                "tools": {},
+                "tools": {"listChanged": self.tool_list_changed_supported},
                 "resources": {
-                    "subscribe": False,
-                    "listChanged": False,
+                    "subscribe": self.resource_subscriptions_supported,
+                    "listChanged": self.resource_list_changed_supported,
                 },
                 "prompts": {},
             },
@@ -779,11 +882,16 @@ class McpServer:
         enabled = getattr(self._enabled_extensions, "data", set())
         tools = []
         for func_name, func in self.tools.methods.items():
+            if self.tool_visibility_filter is not None and not self.tool_visibility_filter(func_name):
+                continue
             # Check if tool belongs to an extension group
             tool_group = self._get_tool_extension(func_name)
             if tool_group and tool_group not in enabled:
                 continue  # Skip tools from disabled extension groups
-            tools.append(self._generate_tool_schema(func_name, func))
+            schema = self._generate_tool_schema(func_name, func)
+            if self.tool_schema_enricher is not None:
+                schema = self.tool_schema_enricher(func_name, schema)
+            tools.append(schema)
         return {"tools": tools}
 
     def _get_tool_extension(self, func_name: str) -> str | None:
@@ -795,6 +903,33 @@ class McpServer:
 
     def _mcp_tools_call(self, name: str, arguments: dict | None = None, _meta: dict | None = None) -> dict:
         """MCP tools/call method"""
+        if self.tool_visibility_filter is not None and not self.tool_visibility_filter(name):
+            return {
+                "content": [{"type": "text", "text": f"Tool '{name}' is not enabled by the active API profile"}],
+                "structuredContent": {
+                    "error": {
+                        "code": "PROFILE_DENIED",
+                        "message": f"Tool '{name}' is not enabled by the active API profile",
+                    }
+                },
+                "isError": True,
+            }
+
+        if self.tool_call_guard is not None:
+            try:
+                self.tool_call_guard(name, arguments or {})
+            except McpToolError as exc:
+                return {
+                    "content": [{"type": "text", "text": str(exc)}],
+                    "structuredContent": {
+                        "error": {
+                            "code": exc.code or "TOOL_ERROR",
+                            "message": str(exc),
+                            "details": exc.details,
+                        }
+                    },
+                    "isError": True,
+                }
         # Check if tool requires an extension that isn't enabled
         enabled = getattr(self._enabled_extensions, "data", set())
         tool_group = self._get_tool_extension(name)
@@ -806,8 +941,9 @@ class McpServer:
 
         # Register request for cancellation tracking
         request_id = get_current_request_id()
+        request_scope = self.get_current_transport_session_id()
         if request_id is not None:
-            register_pending_request(request_id)
+            register_pending_request(request_id, request_scope)
 
         try:
             # Wrap tool call in JSON-RPC request
@@ -823,6 +959,12 @@ class McpServer:
                 error = tool_response["error"]
                 return {
                     "content": [{"type": "text", "text": error.get("message", "Unknown error")}],
+                    "structuredContent": {
+                        "error": error.get("data", {
+                            "code": "TOOL_ERROR",
+                            "message": error.get("message", "Unknown error"),
+                        })
+                    },
                     "isError": True,
                 }
 
@@ -834,7 +976,7 @@ class McpServer:
             }
         finally:
             if request_id is not None:
-                unregister_pending_request(request_id)
+                unregister_pending_request(request_id, request_scope)
 
     def _mcp_notifications_initialized(self) -> None:
         """MCP notifications/initialized - client signals initialization complete"""
@@ -842,7 +984,8 @@ class McpServer:
 
     def _mcp_notifications_cancelled(self, requestId: int | str, reason: str | None = None) -> None:
         """MCP notifications/cancelled - cancel an in-flight request"""
-        if cancel_request(requestId):
+        request_scope = self.get_current_transport_session_id()
+        if cancel_request(requestId, request_scope):
             logger.info(
                 "[MCP] Cancelled request %s: %s",
                 requestId,
@@ -944,6 +1087,78 @@ class McpServer:
             }],
             "isError": True,
         }
+
+    def _mcp_resources_subscribe(self, uri: str, _meta: dict | None = None) -> dict:
+        if not self.resource_subscriptions_supported:
+            raise JsonRpcException(-32601, "Resource subscriptions are not supported")
+        session_id = self.get_current_transport_session_id()
+        if not session_id:
+            raise JsonRpcException(-32602, "Resource subscription requires a transport session")
+        with self._resource_subscriptions_lock:
+            self._resource_subscriptions.setdefault(session_id, set()).add(uri)
+        return {}
+
+    def _mcp_resources_unsubscribe(self, uri: str, _meta: dict | None = None) -> dict:
+        session_id = self.get_current_transport_session_id()
+        if session_id:
+            with self._resource_subscriptions_lock:
+                subscriptions = self._resource_subscriptions.get(session_id)
+                if subscriptions is not None:
+                    subscriptions.discard(uri)
+                    if not subscriptions:
+                        self._resource_subscriptions.pop(session_id, None)
+        return {}
+
+    def _notify_sse(self, method: str, params: dict) -> int:
+        delivered = 0
+        payload = {"jsonrpc": "2.0", "method": method, "params": params}
+        for connection in list(self._sse_connections.values()):
+            if connection.alive and connection.send_event("message", payload):
+                delivered += 1
+        return delivered
+
+    def notify_resource_updated(self, uri: str) -> int:
+        if not self.resource_subscriptions_supported:
+            return 0
+        with self._resource_subscriptions_lock:
+            interested = any(uri in uris for uris in self._resource_subscriptions.values())
+        if not interested:
+            return 0
+        now = time.monotonic()
+        with self._resource_notification_lock:
+            last = self._resource_notification_last.get(uri, 0.0)
+            elapsed = now - last
+            if elapsed >= self.resource_event_coalesce_sec:
+                self._resource_notification_last[uri] = now
+                immediate = True
+            else:
+                immediate = False
+                if uri not in self._resource_notification_timers:
+                    delay = max(0.0, self.resource_event_coalesce_sec - elapsed)
+
+                    def deliver() -> None:
+                        with self._resource_notification_lock:
+                            self._resource_notification_timers.pop(uri, None)
+                            self._resource_notification_last[uri] = time.monotonic()
+                        self._notify_sse("notifications/resources/updated", {"uri": uri})
+
+                    timer = threading.Timer(delay, deliver)
+                    timer.daemon = True
+                    self._resource_notification_timers[uri] = timer
+                    timer.start()
+        if immediate:
+            return self._notify_sse("notifications/resources/updated", {"uri": uri})
+        return 0
+
+    def notify_resources_list_changed(self) -> int:
+        if not self.resource_list_changed_supported:
+            return 0
+        return self._notify_sse("notifications/resources/list_changed", {})
+
+    def notify_tools_list_changed(self) -> int:
+        if not self.tool_list_changed_supported:
+            return 0
+        return self._notify_sse("notifications/tools/list_changed", {})
 
     def _mcp_prompts_list(self, _meta: dict | None = None) -> dict:
         """MCP prompts/list method"""

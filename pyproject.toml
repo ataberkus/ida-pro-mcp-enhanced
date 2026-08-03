@@ -37,6 +37,10 @@ Repository = "https://github.com/ataberkus/ida-pro-mcp-enhanced"
 Issues = "https://github.com/ataberkus/ida-pro-mcp-enhanced/issues"
 Upstream = "https://github.com/mrexodia/ida-pro-mcp"
 
+[tool.setuptools.data-files]
+"share/ida-pro-mcp/profiles" = ["profiles/*.txt"]
+"share/ida-pro-mcp/devdocs" = ["devdocs/*.md"]
+
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"

@@ -8,7 +8,7 @@ Architecture:
 - mcp.py: MCP protocol server (HTTP/SSE)
 - sync.py: IDA synchronization decorator (@idasync)
 - utils.py: Shared helpers and TypedDict definitions
-- api_*.py: Modular API implementations and resources
+- api_*.py: Modular API implementations (75 tools + 24 resources)
 """
 
 # Ignore SIGPIPE to prevent IDA from being killed when an MCP client
@@ -36,13 +36,31 @@ from . import api_python
 from . import api_resources
 from . import api_survey
 from . import api_composite
+from . import trace as trace
+from . import api_sigmaker
+from . import api_vnext
 from . import api_investigation
 
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
-from .rpc import MCP_SERVER, MCP_UNSAFE, tool, unsafe, resource
+from .rpc import (
+    MCP_AUDIT,
+    MCP_POLICY,
+    MCP_SERVER,
+    MCP_UNSAFE,
+    configure_tool_policy,
+    configure_workspace_policy,
+    prompt,
+    resource,
+    scope,
+    tool,
+    unsafe,
+)
 from .http import IdaMcpHttpRequestHandler
 from .api_core import init_caches
+
+# Tracing is always on: every tools/call is recorded into the IDB netnode.
+trace.configure_idb()
 
 __all__ = [
     # Infrastructure modules
@@ -61,6 +79,8 @@ __all__ = [
     "api_resources",
     "api_survey",
     "api_composite",
+    "api_sigmaker",
+    "api_vnext",
     "api_investigation",
     # Re-exported components
     "idasync",
@@ -69,9 +89,15 @@ __all__ = [
     "CancelledError",
     "MCP_SERVER",
     "MCP_UNSAFE",
+    "MCP_POLICY",
+    "MCP_AUDIT",
     "tool",
     "unsafe",
+    "scope",
     "resource",
+    "prompt",
+    "configure_tool_policy",
+    "configure_workspace_policy",
     "IdaMcpHttpRequestHandler",
     "init_caches",
 ]

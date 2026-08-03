@@ -10,17 +10,25 @@ from typing import Annotated, Any, TypedDict
 # idapro must go first to initialize idalib
 import idapro
 
-from ida_pro_mcp.ida_mcp import MCP_SERVER, MCP_UNSAFE
+from ida_pro_mcp.ida_mcp import (
+    MCP_POLICY,
+    MCP_SERVER,
+    MCP_UNSAFE,
+    configure_tool_policy,
+    configure_workspace_policy,
+)
 from ida_pro_mcp.ida_mcp.api_core import (
     ServerWarmupResult,
     server_warmup,
 )
 from ida_pro_mcp.ida_mcp.discovery import register_instance, unregister_instance
 from ida_pro_mcp.ida_mcp.http import IdaMcpHttpRequestHandler
-from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile
+from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile, load_profile_scopes
 from ida_pro_mcp.ida_mcp.rpc import set_download_base_url, tool
 from ida_pro_mcp.idalib_session_manager import get_session_manager
 from ida_pro_mcp.worker_lifecycle import WorkerLifecycle
+from ida_pro_mcp.vnext.auth import AuthPolicy, WorkspacePolicy, default_token_path, load_token_file
+from ida_pro_mcp.vnext.contracts import SafetyScope, VNextError
 
 
 class IdalibSessionInfo(TypedDict):
@@ -63,6 +71,7 @@ _LIFECYCLE = WorkerLifecycle()
 _REGISTERED_PORT: int | None = None
 _BOUND_HOST: str = ""
 _BOUND_PORT: int = 0
+_WORKSPACE_POLICY = WorkspacePolicy()
 
 
 def _register_in_discovery(host: str, port: int, input_path: Path) -> None:
@@ -112,7 +121,7 @@ def idb_open(
 
     try:
         manager = get_session_manager()
-        resolved_path = Path(input_path).resolve()
+        resolved_path = _WORKSPACE_POLICY.resolve(input_path, must_exist=True)
         load_started_at = time.monotonic()
         opened_session_id = manager.open_binary(
             resolved_path,
@@ -187,6 +196,32 @@ def main():
         "--unsafe", action="store_true", help="Enable unsafe functions (DANGEROUS)"
     )
     parser.add_argument(
+        "--safety-scope",
+        choices=tuple(scope.value for scope in SafetyScope if scope is not SafetyScope.READ),
+        action="append",
+        default=[],
+        help="Enable one additional safety scope (repeatable).",
+    )
+    parser.add_argument(
+        "--api-profile",
+        choices=("canonical", "legacy"),
+        default="canonical",
+        help="Advertise the bounded canonical API or all legacy tools.",
+    )
+    parser.add_argument(
+        "--auth-token-file",
+        type=Path,
+        default=None,
+        help="Bearer token file. Required for non-loopback HTTP unless IDA_MCP_AUTH_TOKEN is set.",
+    )
+    parser.add_argument(
+        "--workspace-root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Restrict binary, script, save, and export paths to this root (repeatable).",
+    )
+    parser.add_argument(
         "--profile",
         type=Path,
         default=None,
@@ -204,6 +239,36 @@ def main():
         help="Path to the input file to analyze (optional).",
     )
     args = parser.parse_args()
+
+    token = os.environ.get("IDA_MCP_AUTH_TOKEN")
+    token_path = args.auth_token_file
+    if token is None and token_path is None and default_token_path().exists():
+        token_path = default_token_path()
+    if token is None and token_path is not None:
+        try:
+            token = load_token_file(token_path)
+        except (OSError, UnicodeDecodeError, VNextError) as exc:
+            raise SystemExit(f"Failed to load bearer token: {exc}") from exc
+    auth_policy = AuthPolicy(args.host, token)
+    try:
+        auth_policy.validate_configuration()
+    except VNextError as exc:
+        raise SystemExit(str(exc)) from exc
+    if auth_policy.token_required or token:
+        MCP_SERVER.http_authenticator = auth_policy.authorize_header
+
+    global _WORKSPACE_POLICY
+    _WORKSPACE_POLICY = WorkspacePolicy.from_values(args.workspace_root)
+    configure_workspace_policy(args.workspace_root)
+
+    scopes = {SafetyScope.READ}
+    scopes.update(SafetyScope(scope) for scope in args.safety_scope)
+    if args.unsafe:
+        scopes.update(SafetyScope)
+    configure_tool_policy(
+        scopes=scopes,
+        legacy_tools=args.api_profile == "legacy" or args.profile is not None,
+    )
 
     if args.verbose:
         log_level = logging.DEBUG
@@ -226,7 +291,7 @@ def main():
             raise FileNotFoundError(f"Input file not found: {args.input_path}")
 
         logger.info("opening initial database: %s", args.input_path)
-        resolved = args.input_path.resolve()
+        resolved = _WORKSPACE_POLICY.resolve(args.input_path, must_exist=True)
         session_id = session_manager.open_binary(resolved, run_auto_analysis=True)
         logger.info("Initial session created: %s", session_id)
         _register_in_discovery(args.host, args.port, resolved)
@@ -266,17 +331,18 @@ def main():
     signal.signal(signal.SIGINT, cleanup_and_exit)
     signal.signal(signal.SIGTERM, cleanup_and_exit)
 
-    if not args.unsafe:
-        for name in MCP_UNSAFE:
-            MCP_SERVER.tools.methods.pop(name, None)
-        if MCP_UNSAFE:
-            logger.info("Unsafe tools disabled (start with --unsafe to enable)")
+    if scopes == {SafetyScope.READ} and MCP_UNSAFE:
+        logger.info("Write/debug/python scopes disabled by the active safety profile")
 
     if args.profile is not None:
         try:
             whitelist = load_profile(args.profile)
         except (OSError, UnicodeDecodeError) as e:
             raise SystemExit(f"Failed to read profile '{args.profile}': {e}")
+        for name in whitelist:
+            scopes.update(MCP_POLICY.get(name).scopes)
+        scopes.update(load_profile_scopes(args.profile))
+        configure_tool_policy(scopes=scopes, legacy_tools=True)
         kept, unknown = apply_profile(
             MCP_SERVER.tools.methods,
             whitelist,
@@ -297,7 +363,7 @@ def main():
     trace.install_tracer()
     logger.info("Tracing tools/call to IDB netnode %s", trace.IDB_NETNODE_NAME)
 
-    if not "IDA_MCP_URL" in os.environ:
+    if "IDA_MCP_URL" not in os.environ:
         set_download_base_url(f"http://{args.host}:{args.port}")
 
     try:

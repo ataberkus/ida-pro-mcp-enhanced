@@ -174,6 +174,61 @@ def test_worker_rpc_default_has_no_socket_timeout(monkeypatch):
     assert _FakeConnection.instances[1].timeout == 2.0
 
 
+def test_worker_rpc_uses_ephemeral_bearer_credential(monkeypatch):
+    captured = {}
+
+    class _FakeResponse:
+        status = 200
+        reason = "OK"
+
+        def read(self):
+            return b'{"jsonrpc":"2.0","result":{},"id":1}'
+
+    class _FakeConnection:
+        def __init__(self, host, port, timeout=None):
+            pass
+
+        def request(self, method, path, body, headers):
+            captured.update(headers)
+
+        def getresponse(self):
+            return _FakeResponse()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(supmod.http.client, "HTTPConnection", _FakeConnection)
+    supervisor = supmod.IdalibSupervisor(supmod.McpServer("test"))
+    worker = supmod.WorkerSession(
+        session_id="worker",
+        input_path="",
+        filename="",
+        port=12345,
+        process=_FakeProcess(),
+        auth_token="ephemeral-secret",
+    )
+    supervisor._worker_rpc(worker, {"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    assert captured["Authorization"] == "Bearer ephemeral-secret"
+
+
+def test_binary_diff_matcher_uses_symbols_signatures_and_instruction_hashes():
+    left = [
+        {"addr": "0x1000", "name": "parse", "size": "0x20", "signature": "AA ? BB", "instruction_hash": "h1"},
+        {"addr": "0x2000", "name": "sub_2000", "size": "0x10", "signature": "CC DD", "instruction_hash": "h2"},
+        {"addr": "0x3000", "name": "removed", "size": "0x8"},
+    ]
+    right = [
+        {"addr": "0x5000", "name": "parse", "size": "0x24", "signature": "AA ? BB", "instruction_hash": "changed"},
+        {"addr": "0x6000", "name": "sub_6000", "size": "0x10", "signature": "CC DD", "instruction_hash": "h2"},
+        {"addr": "0x7000", "name": "added", "size": "0x8"},
+    ]
+    matches, removed, added = supmod.IdalibSupervisor._match_functions(left, right)
+    assert len(matches) == 2
+    assert any(item["left"]["name"] == "parse" and item["changed"] for item in matches)
+    assert removed[0]["name"] == "removed"
+    assert added[0]["name"] == "added"
+
+
 def test_cleanup_partial_database_removes_only_new_parts(tmp_path):
     sample = tmp_path / "sample.bin"
     sample.write_bytes(b"sample")

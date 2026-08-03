@@ -1,6 +1,11 @@
 import json
 import os
+from threading import RLock
 from typing import Any, Optional
+from ida_pro_mcp.vnext.audit import AuditLog
+from ida_pro_mcp.vnext.auth import WorkspacePolicy
+from ida_pro_mcp.vnext.contracts import SafetyScope, VNextError
+from ida_pro_mcp.vnext.policy import ToolPolicyRegistry, register_builtin_policies
 from .zeromcp import (
     McpRpcRegistry,
     McpServer,
@@ -12,6 +17,110 @@ from .zeromcp import (
 MCP_UNSAFE: set[str] = set()
 MCP_EXTENSIONS: dict[str, set[str]] = {}  # group -> set of function names
 MCP_SERVER = McpServer("ida-pro-mcp", extensions=MCP_EXTENSIONS)
+MCP_POLICY = ToolPolicyRegistry()
+register_builtin_policies(MCP_POLICY)
+MCP_UNSAFE.update(
+    name
+    for name, policy in MCP_POLICY.schemas().items()
+    if policy.scopes != frozenset({SafetyScope.READ})
+)
+MCP_AUDIT = AuditLog()
+_policy_lock = RLock()
+_active_scopes: set[SafetyScope] = {SafetyScope.READ}
+_legacy_tools_enabled = False
+_workspace_policy = WorkspacePolicy()
+
+
+def configure_tool_policy(
+    *,
+    scopes: set[SafetyScope | str] | None = None,
+    legacy_tools: bool = False,
+) -> None:
+    """Set the process-wide policy applied by tools/list and tools/call."""
+
+    global _active_scopes, _legacy_tools_enabled
+    with _policy_lock:
+        _active_scopes = {
+            SafetyScope(scope) for scope in (scopes or {SafetyScope.READ})
+        }
+        _active_scopes.add(SafetyScope.READ)
+        _legacy_tools_enabled = bool(legacy_tools)
+
+
+def get_active_scopes() -> set[SafetyScope]:
+    with _policy_lock:
+        return set(_active_scopes)
+
+
+def configure_workspace_policy(roots) -> None:
+    global _workspace_policy
+    with _policy_lock:
+        _workspace_policy = WorkspacePolicy.from_values(roots)
+
+
+def get_workspace_policy() -> WorkspacePolicy:
+    with _policy_lock:
+        return _workspace_policy
+
+
+def _tool_visible(name: str) -> bool:
+    with _policy_lock:
+        policy = MCP_POLICY.get(name)
+        return (
+            MCP_POLICY.visible(name, legacy=_legacy_tools_enabled)
+            and policy.scopes <= _active_scopes
+        )
+
+
+def _enrich_tool_schema(name: str, schema: dict) -> dict:
+    policy = MCP_POLICY.get(name)
+    schema["annotations"] = policy.annotations()
+    schema["_meta"] = {
+        **schema.get("_meta", {}),
+        "ida_mcp": {
+            "safety_scopes": sorted(scope.value for scope in policy.scopes),
+            "canonical": policy.canonical,
+            "deprecated": policy.replacement is not None and not policy.canonical,
+            "replacement": policy.replacement,
+        },
+    }
+    return schema
+
+
+def _guard_tool_call(name: str, arguments: dict) -> None:
+    try:
+        MCP_POLICY.authorize(name, get_active_scopes())
+    except VNextError as exc:
+        raise McpToolError(
+            str(exc),
+            code=exc.code.value,
+            details=exc.details,
+        ) from exc
+    path_argument = {
+        "idb_open": "input_path",
+        "idb_save": "path",
+        "py_exec_file": "file_path",
+    }.get(name)
+    if name == "python_execute" and arguments.get("mode") == "file":
+        path_argument = "path"
+    if name == "investigation_export" and arguments.get("path"):
+        path_argument = "path"
+    if path_argument and arguments.get(path_argument):
+        try:
+            get_workspace_policy().resolve(
+                arguments[path_argument],
+                must_exist=name in {"idb_open", "py_exec_file", "python_execute"},
+            )
+        except VNextError as exc:
+            raise McpToolError(str(exc), code=exc.code.value, details=exc.details) from exc
+
+
+MCP_SERVER.tool_visibility_filter = _tool_visible
+MCP_SERVER.tool_schema_enricher = _enrich_tool_schema
+MCP_SERVER.tool_call_guard = _guard_tool_call
+MCP_SERVER.resource_subscriptions_supported = True
+MCP_SERVER.resource_list_changed_supported = True
+MCP_SERVER.tool_list_changed_supported = True
 
 # ============================================================================
 # Output Size Limiting
@@ -99,6 +208,29 @@ def _install_tools_call_patch() -> None:
     ) -> dict:
         response = original(name, arguments, _meta)
 
+        policy = MCP_POLICY.get(name)
+        MCP_AUDIT.append(
+            tool=name,
+            arguments=arguments or {},
+            outcome="error" if response.get("isError") else "success",
+            session_id=get_current_transport_session_id(),
+            safety_scopes=tuple(sorted(scope.value for scope in policy.scopes)),
+            error_code=(
+                response.get("structuredContent", {}).get("error", {}).get("code")
+                if response.get("isError")
+                else None
+            ),
+        )
+
+        if policy.replacement is not None and not policy.canonical:
+            metadata = response.setdefault("_meta", {}).setdefault("ida_mcp", {})
+            metadata["deprecation"] = {
+                "deprecated": True,
+                "replacement": policy.replacement,
+                "message": f"Legacy tool '{name}' is deprecated; use '{policy.replacement}'.",
+                "removal": "next-major",
+            }
+
         if response.get("isError"):
             return response
 
@@ -151,9 +283,39 @@ def resource(uri):
     return MCP_SERVER.resource(uri)
 
 
+def prompt(func):
+    return MCP_SERVER.prompt(func)
+
+
 def unsafe(func):
     MCP_UNSAFE.add(func.__name__)
+    policy = MCP_POLICY.get(func.__name__)
+    if policy.scopes == frozenset({SafetyScope.READ}):
+        MCP_POLICY.set_scope(func.__name__, SafetyScope.MODIFY)
     return func
+
+
+def scope(
+    *scopes: SafetyScope,
+    destructive: bool = True,
+    idempotent: bool = False,
+    open_world: bool = False,
+):
+    """Attach explicit vNext safety metadata to a tool function."""
+
+    def decorator(func):
+        MCP_POLICY.set_scope(
+            func.__name__,
+            *scopes,
+            destructive=destructive,
+            idempotent=idempotent,
+            open_world=open_world,
+        )
+        if scopes and set(scopes) != {SafetyScope.READ}:
+            MCP_UNSAFE.add(func.__name__)
+        return func
+
+    return decorator
 
 
 def ext(group: str):
@@ -180,10 +342,18 @@ __all__ = [
     "MCP_SERVER",
     "MCP_UNSAFE",
     "MCP_EXTENSIONS",
+    "MCP_POLICY",
+    "MCP_AUDIT",
     "tool",
     "unsafe",
+    "scope",
     "ext",
     "resource",
+    "prompt",
+    "configure_tool_policy",
+    "configure_workspace_policy",
+    "get_active_scopes",
+    "get_workspace_policy",
     "get_cached_output",
     "set_download_base_url",
     "get_download_base_url",

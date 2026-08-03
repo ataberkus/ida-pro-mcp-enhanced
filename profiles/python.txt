@@ -1,0 +1,6 @@
+# ida-pro-mcp vNext restricted Python profile
+# schema-version: 2026-08-01
+# scopes: python
+
+server_capabilities
+python_execute

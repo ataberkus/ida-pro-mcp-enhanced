@@ -1,0 +1,6 @@
+# ida-pro-mcp legacy compatibility profile
+# Exposes every registered tool for one stable vNext release.
+# schema-version: 2026-08-01
+# scopes: annotate,modify,filesystem,debug,python
+
+*

@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import http.client
 import importlib.util
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -25,6 +27,16 @@ from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Annotated, Any, TypedDict
+from urllib.parse import quote, unquote
+
+from ida_pro_mcp.vnext.auth import (
+    AuthPolicy,
+    WorkspacePolicy,
+    create_token,
+    default_token_path,
+    load_token_file,
+)
+from ida_pro_mcp.vnext.contracts import API_SCHEMA_VERSION, VNextError
 
 
 logger = logging.getLogger(__name__)
@@ -166,6 +178,7 @@ class WorkerSession:
     owned: bool = True
     pid: int | None = None
     last_warmup: dict[str, Any] | None = None
+    auth_token: str | None = field(default=None, repr=False)
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -205,10 +218,12 @@ class IdalibSupervisor:
         *,
         max_workers: int = 4,
         worker_args: list[str] | None = None,
+        workspace_policy: WorkspacePolicy | None = None,
     ):
         self.mcp = mcp
         self.max_workers = max_workers
         self.worker_args = worker_args or []
+        self.workspace_policy = workspace_policy or WorkspacePolicy()
         self.sessions: dict[str, WorkerSession] = {}
         self.path_to_session: dict[str, str] = {}
         self._schema_worker: WorkerSession | None = None
@@ -227,6 +242,7 @@ class IdalibSupervisor:
 
     def _spawn_worker(self) -> WorkerSession:
         port = self._pick_port()
+        worker_token = create_token()
         cmd = [
             sys.executable,
             "-m",
@@ -246,6 +262,8 @@ class IdalibSupervisor:
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
             start_new_session = True
+        worker_environment = os.environ.copy()
+        worker_environment["IDA_MCP_AUTH_TOKEN"] = worker_token
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -253,6 +271,7 @@ class IdalibSupervisor:
             stderr=subprocess.DEVNULL,
             creationflags=creationflags,
             start_new_session=start_new_session,
+            env=worker_environment,
         )
         worker = WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
@@ -264,6 +283,7 @@ class IdalibSupervisor:
             backend="worker",
             owned=True,
             pid=process.pid,
+            auth_token=worker_token,
         )
         try:
             self._wait_worker_ready(worker)
@@ -344,19 +364,22 @@ class IdalibSupervisor:
                 pass
 
     def shutdown(self) -> None:
-        """Forget local session state without killing persistent workers.
-
-        Spawned workers self-exit after their idle TTL. The only process the
-        supervisor is responsible for is the schema worker, which is
-        supervisor-private and has no DB; terminate it explicitly.
-        """
+        """Terminate supervisor-owned workers whose credentials are ephemeral."""
         with self._lock:
             schema = self._schema_worker
+            owned = [
+                session
+                for session in self.sessions.values()
+                if session.backend == "worker" and session.owned
+            ]
             self.sessions.clear()
             self.path_to_session.clear()
             self._schema_worker = None
         if schema is not None:
             self._terminate_worker(schema)
+        for session in owned:
+            if session is not schema:
+                self._terminate_worker(session)
 
     def _schema_or_idle_worker(self) -> WorkerSession:
         with self._lock:
@@ -426,14 +449,17 @@ class IdalibSupervisor:
         body = json.dumps(payload).encode("utf-8")
         conn = http.client.HTTPConnection(worker.host, worker.port, timeout=timeout)
         try:
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            }
+            if worker.auth_token:
+                headers["Authorization"] = f"Bearer {worker.auth_token}"
             conn.request(
                 "POST",
                 self._worker_request_path(),
                 body,
-                {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream",
-                },
+                headers,
             )
             response = conn.getresponse()
             raw = response.read().decode("utf-8")
@@ -469,6 +495,167 @@ class IdalibSupervisor:
             message = content[0].get("text", "Unknown worker tool error") if content else "Unknown worker tool error"
             raise RuntimeError(message)
         return result.get("structuredContent")
+
+    @staticmethod
+    def _envelope_data(value: Any) -> Any:
+        if isinstance(value, dict) and "data" in value and "schema_version" in value:
+            return value["data"]
+        return value
+
+    def _function_inventory(
+        self,
+        session: WorkerSession,
+        *,
+        limit: int,
+        hash_limit: int,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        warnings: list[str] = []
+        raw_pages = self.call_worker_tool(
+            session,
+            "entity_query",
+            {"queries": {"kind": "functions", "offset": 0, "count": limit, "sort_by": "addr"}},
+        )
+        pages = self._envelope_data(raw_pages)
+        if not isinstance(pages, list) or not pages:
+            return [], ["Function inventory returned no page"]
+        functions = [dict(item) for item in pages[0].get("data", [])]
+        if pages[0].get("next_offset") is not None:
+            warnings.append(f"Function inventory truncated at {limit} entries")
+
+        addresses = [str(item.get("addr")) for item in functions if item.get("addr")]
+        try:
+            signature_result = self._envelope_data(
+                self.call_worker_tool(
+                    session,
+                    "signature_create",
+                    {"addrs": addresses, "format": "ida", "wildcard_operands": True, "max_length": 250},
+                )
+            )
+            signatures = {
+                str(item.get("addr", "")).lower(): item.get("signature")
+                for item in (signature_result if isinstance(signature_result, list) else [])
+                if isinstance(item, dict) and item.get("signature")
+            }
+            for item in functions:
+                item["signature"] = signatures.get(str(item.get("addr", "")).lower())
+        except Exception as exc:
+            warnings.append(f"Signature matching unavailable: {exc}")
+
+        for item in functions[:hash_limit]:
+            try:
+                disassembly = self._envelope_data(
+                    self.call_worker_tool(
+                        session,
+                        "disassemble",
+                        {"addr": item["addr"], "max_instructions": 5000, "offset": 0, "include_total": False},
+                    )
+                )
+                lines = ((disassembly or {}).get("asm") or {}).get("lines", [])
+                normalized = []
+                for line in lines:
+                    instruction = str(line.get("instruction", "")).lower()
+                    instruction = re.sub(r"\b(?:0x)?[0-9a-f]{4,}\b", "#", instruction)
+                    normalized.append(instruction)
+                if normalized:
+                    item["instruction_hash"] = hashlib.sha256("\n".join(normalized).encode()).hexdigest()
+            except Exception as exc:
+                warnings.append(f"Instruction hashing failed for {item.get('addr')}: {exc}")
+        return functions, warnings
+
+    @staticmethod
+    def _match_functions(
+        left: list[dict[str, Any]], right: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        auto_prefixes = ("sub_", "loc_", "nullsub_", "<unnamed>")
+        candidates: list[tuple[float, int, int, list[str]]] = []
+        for left_index, left_item in enumerate(left):
+            for right_index, right_item in enumerate(right):
+                score = 0.0
+                reasons: list[str] = []
+                left_name = str(left_item.get("name", ""))
+                right_name = str(right_item.get("name", ""))
+                if left_name and left_name == right_name and not left_name.lower().startswith(auto_prefixes):
+                    score += 0.55
+                    reasons.append("symbol")
+                if left_item.get("signature") and left_item.get("signature") == right_item.get("signature"):
+                    score += 0.3
+                    reasons.append("signature")
+                if left_item.get("instruction_hash") and left_item.get("instruction_hash") == right_item.get("instruction_hash"):
+                    score += 0.4
+                    reasons.append("normalized_instruction_hash")
+                if left_item.get("size") == right_item.get("size"):
+                    score += 0.05
+                    reasons.append("size")
+                if score >= 0.35:
+                    candidates.append((min(score, 1.0), left_index, right_index, reasons))
+        matches: list[dict[str, Any]] = []
+        used_left: set[int] = set()
+        used_right: set[int] = set()
+        for score, left_index, right_index, reasons in sorted(candidates, reverse=True):
+            if left_index in used_left or right_index in used_right:
+                continue
+            used_left.add(left_index)
+            used_right.add(right_index)
+            left_item, right_item = left[left_index], right[right_index]
+            changed = any(
+                left_item.get(field) != right_item.get(field)
+                for field in ("size", "signature", "instruction_hash", "has_type")
+            )
+            matches.append(
+                {
+                    "left": left_item,
+                    "right": right_item,
+                    "score": round(score, 3),
+                    "reasons": reasons,
+                    "changed": changed,
+                }
+            )
+        removed = [item for index, item in enumerate(left) if index not in used_left]
+        added = [item for index, item in enumerate(right) if index not in used_right]
+        return matches, removed, added
+
+    def binary_diff(
+        self,
+        left_database: str,
+        right_database: str,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        effective = options or {}
+        limit = max(1, min(int(effective.get("max_functions", 500)), 5000))
+        hash_limit = max(0, min(int(effective.get("hash_functions", 200)), limit))
+        left_session = self.resolve_session(left_database)
+        right_session = self.resolve_session(right_database)
+        left, left_warnings = self._function_inventory(left_session, limit=limit, hash_limit=hash_limit)
+        right, right_warnings = self._function_inventory(right_session, limit=limit, hash_limit=hash_limit)
+        matches, removed, added = self._match_functions(left, right)
+        return {
+            "data": {
+                "left_database": left_database,
+                "right_database": right_database,
+                "matches": matches,
+                "changed": [item for item in matches if item["changed"]],
+                "unchanged": [item for item in matches if not item["changed"]],
+                "removed": removed,
+                "added": added,
+                "summary": {
+                    "left_functions": len(left),
+                    "right_functions": len(right),
+                    "matched": len(matches),
+                    "changed": sum(1 for item in matches if item["changed"]),
+                    "removed": len(removed),
+                    "added": len(added),
+                },
+            },
+            "warnings": left_warnings + right_warnings,
+            "provenance": {
+                "engines": ["symbols", "ida_signature", "normalized_instruction_hash"],
+                "hash_budget": hash_limit,
+            },
+            "truncated": len(left) >= limit or len(right) >= limit,
+            "next_cursor": None,
+            "schema_version": API_SCHEMA_VERSION,
+        }
 
     # ------------------------------------------------------------------
     # Session management
@@ -709,7 +896,12 @@ class IdalibSupervisor:
             raise ValueError(
                 f"Unknown mode: {mode!r}. Expected one of: {sorted(IDB_OPEN_MODES)}."
             )
-        resolved = self._normalize_input_path(input_path)
+        resolved = str(
+            self.workspace_policy.resolve(
+                self._normalize_input_path(input_path),
+                must_exist=True,
+            )
+        )
         with self._lock:
             existing = self.path_to_session.get(self._path_key(resolved))
             if existing is not None:
@@ -1194,6 +1386,13 @@ def databases_resource() -> dict:
     return {"databases": databases, "count": len(databases)}
 
 
+@mcp.resource("ida://sessions")
+def sessions_resource() -> dict:
+    """Canonical alias for the supervisor's database session collection."""
+
+    return databases_resource()
+
+
 def _handle_tools_list(request_obj: dict[str, Any]) -> dict[str, Any]:
     sup = _require_supervisor()
     local_tools = mcp._mcp_tools_list().get("tools", [])
@@ -1222,6 +1421,25 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
     except Exception as e:
         return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
 
+    if tool_name == "analysis_run" and str(arguments.get("mode", "")).lower() == "binary_diff":
+        options = dict(arguments.get("options") or {})
+        right_database = options.pop("right_database", None)
+        if not isinstance(right_database, str) or not right_database:
+            return _jsonrpc_result(
+                request_id,
+                _call_tool_result(
+                    {"error": "binary_diff requires options.right_database"},
+                    is_error=True,
+                ),
+            )
+        try:
+            result = sup.binary_diff(database, right_database, options=options)
+            return _jsonrpc_result(request_id, _call_tool_result(result))
+        except Exception as exc:
+            return _jsonrpc_result(
+                request_id, _call_tool_result({"error": str(exc)}, is_error=True)
+            )
+
     forwarded = copy.deepcopy(request_obj)
     forwarded.setdefault("params", {})["arguments"] = arguments
     try:
@@ -1246,8 +1464,26 @@ def _handle_resource_templates_list(request_obj: dict[str, Any]) -> dict[str, An
 
 def _handle_resources_read(request_obj: dict[str, Any]) -> dict[str, Any] | None:
     uri = (request_obj.get("params") or {}).get("uri", "")
-    if uri == "ida://databases":
+    if uri in {"ida://databases", "ida://sessions"}:
         return _original_dispatch(request_obj)
+    sup = _require_supervisor()
+    if uri == "ida://server/capabilities":
+        try:
+            return sup._worker_rpc(sup._schema_or_idle_worker(), request_obj)
+        except Exception as exc:
+            return _jsonrpc_error(request_obj.get("id"), -32001, str(exc))
+    match = re.match(r"^ida://sessions/([^/]+)(/.*)?$", uri)
+    if match:
+        try:
+            session = sup.resolve_session(unquote(match.group(1)))
+            worker_database = quote(session.input_path or "active", safe="")
+            forwarded = copy.deepcopy(request_obj)
+            forwarded["params"]["uri"] = (
+                f"ida://sessions/{worker_database}{match.group(2) or ''}"
+            )
+            return sup._worker_rpc(session, forwarded)
+        except Exception as exc:
+            return _jsonrpc_error(request_obj.get("id"), -32001, str(exc))
     return _jsonrpc_error(
         request_obj.get("id"),
         -32001,
@@ -1292,6 +1528,32 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8745, help="HTTP port, default: 8745")
     parser.add_argument("--unsafe", action="store_true", help="Enable unsafe worker tools (DANGEROUS)")
     parser.add_argument(
+        "--safety-scope",
+        choices=("annotate", "modify", "filesystem", "debug", "python"),
+        action="append",
+        default=[],
+        help="Enable one worker safety scope (repeatable).",
+    )
+    parser.add_argument(
+        "--api-profile",
+        choices=("canonical", "legacy"),
+        default="canonical",
+        help="Advertise the bounded canonical API or every legacy worker tool.",
+    )
+    parser.add_argument(
+        "--auth-token-file",
+        type=Path,
+        default=None,
+        help="Bearer token file. Required for non-loopback HTTP unless IDA_MCP_AUTH_TOKEN is set.",
+    )
+    parser.add_argument(
+        "--workspace-root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Restrict binary and output paths to this root (repeatable).",
+    )
+    parser.add_argument(
         "--profile",
         type=Path,
         default=None,
@@ -1309,11 +1571,35 @@ def main() -> None:
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
+    token = os.environ.get("IDA_MCP_AUTH_TOKEN")
+    token_path = args.auth_token_file
+    if token is None and token_path is None and default_token_path().exists():
+        token_path = default_token_path()
+    if token is None and token_path is not None:
+        try:
+            token = load_token_file(token_path)
+        except (OSError, UnicodeDecodeError, VNextError) as exc:
+            raise SystemExit(f"Failed to load bearer token: {exc}") from exc
+    auth_policy = AuthPolicy(args.host, token)
+    try:
+        auth_policy.validate_configuration()
+    except VNextError as exc:
+        raise SystemExit(str(exc)) from exc
+    if auth_policy.token_required or token:
+        mcp.http_authenticator = auth_policy.authorize_header
+
+    workspace_policy = WorkspacePolicy.from_values(args.workspace_root)
+
     worker_args: list[str] = []
     if args.verbose:
         worker_args.append("--verbose")
     if args.unsafe:
         worker_args.append("--unsafe")
+    for safety_scope in args.safety_scope:
+        worker_args.extend(["--safety-scope", safety_scope])
+    worker_args.extend(["--api-profile", args.api_profile])
+    for workspace_root in args.workspace_root:
+        worker_args.extend(["--workspace-root", str(workspace_root)])
     if args.profile is not None:
         worker_args.extend(["--profile", str(args.profile)])
 
@@ -1322,6 +1608,7 @@ def main() -> None:
         mcp,
         max_workers=args.max_workers,
         worker_args=worker_args,
+        workspace_policy=workspace_policy,
     )
     mcp.registry.dispatch = dispatch_supervisor
 

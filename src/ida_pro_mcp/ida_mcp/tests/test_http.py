@@ -32,9 +32,23 @@ def test_unsafe_set_includes_all_expected_categories():
 @test()
 def test_unsafe_tools_are_disjoint_from_safe_core():
     """Core analysis tools must never be marked @unsafe."""
-    safe_core = {"decompile", "disasm", "list_funcs", "rename", "imports"}
+    safe_core = {"decompile", "disasm", "list_funcs", "imports"}
     overlap = MCP_UNSAFE & safe_core
     assert not overlap, f"Core tools incorrectly marked unsafe: {overlap}"
+
+
+def test_all_idb_mutators_are_marked_unsafe():
+    expected = {
+        "rename",
+        "set_comments",
+        "patch",
+        "put_int",
+        "patch_asm",
+        "declare_type",
+        "set_type",
+        "declare_stack",
+    }
+    assert expected <= MCP_UNSAFE
 
 
 # ---------------------------------------------------------------------------

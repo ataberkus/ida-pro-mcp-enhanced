@@ -1,0 +1,11 @@
+# ida-pro-mcp vNext debugger profile
+# schema-version: 2026-08-01
+# scopes: debug
+
+server_capabilities
+debug_session
+debug_control
+debug_breakpoints
+debug_state
+debug_memory
+debug_trace
