@@ -31,7 +31,10 @@ except ImportError:
 
 MCP_SERVER_NAME = "ida-pro-mcp"
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "server.py")
+# stdio clients must use the discovery/routing bridge so multiple live IDA
+# processes can be addressed.  The direct ``server.py`` proxy remains useful
+# for explicit single-instance HTTP connections.
+SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "bridge_server.py")
 IDA_PLUGIN_PKG = os.path.join(SCRIPT_DIR, "ida_mcp")
 IDA_PLUGIN_LOADER = os.path.join(SCRIPT_DIR, "ida_mcp.py")
 # The IDA plugin runs inside IDA's embedded Python and cannot import the
