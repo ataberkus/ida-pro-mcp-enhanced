@@ -211,6 +211,9 @@ If `tools/list` works but `entity_query`, `search`, or other IDA-backed calls ti
 1. Run `codex mcp get ida-pro-mcp` and confirm both stdio paths point to the intended checkout.
 2. From that checkout, run `uv sync --all-groups` followed by `uv run --no-sync ida-pro-mcp --install codex --scope global --transport stdio`.
 3. Completely restart IDA so it loads the refreshed plugin package, then restart the MCP client so it launches the refreshed bridge.
+4. Inspect `%TEMP%\ida-pro-mcp-sync-<ida-pid>.log`. Each request records its ID, worker/UI thread, queue delay, execution time, outcome, and exception traceback. `queue_start_timeout` means IDA never serviced the UI callback; `ui_started` followed by no `ui_finished` identifies a tool that stalled after dispatch.
+
+The UI-start timeout defaults to 10 seconds and can be overridden with `IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC`. Override the diagnostic file with `IDA_MCP_SYNC_LOG`.
 
 The plugin and bridge are separate runtime halves; updating only the client configuration or only the copied IDA plugin can leave an older implementation active.
 
@@ -254,10 +257,11 @@ A direct connection to `http://127.0.0.1:13337/mcp` still works, but it connects
 
 Current Windows/IDA 9.4 release checks:
 
-- Portable suite: **235 passed, 114 subtests passed**.
-- Multi-instance bridge suite: **14 passed**.
+- Portable suite: **240 passed, 114 subtests passed**.
+- Multi-instance bridge suite: **17 passed**.
 - Targeted Ruff checks, `compileall`, package build, isolated installation, and CLI smoke pass.
 - Live IDA 9.4 registration, resource reads, tool listing, function analysis, transactional mutation, and IDB save have been exercised.
+- The asynchronous UI-queue scheduler and late-callback abandonment are regression tested; live acceptance requires reloading the updated plugin in IDA.
 - Multi-instance routing is unit verified; final two-GUI live acceptance remains pending.
 
 ## Development

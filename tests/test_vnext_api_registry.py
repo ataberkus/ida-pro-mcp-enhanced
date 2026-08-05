@@ -195,18 +195,19 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
     source = sync_path.read_text(encoding="utf-8")
 
     # Regression guards for upstream fixes accidentally overwritten by a
-    # later integration: escaping execute_sync exceptions and pure-C scans
-    # must never leave HTTP workers blocked indefinitely.
+    # later integration: UI queue stalls and pure-C scans must never leave
+    # HTTP workers blocked indefinitely.
     assert "res_container.put(" in source
     assert "call_stack.get_nowait()" in source
     assert "threading.Timer(timeout, _fire_native_cancel)" in source
     assert "ida_kernwin.set_cancelled()" in source
     assert "ida_kernwin.clr_cancelled()" in source
-    assert "return 1" in source
-    assert "MFF_WRITE" in source
+    assert "execute_ui_requests" in source
+    assert "IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC" in source
+    assert "late_callback_skipped" in source
 
 
-def _load_sync_module(monkeypatch, execute_sync, *, is_main_thread=False):
+def _load_sync_module(monkeypatch, execute_ui_requests, *, is_main_thread=False):
     load_ida_rpc_module()
     pkg_root = (
         pathlib.Path(__file__).resolve().parents[1]
@@ -216,13 +217,12 @@ def _load_sync_module(monkeypatch, execute_sync, *, is_main_thread=False):
     )
 
     idaapi = types.ModuleType("idaapi")
-    idaapi.MFF_WRITE = 2
     idaapi.get_kernel_version = lambda: "9.4"
-    idaapi.execute_sync = execute_sync
 
     ida_kernwin = types.ModuleType("ida_kernwin")
     ida_kernwin.clr_cancelled = lambda: None
     ida_kernwin.set_cancelled = lambda: None
+    ida_kernwin.execute_ui_requests = execute_ui_requests
 
     ida_pro = types.ModuleType("ida_pro")
     ida_pro.is_main_thread = lambda: is_main_thread
@@ -250,32 +250,64 @@ def _load_sync_module(monkeypatch, execute_sync, *, is_main_thread=False):
     return module
 
 
-def test_sync_callback_returns_required_integer(monkeypatch):
+def test_sync_callback_runs_once_through_ui_queue(monkeypatch):
     callback_returns = []
-    submitted_flags = []
+    submitted_callbacks = []
 
-    def execute_sync(callback, flags):
-        submitted_flags.append(flags)
-        callback_returns.append(callback())
-        return callback_returns[-1]
+    def execute_ui_requests(callbacks):
+        submitted_callbacks.extend(callbacks)
+        callback_returns.extend(callback() for callback in callbacks)
+        return True
 
-    sync = _load_sync_module(monkeypatch, execute_sync)
+    sync = _load_sync_module(monkeypatch, execute_ui_requests)
     assert sync._sync_wrapper(lambda: "ok") == "ok"
-    assert callback_returns == [1]
-    assert submitted_flags == [2]
+    assert len(submitted_callbacks) == 1
+    assert callback_returns == [False]
 
 
 def test_sync_callback_transports_tool_exception(monkeypatch):
     callback_returns = []
 
-    def execute_sync(callback, _flags):
-        callback_returns.append(callback())
-        return callback_returns[-1]
+    def execute_ui_requests(callbacks):
+        callback_returns.extend(callback() for callback in callbacks)
+        return True
 
     def fail():
         raise ValueError("boom")
 
-    sync = _load_sync_module(monkeypatch, execute_sync)
+    sync = _load_sync_module(monkeypatch, execute_ui_requests)
     with pytest.raises(ValueError, match="boom"):
         sync._sync_wrapper(fail)
-    assert callback_returns == [1]
+    assert callback_returns == [False]
+
+
+def test_sync_queue_timeout_abandons_late_callback(monkeypatch):
+    callbacks = []
+    calls = []
+    monkeypatch.setenv("IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC", "0.01")
+
+    def execute_ui_requests(items):
+        callbacks.extend(items)
+        return True
+
+    def mutate():
+        calls.append("called")
+
+    sync = _load_sync_module(monkeypatch, execute_ui_requests)
+    with pytest.raises(sync.IDASyncError, match=r"request 1.*diagnostics"):
+        sync._sync_wrapper(mutate)
+
+    assert calls == []
+    assert len(callbacks) == 1
+    assert callbacks[0]() is False
+    assert calls == []
+
+
+def test_sync_main_thread_bypasses_ui_queue(monkeypatch):
+    def execute_ui_requests(_callbacks):
+        raise AssertionError("main-thread calls must not be queued")
+
+    sync = _load_sync_module(
+        monkeypatch, execute_ui_requests, is_main_thread=True
+    )
+    assert sync._sync_wrapper(lambda: "direct") == "direct"
