@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import queue
 import sys
 import threading
 import types
@@ -203,7 +204,9 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
     assert "threading.Timer(timeout, _fire_native_cancel)" in source
     assert "ida_kernwin.set_cancelled()" in source
     assert "ida_kernwin.clr_cancelled()" in source
-    assert "execute_ui_requests" in source
+    assert "QCoreApplication.postEvent" in source
+    assert "qt_post_event" in source
+    assert "execute_ui_requests" not in source
     assert "IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC" in source
     assert "late_callback_skipped" in source
     assert "QTimer.singleShot(0, callback)" in source
@@ -212,9 +215,9 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
 
 def _load_sync_module(
     monkeypatch,
-    execute_ui_requests,
     *,
     is_main_thread=False,
+    post_event=None,
     single_shot=None,
 ):
     load_ida_rpc_module()
@@ -231,7 +234,6 @@ def _load_sync_module(
     ida_kernwin = types.ModuleType("ida_kernwin")
     ida_kernwin.clr_cancelled = lambda: None
     ida_kernwin.set_cancelled = lambda: None
-    ida_kernwin.execute_ui_requests = execute_ui_requests
 
     ida_pro = types.ModuleType("ida_pro")
     ida_pro.is_main_thread = lambda: is_main_thread
@@ -255,6 +257,33 @@ def _load_sync_module(
         def single_shot(_delay, callback):
             callback()
 
+    if post_event is None:
+
+        def post_event(receiver, event):
+            receiver.event(event)
+
+    class QEvent:
+        Type = int
+
+        @staticmethod
+        def registerEventType():
+            return 1001
+
+        def __init__(self, event_type):
+            self._event_type = event_type
+
+        def type(self):
+            return self._event_type
+
+    class QObject:
+        def event(self, _event):
+            return False
+
+    class QCoreApplication:
+        @staticmethod
+        def postEvent(receiver, event):
+            post_event(receiver, event)
+
     class QTimer:
         @staticmethod
         def singleShot(delay, callback):
@@ -262,6 +291,9 @@ def _load_sync_module(
 
     pyside6 = types.ModuleType("PySide6")
     qtcore = types.ModuleType("PySide6.QtCore")
+    qtcore.QCoreApplication = QCoreApplication
+    qtcore.QEvent = QEvent
+    qtcore.QObject = QObject
     qtcore.QTimer = QTimer
     pyside6.QtCore = qtcore
     monkeypatch.setitem(sys.modules, "PySide6", pyside6)
@@ -276,19 +308,45 @@ def _load_sync_module(
     return module
 
 
-def test_sync_callback_runs_once_through_ui_queue(monkeypatch):
-    callback_returns = []
-    submitted_callbacks = []
+def test_sync_callback_runs_once_through_qt_event(monkeypatch):
+    posted_events = []
 
-    def execute_ui_requests(callbacks):
-        submitted_callbacks.extend(callbacks)
-        callback_returns.extend(callback() for callback in callbacks)
-        return True
+    def post_event(receiver, event):
+        posted_events.append(event)
+        assert receiver.event(event) is True
 
-    sync = _load_sync_module(monkeypatch, execute_ui_requests)
+    sync = _load_sync_module(monkeypatch, post_event=post_event)
     assert sync._sync_wrapper(lambda: "ok") == "ok"
-    assert len(submitted_callbacks) == 1
-    assert callback_returns == [False]
+    assert len(posted_events) == 1
+
+
+def test_sync_immediately_chained_qt_events_are_not_lost(monkeypatch):
+    posted_events = queue.Queue()
+    outcome = {}
+
+    def post_event(receiver, event):
+        posted_events.put((receiver, event))
+
+    sync = _load_sync_module(monkeypatch, post_event=post_event)
+
+    def worker():
+        try:
+            outcome["results"] = [
+                sync._sync_wrapper(lambda: "first"),
+                sync._sync_wrapper(lambda: "second"),
+            ]
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    worker_thread = threading.Thread(target=worker)
+    worker_thread.start()
+    for _ in range(2):
+        receiver, event = posted_events.get(timeout=1.0)
+        assert receiver.event(event) is True
+
+    worker_thread.join(1.0)
+    assert not worker_thread.is_alive()
+    assert outcome == {"results": ["first", "second"]}
 
 
 def test_sync_worker_result_waits_for_next_ui_turn(monkeypatch):
@@ -296,9 +354,8 @@ def test_sync_worker_result_waits_for_next_ui_turn(monkeypatch):
     timer_scheduled = threading.Event()
     outcome = {}
 
-    def execute_ui_requests(callbacks):
-        assert [callback() for callback in callbacks] == [False]
-        return True
+    def post_event(receiver, event):
+        assert receiver.event(event) is True
 
     def single_shot(delay, callback):
         assert delay == 0
@@ -306,7 +363,7 @@ def test_sync_worker_result_waits_for_next_ui_turn(monkeypatch):
         timer_scheduled.set()
 
     sync = _load_sync_module(
-        monkeypatch, execute_ui_requests, single_shot=single_shot
+        monkeypatch, post_event=post_event, single_shot=single_shot
     )
 
     def worker():
@@ -327,48 +384,44 @@ def test_sync_worker_result_waits_for_next_ui_turn(monkeypatch):
 
 
 def test_sync_callback_transports_tool_exception(monkeypatch):
-    callback_returns = []
-
-    def execute_ui_requests(callbacks):
-        callback_returns.extend(callback() for callback in callbacks)
-        return True
+    def post_event(receiver, event):
+        assert receiver.event(event) is True
 
     def fail():
         raise ValueError("boom")
 
-    sync = _load_sync_module(monkeypatch, execute_ui_requests)
+    sync = _load_sync_module(monkeypatch, post_event=post_event)
     with pytest.raises(ValueError, match="boom"):
         sync._sync_wrapper(fail)
-    assert callback_returns == [False]
 
 
 def test_sync_queue_timeout_abandons_late_callback(monkeypatch):
-    callbacks = []
+    posted_events = []
     calls = []
     monkeypatch.setenv("IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC", "0.01")
 
-    def execute_ui_requests(items):
-        callbacks.extend(items)
-        return True
+    def post_event(receiver, event):
+        posted_events.append((receiver, event))
 
     def mutate():
         calls.append("called")
 
-    sync = _load_sync_module(monkeypatch, execute_ui_requests)
+    sync = _load_sync_module(monkeypatch, post_event=post_event)
     with pytest.raises(sync.IDASyncError, match=r"request 1.*diagnostics"):
         sync._sync_wrapper(mutate)
 
     assert calls == []
-    assert len(callbacks) == 1
-    assert callbacks[0]() is False
+    assert len(posted_events) == 1
+    receiver, event = posted_events[0]
+    assert receiver.event(event) is True
     assert calls == []
 
 
 def test_sync_main_thread_bypasses_ui_queue(monkeypatch):
-    def execute_ui_requests(_callbacks):
+    def post_event(_receiver, _event):
         raise AssertionError("main-thread calls must not be queued")
 
     sync = _load_sync_module(
-        monkeypatch, execute_ui_requests, is_main_thread=True
+        monkeypatch, is_main_thread=True, post_event=post_event
     )
     assert sync._sync_wrapper(lambda: "direct") == "direct"

@@ -116,15 +116,47 @@ def _sync_diag(request_id: int, stage: str, **fields) -> None:
     logger.info("IDA MCP sync: %s", line)
 
 
-def _defer_until_next_ui_turn(callback) -> None:
-    """Run callback after the current native UI request has fully returned."""
+def _load_qt_core():
     using_pyside6 = (ida_major > 9) or (ida_major == 9 and ida_minor >= 2)
     if using_pyside6:
-        from PySide6.QtCore import QTimer
+        from PySide6 import QtCore
     else:
-        from PyQt5.QtCore import QTimer
+        from PyQt5 import QtCore
+    return QtCore
 
-    QTimer.singleShot(0, callback)
+
+_qt_core = _load_qt_core()
+_DISPATCH_EVENT_TYPE = _qt_core.QEvent.Type(_qt_core.QEvent.registerEventType())
+
+
+class _QtDispatchEvent(_qt_core.QEvent):
+    def __init__(self, callback):
+        super().__init__(_DISPATCH_EVENT_TYPE)
+        self.callback = callback
+
+
+class _QtMainThreadDispatcher(_qt_core.QObject):
+    def event(self, event):
+        if event.type() == _DISPATCH_EVENT_TYPE:
+            callback = event.callback
+            event.callback = None
+            callback()
+            return True
+        return super().event(event)
+
+
+_qt_main_thread_dispatcher = _QtMainThreadDispatcher()
+
+
+def _post_to_main_thread(callback) -> None:
+    """Post a thread-safe event to the Qt object owned by IDA's main thread."""
+    event = _QtDispatchEvent(callback)
+    _qt_core.QCoreApplication.postEvent(_qt_main_thread_dispatcher, event)
+
+
+def _defer_until_next_ui_turn(callback) -> None:
+    """Run callback on a later Qt event-loop turn."""
+    _qt_core.QTimer.singleShot(0, callback)
 
 
 call_stack = queue.LifoQueue()
@@ -132,12 +164,13 @@ _sync_diag(
     0,
     "module_loaded",
     queue_timeout=_get_sync_queue_timeout_seconds(),
+    scheduler="qt_post_event",
     log_path=_SYNC_LOG_PATH,
 )
 
 
 def _sync_wrapper(ff):
-    """Run ff synchronously through IDA's asynchronous UI request queue."""
+    """Run ff synchronously through IDA's Qt main-thread event queue."""
     request_id = next(_sync_request_ids)
     queued_at = time.monotonic()
     queue_timeout = _get_sync_queue_timeout_seconds()
@@ -259,41 +292,36 @@ def _sync_wrapper(ff):
             elapsed=time.monotonic() - callback_started_at,
             outcome="error" if isinstance(result, BaseException) else "ok",
         )
-        # A zero-delay Qt callback runs only after this native UI request has
-        # returned, preventing immediately chained requests from losing wakeups.
+        # Release the worker on a later Qt turn. A chained request can then be
+        # posted safely even if this dispatch event has not returned yet.
         release_result_after_ui_turn(result)
-        # execute_ui_requests repeats callbacks that return True.
         return False
 
     if on_main_thread:
         runned()
     else:
         try:
-            accepted = ida_kernwin.execute_ui_requests([runned])
+            _post_to_main_thread(runned)
         except BaseException as exc:
             _sync_diag(
                 request_id,
                 "queue_submit_exception",
                 function=ff.__name__,
+                scheduler="qt_post_event",
                 error=repr(exc),
                 traceback=traceback.format_exc().replace("\n", "\\n"),
             )
             raise IDASyncError(
-                f"IDA rejected UI request {request_id} for {ff.__name__}: {exc}; "
-                f"diagnostics: {_SYNC_LOG_PATH}"
+                f"IDA rejected Qt UI request {request_id} for {ff.__name__}: "
+                f"{exc}; diagnostics: {_SYNC_LOG_PATH}"
             ) from exc
 
         _sync_diag(
             request_id,
             "queued",
             function=ff.__name__,
-            accepted=accepted,
+            scheduler="qt_post_event",
         )
-        if accepted is False:
-            raise IDASyncError(
-                f"IDA rejected UI request {request_id} for {ff.__name__}; "
-                f"diagnostics: {_SYNC_LOG_PATH}"
-            )
 
         if not started_event.wait(queue_timeout):
             with state_lock:
@@ -308,7 +336,7 @@ def _sync_wrapper(ff):
                     waited=queue_timeout,
                 )
                 raise IDASyncError(
-                    f"IDA UI queue did not start request {request_id} "
+                    f"IDA Qt UI queue did not start request {request_id} "
                     f"({ff.__name__}) within {queue_timeout:.2f}s; "
                     f"diagnostics: {_SYNC_LOG_PATH}"
                 )
