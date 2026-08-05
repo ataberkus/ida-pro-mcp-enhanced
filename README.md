@@ -44,7 +44,7 @@ Verify the global client entry:
 codex mcp get ida-pro-mcp
 ```
 
-The expected transport is `stdio`, with the command and bridge path pointing into this checkout.
+The expected transport is `stdio`, with both `command` and `args` pointing into this checkout. If either path still points to an older clone, remove the stale entry and rerun the installer from the intended checkout.
 
 ### Update an existing installation
 
@@ -86,7 +86,7 @@ uv run --no-sync ida-pro-mcp --install <client> --scope <global|project> --trans
 - `--transport` selects `stdio` (default), `streamable-http`, or `sse`.
 - `--config` prints the raw JSON for the current setup; `--list-clients` lists every supported target.
 
-The examples below show the manual configuration for the most common clients. All paths must be **absolute** — replace the `C:\Users\Valo\source\ida-pro-mcp` prefix with the actual location of your checkout.
+The examples below show manual configuration for the most common clients. All paths must be **absolute**. Replace `C:\path\to\ida-pro-mcp-enhanced` with the location of your checkout; do not mix the bridge from one clone with plugin files from another.
 
 ### VS Code
 
@@ -99,9 +99,9 @@ VS Code reads MCP servers from a top-level `"servers"` object. Add the entry to 
 {
   "servers": {
     "ida-pro-mcp": {
-      "command": "C:\\Users\\Valo\\source\\ida-pro-mcp\\.venv\\Scripts\\python.exe",
+      "command": "C:\\path\\to\\ida-pro-mcp-enhanced\\.venv\\Scripts\\python.exe",
       "args": [
-        "C:\\Users\\Valo\\source\\ida-pro-mcp\\src\\ida_pro_mcp\\bridge_server.py"
+        "C:\\path\\to\\ida-pro-mcp-enhanced\\src\\ida_pro_mcp\\bridge_server.py"
       ]
     }
   }
@@ -118,9 +118,9 @@ Claude Desktop reads from `%APPDATA%\Claude\claude_desktop_config.json` using a 
 {
   "mcpServers": {
     "ida-pro-mcp": {
-      "command": "C:\\Users\\Valo\\source\\ida-pro-mcp\\.venv\\Scripts\\python.exe",
+      "command": "C:\\path\\to\\ida-pro-mcp-enhanced\\.venv\\Scripts\\python.exe",
       "args": [
-        "C:\\Users\\Valo\\source\\ida-pro-mcp\\src\\ida_pro_mcp\\bridge_server.py"
+        "C:\\path\\to\\ida-pro-mcp-enhanced\\src\\ida_pro_mcp\\bridge_server.py"
       ]
     }
   }
@@ -137,9 +137,9 @@ Claude Code reads project-scoped servers from `.mcp.json` in the workspace root 
 {
   "mcpServers": {
     "ida-pro-mcp": {
-      "command": "C:\\Users\\Valo\\source\\ida-pro-mcp\\.venv\\Scripts\\python.exe",
+      "command": "C:\\path\\to\\ida-pro-mcp-enhanced\\.venv\\Scripts\\python.exe",
       "args": [
-        "C:\\Users\\Valo\\source\\ida-pro-mcp\\src\\ida_pro_mcp\\bridge_server.py"
+        "C:\\path\\to\\ida-pro-mcp-enhanced\\src\\ida_pro_mcp\\bridge_server.py"
       ]
     }
   }
@@ -148,18 +148,18 @@ Claude Code reads project-scoped servers from `.mcp.json` in the workspace root 
 
 ### Codex
 
-Codex stores MCP servers in `~/.codex/config.toml` (or a project-scoped `.codex/config.toml`) as `[mcp_servers.<name>]` tables. For stdio:
+Codex stores global MCP servers in `%USERPROFILE%\.codex\config.toml` on Windows (`~/.codex/config.toml` on other platforms). Project-scoped entries may instead use `.codex/config.toml`. For the recommended global stdio configuration:
 
 ```toml
 [mcp_servers.ida-pro-mcp]
-command = "C:\\Users\\Valo\\source\\ida-pro-mcp\\.venv\\Scripts\\python.exe"
-args = ["C:\\Users\\Valo\\source\\ida-pro-mcp\\src\\ida_pro_mcp\\bridge_server.py"]
+command = "C:\\path\\to\\ida-pro-mcp-enhanced\\.venv\\Scripts\\python.exe"
+args = ["C:\\path\\to\\ida-pro-mcp-enhanced\\src\\ida_pro_mcp\\bridge_server.py"]
 ```
 
 You can also add it from the CLI:
 
 ```powershell
-codex mcp add ida-pro-mcp -- C:\Users\Valo\source\ida-pro-mcp\.venv\Scripts\python.exe C:\Users\Valo\source\ida-pro-mcp\src\ida_pro_mcp\bridge_server.py
+codex mcp add ida-pro-mcp -- "C:\path\to\ida-pro-mcp-enhanced\.venv\Scripts\python.exe" "C:\path\to\ida-pro-mcp-enhanced\src\ida_pro_mcp\bridge_server.py"
 ```
 
 Verify with `codex mcp get ida-pro-mcp` or `codex mcp list`.
@@ -172,9 +172,9 @@ Cursor reads project-scoped servers from `.cursor/mcp.json` (or `~/.cursor/mcp.j
 {
   "mcpServers": {
     "ida-pro-mcp": {
-      "command": "C:\\Users\\Valo\\source\\ida-pro-mcp\\.venv\\Scripts\\python.exe",
+      "command": "C:\\path\\to\\ida-pro-mcp-enhanced\\.venv\\Scripts\\python.exe",
       "args": [
-        "C:\\Users\\Valo\\source\\ida-pro-mcp\\src\\ida_pro_mcp\\bridge_server.py"
+        "C:\\path\\to\\ida-pro-mcp-enhanced\\src\\ida_pro_mcp\\bridge_server.py"
       ]
     }
   }
@@ -185,10 +185,10 @@ Cursor reads project-scoped servers from `.cursor/mcp.json` (or `~/.cursor/mcp.j
 
 The installer also knows how to configure Cline, Roo Code, Kilo Code, Windsurf, Zed, Kimi Code, Gemini CLI, Qwen Coder, Copilot CLI, LM Studio, Amazon Q, and more — run `uv run --no-sync ida-pro-mcp --list-clients` to see the full list.
 
-For remote or headless setups, the bridge can also be reached over **streamable HTTP** or **SSE** instead of stdio. Start it with a transport URL and point the client at it:
+For remote or headless setups, the bridge can also be reached over **streamable HTTP** or **SSE** instead of stdio. Its listener must use a different port from the IDA plugin, which uses `13337` by default. This example uses `8744`:
 
 ```powershell
-uv run --no-sync ida-pro-mcp --transport http://127.0.0.1:13337/mcp
+uv run --no-sync ida-pro-mcp --transport http://127.0.0.1:8744/mcp
 ```
 
 ```json
@@ -196,13 +196,23 @@ uv run --no-sync ida-pro-mcp --transport http://127.0.0.1:13337/mcp
   "mcpServers": {
     "ida-pro-mcp": {
       "type": "http",
-      "url": "http://127.0.0.1:13337/mcp"
+      "url": "http://127.0.0.1:8744/mcp"
     }
   }
 }
 ```
 
-> **Note:** A direct HTTP connection reaches only that single IDA process and bypasses multi-instance discovery. Prefer stdio when you run more than one IDA database at a time.
+> **Note:** Connecting directly to IDA at `http://127.0.0.1:13337/mcp` reaches only that IDA process and bypasses multi-instance discovery. Prefer the stdio bridge when you run more than one database.
+
+### Installation troubleshooting
+
+If `tools/list` works but `entity_query`, `search`, or other IDA-backed calls time out:
+
+1. Run `codex mcp get ida-pro-mcp` and confirm both stdio paths point to the intended checkout.
+2. From that checkout, run `uv sync --all-groups` followed by `uv run --no-sync ida-pro-mcp --install codex --scope global --transport stdio`.
+3. Completely restart IDA so it loads the refreshed plugin package, then restart the MCP client so it launches the refreshed bridge.
+
+The plugin and bridge are separate runtime halves; updating only the client configuration or only the copied IDA plugin can leave an older implementation active.
 
 ## Agentic analysis surface
 
