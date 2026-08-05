@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
+import threading
+import types
 
 import pytest
 
@@ -201,3 +203,82 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
     assert "threading.Timer(timeout, _fire_native_cancel)" in source
     assert "ida_kernwin.set_cancelled()" in source
     assert "ida_kernwin.clr_cancelled()" in source
+    assert "return 1" in source
+    assert "IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC" in source
+    assert "abandoned_event.set()" in source
+
+
+def _load_sync_module(monkeypatch, execute_sync, *, is_main_thread=False):
+    load_ida_rpc_module()
+    pkg_root = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src"
+        / "ida_pro_mcp"
+        / "ida_mcp"
+    )
+
+    idaapi = types.ModuleType("idaapi")
+    idaapi.MFF_WRITE = 2
+    idaapi.get_kernel_version = lambda: "9.4"
+    idaapi.execute_sync = execute_sync
+
+    ida_kernwin = types.ModuleType("ida_kernwin")
+    ida_kernwin.clr_cancelled = lambda: None
+    ida_kernwin.set_cancelled = lambda: None
+
+    ida_pro = types.ModuleType("ida_pro")
+    ida_pro.is_main_thread = lambda: is_main_thread
+
+    batch_state = {"value": 0}
+    idc = types.ModuleType("idc")
+
+    def batch(value):
+        previous = batch_state["value"]
+        batch_state["value"] = value
+        return previous
+
+    idc.batch = batch
+    monkeypatch.setitem(sys.modules, "idaapi", idaapi)
+    monkeypatch.setitem(sys.modules, "ida_kernwin", ida_kernwin)
+    monkeypatch.setitem(sys.modules, "ida_pro", ida_pro)
+    monkeypatch.setitem(sys.modules, "idc", idc)
+
+    module_name = "_test_stub_ida_mcp.sync_queue_test"
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, pkg_root / "sync.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_sync_callback_returns_required_integer(monkeypatch):
+    callback_returns = []
+
+    def execute_sync(callback, _flags):
+        callback_returns.append(callback())
+        return callback_returns[-1]
+
+    sync = _load_sync_module(monkeypatch, execute_sync)
+    assert sync._sync_wrapper(lambda: "ok") == "ok"
+    assert callback_returns == [1]
+
+
+def test_sync_queue_timeout_abandons_late_callback(monkeypatch):
+    release = threading.Event()
+    side_effects = []
+
+    def execute_sync(callback, _flags):
+        release.wait(1.0)
+        return callback()
+
+    monkeypatch.setenv("IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC", "0.05")
+    sync = _load_sync_module(monkeypatch, execute_sync)
+
+    with pytest.raises(sync.IDASyncError, match="did not start"):
+        sync._sync_wrapper(lambda: side_effects.append("ran"))
+
+    release.set()
+    assert sync._dispatch_lock.acquire(timeout=0.5)
+    sync._dispatch_lock.release()
+    assert side_effects == []
