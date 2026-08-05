@@ -458,11 +458,12 @@ def get_any_function() -> Optional[str]:
 def get_named_function(name: str) -> Optional[str]:
     """Return the address of a named function, or None if it does not exist."""
     import idaapi
+    import ida_funcs
 
     ea = idaapi.get_name_ea(idaapi.BADADDR, name)
     if ea == idaapi.BADADDR:
         return None
-    func = idaapi.get_func(ea)
+    func = ida_funcs.get_func(ea)
     if not func:
         return None
     return hex(func.start_ea)
@@ -518,12 +519,12 @@ def get_first_segment() -> Optional[tuple[str, str]]:
 
     Must be called from within IDA context.
     """
-    import idaapi
+    import ida_segment
     import idautils
 
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
-        if seg:
+        seg = ida_segment.segment_info_t()
+        if ida_segment.get_segment_info(seg, seg_ea):
             return (hex(seg.start_ea), hex(seg.end_ea))
     return None
 
@@ -533,12 +534,14 @@ def get_data_address() -> Optional[str]:
 
     Useful for testing error paths when code address is expected.
     """
-    import idaapi
+    import ida_segment
     import idautils
 
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
-        if seg and not (seg.perm & idaapi.SEGPERM_EXEC):
+        seg = ida_segment.segment_info_t()
+        if seg and ida_segment.get_segment_info(seg, seg_ea) and not (
+            seg.get_perm() & ida_segment.SEGPERM_EXEC
+        ):
             # Return first address in non-executable segment
             return hex(seg.start_ea)
     return None

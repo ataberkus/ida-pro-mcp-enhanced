@@ -8,6 +8,7 @@ import idautils
 import ida_typeinf
 import ida_nalt
 import ida_bytes
+import ida_segment
 import ida_ida
 import ida_idaapi
 import ida_xref
@@ -28,7 +29,6 @@ from .utils import (
     get_assembly_lines,
     get_all_xrefs,
     get_all_comments,
-    Function,
     get_callers,
     get_callees,
     extract_function_strings,
@@ -44,6 +44,12 @@ from .utils import (
     AnalyzeBatchQuery,
 )
 from . import compat
+
+
+def _segment_perm(segment) -> int:
+    """Read permissions from either modern segment_info_t or legacy segment_t."""
+    getter = getattr(segment, "get_perm", None)
+    return int(getter() if getter is not None else segment.perm)
 
 # ============================================================================
 # Instruction Helpers
@@ -211,7 +217,7 @@ def _resolve_function_start(query: object) -> tuple[int | None, str | None]:
     if ea == idaapi.BADADDR:
         return None, f"Failed to resolve function: {q}"
 
-    func = idaapi.get_func(ea)
+    func = ida_funcs.get_func(ea)
     if not func:
         return None, f"Not a function: {q}"
     return func.start_ea, None
@@ -264,7 +270,7 @@ def _collect_callees_for_function(func: ida_funcs.func_t) -> list[dict]:
     callees: dict[int, dict] = {}
     for item_ea in idautils.FuncItems(func.start_ea):
         for target in idautils.CodeRefsFrom(item_ea, 0):
-            callee = idaapi.get_func(target)
+            callee = ida_funcs.get_func(target)
             if not callee:
                 continue
             callee_start = callee.start_ea
@@ -280,7 +286,7 @@ def _collect_callees_for_function(func: ida_funcs.func_t) -> list[dict]:
 def _collect_callers_for_function(func: ida_funcs.func_t) -> list[dict]:
     callers: dict[int, dict] = {}
     for caller_site in idautils.CodeRefsTo(func.start_ea, 0):
-        caller = idaapi.get_func(caller_site)
+        caller = ida_funcs.get_func(caller_site)
         if not caller:
             continue
         caller_start = caller.start_ea
@@ -305,7 +311,7 @@ def _profile_function(
     max_items: int,
     include_prototype: bool,
 ) -> dict:
-    func = idaapi.get_func(start_ea)
+    func = ida_funcs.get_func(start_ea)
     if not func:
         return {"addr": hex(start_ea), "error": "Function not found"}
 
@@ -423,10 +429,10 @@ def disasm(
                     "cursor": {"done": True},
                 }
             start = ea
-        func = idaapi.get_func(start)
+        func = ida_funcs.get_func(start)
 
         # Get segment info
-        seg = idaapi.getseg(start)
+        seg = compat.get_segment_info(start)
         if not seg:
             return {
                 "addr": addr,
@@ -435,7 +441,7 @@ def disasm(
                 "cursor": {"done": True},
             }
 
-        segment_name = idaapi.get_segm_name(seg) if seg else "UNKNOWN"
+        segment_name = compat.get_segment_name(start) or "UNKNOWN"
 
         if func:
             # Function exists: disassemble function items starting from requested address
@@ -595,7 +601,7 @@ def func_profile(
                     }
                 )
                 continue
-            fn = idaapi.get_func(start_ea)
+            fn = ida_funcs.get_func(start_ea)
             if fn:
                 candidates.append(
                     {
@@ -608,7 +614,7 @@ def func_profile(
                 )
         else:
             for start_ea in idautils.Functions():
-                fn = idaapi.get_func(start_ea)
+                fn = ida_funcs.get_func(start_ea)
                 if not fn:
                     continue
                 candidates.append(
@@ -719,7 +725,7 @@ def analyze_batch(
             continue
 
         try:
-            fn = idaapi.get_func(start_ea)
+            fn = ida_funcs.get_func(start_ea)
             if not fn:
                 raise RuntimeError(f"Function not found: {q}")
 
@@ -1146,7 +1152,7 @@ def callees(
     for fn_addr in addrs:
         try:
             func_start = parse_address(fn_addr)
-            func = idaapi.get_func(func_start)
+            func = ida_funcs.get_func(func_start)
             if not func:
                 results.append(
                     {"addr": fn_addr, "callees": None, "error": "No function found"}
@@ -1178,7 +1184,7 @@ def callees(
                     if target is not None and target not in callees_dict:
                         func_type = (
                             "internal"
-                            if idaapi.get_func(target) is not None
+                            if ida_funcs.get_func(target) is not None
                             else "external"
                         )
                         func_name = ida_name.get_name(target)
@@ -1319,7 +1325,7 @@ def basic_blocks(
     for fn_addr in addrs:
         try:
             ea = parse_address(fn_addr)
-            func = idaapi.get_func(ea)
+            func = ida_funcs.get_func(ea)
             if not func:
                 results.append(
                     {
@@ -1481,8 +1487,8 @@ def find(
 
                 seen_insn = set()
                 for seg_ea in idautils.Segments():
-                    seg = idaapi.getseg(seg_ea)
-                    if not seg or not (seg.perm & idaapi.SEGPERM_EXEC):
+                    seg = compat.get_segment_info(seg_ea)
+                    if not seg or not (_segment_perm(seg) & ida_segment.SEGPERM_EXEC):
                         continue
                     for normalized, size, pattern_bytes in candidates:
                         ea = seg.start_ea
@@ -1617,14 +1623,14 @@ def _resolve_insn_scan_ranges(
 
     exec_segments = []
     for seg_ea in idautils.Segments():
-        seg = idaapi.getseg(seg_ea)
-        if seg and (seg.perm & idaapi.SEGPERM_EXEC):
+        seg = compat.get_segment_info(seg_ea)
+        if seg and (_segment_perm(seg) & ida_segment.SEGPERM_EXEC):
             exec_segments.append(seg)
 
     if func_addr is not None:
         try:
             ea = parse_address(func_addr)
-            func = idaapi.get_func(ea)
+            func = ida_funcs.get_func(ea)
             if not func:
                 return [], f"Function not found at {func_addr}"
             return [(func.start_ea, func.end_ea)], None
@@ -1633,7 +1639,7 @@ def _resolve_insn_scan_ranges(
 
     if segment_name is not None:
         for seg in exec_segments:
-            if idaapi.get_segm_name(seg) == segment_name:
+            if compat.get_segment_name(seg.start_ea) == segment_name:
                 return [(seg.start_ea, seg.end_ea)], None
         return [], f"Executable segment not found: {segment_name}"
 
@@ -1650,8 +1656,8 @@ def _resolve_insn_scan_ranges(
             return [], "No executable segments found"
 
         if end_ea is None:
-            seg = idaapi.getseg(start_ea)
-            if not seg or not (seg.perm & idaapi.SEGPERM_EXEC):
+            seg = compat.get_segment_info(start_ea)
+            if not seg or not (_segment_perm(seg) & ida_segment.SEGPERM_EXEC):
                 return [], "start address not in executable segment"
             end_ea = seg.end_ea
 
@@ -1904,7 +1910,7 @@ def export_funcs(
     for addr in addrs:
         try:
             ea = parse_address(addr)
-            func = idaapi.get_func(ea)
+            func = ida_funcs.get_func(ea)
             if not func:
                 results.append({"addr": addr, "error": "Function not found"})
                 continue
@@ -1985,7 +1991,7 @@ def callgraph(
     for root in roots:
         try:
             ea = parse_address(root)
-            func = idaapi.get_func(ea)
+            func = ida_funcs.get_func(ea)
             if not func:
                 results.append(
                     {
@@ -2020,7 +2026,7 @@ def callgraph(
                     return
                 visited.add(addr)
 
-                f = idaapi.get_func(addr)
+                f = ida_funcs.get_func(addr)
                 if not f:
                     return
 
@@ -2042,7 +2048,7 @@ def callgraph(
                         if edges_added >= max_edges_per_func:
                             per_func_capped = True
                             break
-                        callee_func = idaapi.get_func(xref)
+                        callee_func = ida_funcs.get_func(xref)
                         if callee_func:
                             if len(edges) >= max_edges:
                                 hit_limit("edges")

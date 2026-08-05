@@ -30,12 +30,17 @@ dev = [
     "jsonschema>=4.0",
     "mcp>=1.0",
     "pytest>=9.0.3",
+    "ruff==0.15.12",
 ]
 
 [project.urls]
 Repository = "https://github.com/ataberkus/ida-pro-mcp-enhanced"
 Issues = "https://github.com/ataberkus/ida-pro-mcp-enhanced/issues"
 Upstream = "https://github.com/mrexodia/ida-pro-mcp"
+
+[tool.setuptools.data-files]
+"share/ida-pro-mcp/profiles" = ["profiles/*.txt"]
+"share/ida-pro-mcp/devdocs" = ["devdocs/*.md"]
 
 [build-system]
 requires = ["setuptools"]

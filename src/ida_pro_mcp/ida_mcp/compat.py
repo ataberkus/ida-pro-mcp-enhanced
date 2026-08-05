@@ -22,6 +22,7 @@ import ida_bytes
 import ida_funcs
 import ida_nalt
 import ida_segment
+import ida_segment
 import ida_typeinf
 
 # ============================================================================

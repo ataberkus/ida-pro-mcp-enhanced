@@ -1,0 +1,27 @@
+# ida-pro-mcp vNext IDB modification profile
+# schema-version: 2026-08-01
+# scopes: annotate,modify
+
+server_capabilities
+entity_query
+search
+memory_read
+disassemble
+decompile
+type_query
+int_convert
+signature_create
+analysis_run
+graph_query
+dataflow_trace
+taint_analyze
+job_status
+job_cancel
+job_result
+investigation_start
+investigation_get
+investigation_add_finding
+mutation_preview
+mutation_commit
+mutation_status
+mutation_rollback

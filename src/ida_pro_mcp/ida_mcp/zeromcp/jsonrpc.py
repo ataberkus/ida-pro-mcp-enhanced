@@ -13,9 +13,10 @@ JsonRpcId: TypeAlias = str | int | float | None
 # Thread-local storage for current request context (ID + cancel event)
 _current_request = threading.local()
 
-# Global pending requests for cancellation
+# Pending requests are scoped by transport session because JSON-RPC IDs are
+# only unique within a client/session.
 _pending_requests_lock = threading.Lock()
-_pending_requests: dict[int | str, threading.Event] = {}
+_pending_requests: dict[tuple[str | None, int | str | float], threading.Event] = {}
 
 
 def get_current_request_id() -> JsonRpcId:
@@ -28,26 +29,45 @@ def get_current_cancel_event() -> threading.Event | None:
     return getattr(_current_request, "cancel_event", None)
 
 
-def register_pending_request(request_id: int | str) -> threading.Event:
-    """Register a request as pending and return its cancel event."""
+def _pending_key(
+    request_id: int | str | float,
+    request_scope: str | None,
+) -> tuple[str | None, int | str | float]:
+    return request_scope, request_id
+
+
+def register_pending_request(
+    request_id: int | str | float,
+    request_scope: str | None = None,
+) -> threading.Event:
+    """Register a pending request within its transport session."""
     event = threading.Event()
     with _pending_requests_lock:
-        _pending_requests[request_id] = event
+        _pending_requests[_pending_key(request_id, request_scope)] = event
     _current_request.cancel_event = event
     return event
 
 
-def unregister_pending_request(request_id: int | str) -> None:
-    """Unregister a pending request."""
+def unregister_pending_request(
+    request_id: int | str | float,
+    request_scope: str | None = None,
+) -> None:
+    """Unregister only the event owned by the current request."""
+    event = getattr(_current_request, "cancel_event", None)
+    key = _pending_key(request_id, request_scope)
     with _pending_requests_lock:
-        _pending_requests.pop(request_id, None)
+        if _pending_requests.get(key) is event:
+            _pending_requests.pop(key, None)
     _current_request.cancel_event = None
 
 
-def cancel_request(request_id: int | str) -> bool:
-    """Signal cancellation for a pending request. Returns True if request was found."""
+def cancel_request(
+    request_id: int | str | float,
+    request_scope: str | None = None,
+) -> bool:
+    """Signal cancellation for a pending request in the same transport session."""
     with _pending_requests_lock:
-        event = _pending_requests.get(request_id)
+        event = _pending_requests.get(_pending_key(request_id, request_scope))
         if event:
             event.set()
             return True

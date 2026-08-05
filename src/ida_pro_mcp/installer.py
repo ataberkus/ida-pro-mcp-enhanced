@@ -31,9 +31,18 @@ except ImportError:
 
 MCP_SERVER_NAME = "ida-pro-mcp"
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "server.py")
+# stdio clients must use the discovery/routing bridge so multiple live IDA
+# processes can be addressed.  The direct ``server.py`` proxy remains useful
+# for explicit single-instance HTTP connections.
+SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "bridge_server.py")
 IDA_PLUGIN_PKG = os.path.join(SCRIPT_DIR, "ida_mcp")
 IDA_PLUGIN_LOADER = os.path.join(SCRIPT_DIR, "ida_mcp.py")
+# The IDA plugin runs inside IDA's embedded Python and cannot import the
+# project package from the bridge virtual environment.  Bundle the pure
+# Python vNext support namespace beside the plugin package so imports such as
+# ``ida_pro_mcp.vnext.contracts`` work in IDAPython.
+IDA_VNEXT_PKG = os.path.join(SCRIPT_DIR, "vnext")
+IDA_VNEXT_INIT = os.path.join(SCRIPT_DIR, "__init__.py")
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
 
@@ -45,6 +54,10 @@ if not os.path.exists(IDA_PLUGIN_PKG):
 if not os.path.exists(IDA_PLUGIN_LOADER):
     raise RuntimeError(
         f"IDA plugin loader not found at {IDA_PLUGIN_LOADER} (did you move it?)"
+    )
+if not os.path.exists(IDA_VNEXT_PKG):
+    raise RuntimeError(
+        f"IDA vNext support package not found at {IDA_VNEXT_PKG} (did you move it?)"
     )
 
 
@@ -487,6 +500,9 @@ def install_ida_plugin(
     ida_plugin_folder = os.path.join(ida_folder, "plugins")
     loader_destination = os.path.join(ida_plugin_folder, "ida_mcp.py")
     pkg_destination = os.path.join(ida_plugin_folder, "ida_mcp")
+    vnext_root_destination = os.path.join(ida_plugin_folder, "ida_pro_mcp")
+    vnext_destination = os.path.join(vnext_root_destination, "vnext")
+    vnext_init_destination = os.path.join(vnext_root_destination, "__init__.py")
     old_plugin = os.path.join(ida_plugin_folder, "mcp-plugin.py")
 
     if uninstall:
@@ -494,6 +510,7 @@ def install_ida_plugin(
         for label, path in (
             ("loader", loader_destination),
             ("package", pkg_destination),
+            ("vNext support", vnext_root_destination),
             ("old plugin", old_plugin),
         ):
             if os.path.lexists(path):
@@ -520,6 +537,11 @@ def install_ida_plugin(
         installed_items.append(f"loader: {loader_destination}")
     if _install_link_or_copy(IDA_PLUGIN_PKG, pkg_destination):
         installed_items.append(f"package: {pkg_destination}")
+    os.makedirs(vnext_root_destination, exist_ok=True)
+    if _install_link_or_copy(IDA_VNEXT_PKG, vnext_destination):
+        installed_items.append(f"vNext support: {vnext_destination}")
+    if _install_link_or_copy(IDA_VNEXT_INIT, vnext_init_destination):
+        installed_items.append(f"vNext namespace: {vnext_init_destination}")
 
     if not quiet:
         if installed_items or removed_old_plugin:

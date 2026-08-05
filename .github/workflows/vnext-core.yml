@@ -1,0 +1,47 @@
+name: vnext-core
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  portable-core:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: uv sync --all-groups
+      - name: Portable protocol and core tests
+        run: uv run pytest -q tests
+      - name: Compile package
+        run: uv run python -m compileall -q src
+      - name: Build wheel and source distribution
+        run: uv build
+
+  vnext-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.13'
+      - name: Lint vNext implementation and tests
+        run: >-
+          uv run ruff check
+          src/ida_pro_mcp/vnext
+          src/ida_pro_mcp/ida_mcp/api_vnext.py
+          src/ida_pro_mcp/ida_mcp/hexrays_dataflow.py
+          src/ida_pro_mcp/ida_mcp/rpc.py
+          src/ida_pro_mcp/idalib_supervisor.py
+          tests/test_vnext_core.py
+          tests/test_vnext_transport.py
+          tests/test_vnext_api_registry.py
+          tests/test_idalib_supervisor.py

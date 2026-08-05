@@ -5,8 +5,19 @@ import os
 import re
 import sys
 import traceback
+import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
+
+from ida_pro_mcp.vnext.auth import (
+    AuthPolicy,
+    create_token,
+    default_token_path,
+    load_token_file,
+    write_token_file,
+)
+from ida_pro_mcp.vnext.contracts import VNextError
 
 if TYPE_CHECKING:
     from ida_pro_mcp.ida_mcp.zeromcp import (
@@ -44,13 +55,13 @@ except ImportError:
     )
 
 try:
-    from .ida_mcp.discovery import discover_instances, probe_instance
+    from .ida_mcp.discovery import discover_instances
 except ImportError:
     try:
-        from ida_mcp.discovery import discover_instances, probe_instance
+        from ida_mcp.discovery import discover_instances
     except ImportError:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "ida_mcp"))
-        from discovery import discover_instances, probe_instance
+        from discovery import discover_instances
 
         sys.path.pop(0)
 
@@ -58,6 +69,7 @@ DEFAULT_IDA_HOST = "127.0.0.1"
 DEFAULT_IDA_PORT = 13337
 IDA_HOST = DEFAULT_IDA_HOST
 IDA_PORT = DEFAULT_IDA_PORT
+BRIDGE_SESSION_ID = str(uuid.uuid4())
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
@@ -81,6 +93,8 @@ def _get_proxy_request_headers() -> dict[str, str]:
         session_id = transport_session_id.split(":", 1)[1]
         if session_id and session_id != "anonymous":
             headers["Mcp-Session-Id"] = session_id
+    if "Mcp-Session-Id" not in headers:
+        headers["Mcp-Session-Id"] = BRIDGE_SESSION_ID
     external_base_url = get_current_request_external_base_url()
     if external_base_url:
         headers[EXTERNAL_BASE_HEADER] = external_base_url
@@ -133,7 +147,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
 
     if request_obj["method"] == "initialize":
         return dispatch_original(request)
-    if request_obj["method"].startswith("notifications/"):
+    if request_obj["method"].startswith("notifications/") and request_obj["method"] != "notifications/cancelled":
         return dispatch_original(request)
 
     try:
@@ -304,7 +318,24 @@ def main():
         action="store_true",
         help="List all available MCP client targets",
     )
+    parser.add_argument(
+        "--auth-token-file",
+        type=str,
+        default=None,
+        help="Bearer token file for non-loopback HTTP transport.",
+    )
+    parser.add_argument("command", nargs="?", help="Optional command, currently: auth")
+    parser.add_argument("command_action", nargs="?", help="Optional command action, currently: init")
     args = parser.parse_args()
+
+    if args.command is not None:
+        if (args.command, args.command_action) != ("auth", "init"):
+            parser.error("supported command: ida-pro-mcp auth init")
+        token_path = Path(args.auth_token_file) if args.auth_token_file else default_token_path()
+        token = create_token()
+        write_token_file(token_path, token)
+        print(f"Created ida-pro-mcp bearer token at {token_path}")
+        return
 
     # Handle --list-clients independently
     if args.list_clients:
@@ -346,6 +377,19 @@ def main():
             url = urlparse(transport)
             if url.hostname is None or url.port is None:
                 raise Exception(f"Invalid transport URL: {args.transport}")
+            token = os.environ.get("IDA_MCP_AUTH_TOKEN")
+            token_path = Path(args.auth_token_file) if args.auth_token_file else None
+            if token is None and token_path is None and default_token_path().exists():
+                token_path = default_token_path()
+            if token is None and token_path is not None:
+                token = load_token_file(token_path)
+            auth_policy = AuthPolicy(url.hostname, token)
+            try:
+                auth_policy.validate_configuration()
+            except VNextError as exc:
+                raise SystemExit(str(exc)) from exc
+            if auth_policy.token_required or token:
+                mcp.http_authenticator = auth_policy.authorize_header
             # NOTE: npx -y @modelcontextprotocol/inspector for debugging
             mcp.serve(url.hostname, url.port, request_handler=ProxyHttpRequestHandler)
             input("Server is running, press Enter or Ctrl+C to stop.")

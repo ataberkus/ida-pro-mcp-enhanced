@@ -237,7 +237,12 @@ class McpHttpTestServer:
                 status = resp.status
                 hdrs = {k: v for k, v in resp.headers.items()}
         except urllib.error.HTTPError as e:
-            raw = e.read()
+            try:
+                raw = e.read()
+            except ConnectionResetError:
+                # macOS may reset the socket after the complete error headers
+                # arrive but before urllib consumes an empty response body.
+                raw = b""
             status = e.code
             hdrs = {k: v for k, v in e.headers.items()}
 

@@ -22,6 +22,7 @@ import ida_funcs
 import ida_hexrays
 import ida_kernwin
 import ida_nalt
+import ida_segment
 import ida_typeinf
 import idaapi
 import idautils
@@ -930,7 +931,10 @@ def refresh_decompiler_ctext(fn_addr: int):
     if not ida_hexrays.init_hexrays_plugin():
         return
     error = ida_hexrays.hexrays_failure_t()
-    cfunc: ida_hexrays.cfunc_t = ida_hexrays.decompile_func(
+    decompile_function = getattr(ida_hexrays, "decompile_function", None)
+    if decompile_function is None:
+        decompile_function = ida_hexrays.decompile_func
+    cfunc: ida_hexrays.cfunc_t = decompile_function(
         fn_addr, error, ida_hexrays.DECOMP_WARNINGS
     )
     if cfunc:
@@ -1098,8 +1102,7 @@ def get_assembly_lines(ea: int) -> str:
     func_name: str = ida_funcs.get_func_name(func.start_ea) or "<unnamed>"
 
     # Get segment from first instruction
-    first_seg = idaapi.getseg(func.start_ea)
-    segment_name = idaapi.get_segm_name(first_seg) if first_seg else "UNKNOWN"
+    segment_name = ida_segment.get_segment_name(func.start_ea) or "UNKNOWN"
 
     # Build compact string format
     lines_str = f"{func_name} ({segment_name} @ {hex(func.start_ea)}):"

@@ -7,14 +7,23 @@ from urllib.parse import urlparse, parse_qs
 from typing import TypeVar, cast
 from http.server import HTTPServer
 
-from .profile import dump_profile, parse_profile
+from .profile import dump_profile, parse_profile, parse_profile_scopes
 from .sync import idasync
 from .rpc import (
     McpRpcRegistry,
     McpHttpRequestHandler,
     MCP_SERVER,
     MCP_UNSAFE,
+    MCP_POLICY,
+    LEGACY_TOOLS_ENABLED,
+    configure_tool_policy,
     get_cached_output,
+)
+from ida_pro_mcp.vnext.contracts import SafetyScope
+from ida_pro_mcp.vnext.policy import CANONICAL_TOOLS
+from ida_pro_mcp.vnext.profiles import (
+    default_profile_enabled,
+    quick_profile_selection,
 )
 
 
@@ -51,8 +60,20 @@ def config_json_set(key: str, value):
 def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     """Changed to registry to enable configured tools, returns original tools."""
     original_tools = registry.methods.copy()
-    enabled_tools = config_json_get(
-        config_key, {name: True for name in original_tools.keys()}
+    # Keep the complete implementation registry available to vNext's internal
+    # orchestration.  Legacy tools remain hidden from external tools/list on a
+    # new installation, but canonical analysis workflows may still call them
+    # as implementation primitives (for example survey_binary during triage).
+    registry._all_methods = original_tools
+    stored_tools = config_json_get(config_key, None)
+    is_new_install = stored_tools is None
+    enabled_tools = (
+        {
+            name: default_profile_enabled(name, MCP_POLICY)
+            for name in original_tools
+        }
+        if is_new_install
+        else dict(stored_tools)
     )
     original_enabled_tools = enabled_tools.copy()
     new_tools = [name for name in original_tools if name not in enabled_tools]
@@ -63,20 +84,44 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
             enabled_tools.pop(name)
 
     if new_tools:
-        enabled_tools.update({name: True for name in new_tools})
+        enabled_tools.update({name: False for name in new_tools})
 
-    if enabled_tools != original_enabled_tools:
+    if is_new_install or enabled_tools != original_enabled_tools:
         config_json_set(config_key, enabled_tools)
 
     registry.methods = {
         name: func for name, func in original_tools.items() if enabled_tools.get(name)
     }
+    stored_scopes = {
+        SafetyScope(value)
+        for value in config_json_get("enabled_scopes", [])
+        if value in {scope.value for scope in SafetyScope}
+    }
+    _configure_scopes(
+        enabled_tools,
+        legacy_tools=LEGACY_TOOLS_ENABLED,
+        extra_scopes=stored_scopes,
+    )
     return original_tools
 
 
+def _configure_scopes(
+    enabled_tools: dict[str, bool],
+    *,
+    legacy_tools: bool,
+    extra_scopes: set[SafetyScope] | None = None,
+) -> None:
+    scopes = {SafetyScope.READ}
+    scopes.update(extra_scopes or set())
+    for name, enabled in enabled_tools.items():
+        if enabled:
+            scopes.update(MCP_POLICY.get(name).scopes)
+    configure_tool_policy(scopes=scopes, legacy_tools=legacy_tools)
+
+
 DEFAULT_CORS_POLICY = "local"
-
-
+# The enhanced checkout opts into IDB annotation and modification by default.
+# Filesystem, debugger, and Python scopes remain explicit opt-ins.
 def get_cors_policy(port: int) -> str:
     """Retrieve the current CORS policy from configuration."""
     match config_json_get("cors_policy", DEFAULT_CORS_POLICY):
@@ -327,6 +372,20 @@ input[type="submit"]:hover {
   opacity: 0.9;
 }
 
+button.profile {
+  margin: 0.25rem 0.35rem 0.25rem 0;
+  padding: 0.45rem 0.8rem;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+button.profile:hover {
+  opacity: 0.9;
+}
+
 .tooltip {
   border-bottom: 1px dotted var(--text);
 }
@@ -378,13 +437,31 @@ input[type="submit"]:hover {
 </p>"""
 
         body += "<h2>Enabled Tools</h2>"
+        if not LEGACY_TOOLS_ENABLED:
+            body += (
+                '<p style="font-size: 0.9rem; margin: 0.5rem 0;">'
+                "vNext-only test mode is active; legacy tools are hidden."
+                "</p>"
+            )
         body += (
             '<p style="font-size: 0.9rem; margin: 0.5rem 0;">'
             '<a href="/profile.txt" download>Export as --profile file</a>'
             "</p>"
         )
+        body += (
+            "<h3>Quick profile</h3>"
+            '<p style="font-size: 0.9rem; margin: 0.5rem 0;">'
+            "Apply a bounded profile immediately. Modify enables IDB annotation and "
+            "mutation tools; filesystem, debugger, and Python scopes remain disabled."
+            "</p>"
+            "<button class='profile' type='submit' name='quick_profile' value='read'>Read only</button>"
+            "<button class='profile' type='submit' name='quick_profile' value='annotate'>Annotate</button>"
+            "<button class='profile' type='submit' name='quick_profile' value='modify'>Modify</button>"
+        )
         body += quick_select
         for name, func in ORIGINAL_TOOLS.items():
+            if not LEGACY_TOOLS_ENABLED and name not in CANONICAL_TOOLS:
+                continue
             description = (
                 (func.__doc__ or "No description").strip().splitlines()[0].strip()
             )
@@ -429,17 +506,50 @@ input[type="submit"]:hover {
         self.update_cors_policy()
 
         # Update the server's tools
-        if "apply_profile" in postvars:
-            whitelist = parse_profile(postvars.get("profile_text", [""])[0])
-            enabled_tools = {name: name in whitelist for name in ORIGINAL_TOOLS.keys()}
+        quick_profile = postvars.get("quick_profile", [None])[0]
+        if quick_profile:
+            try:
+                enabled_tools, explicit_scopes = quick_profile_selection(
+                    quick_profile, ORIGINAL_TOOLS, MCP_POLICY
+                )
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+        elif "apply_profile" in postvars:
+            profile_text = postvars.get("profile_text", [""])[0]
+            whitelist = parse_profile(profile_text)
+            explicit_scopes = parse_profile_scopes(profile_text)
+            enabled_tools = {
+                name: name in whitelist
+                and (LEGACY_TOOLS_ENABLED or name in CANONICAL_TOOLS)
+                for name in ORIGINAL_TOOLS.keys()
+            }
         else:
-            enabled_tools = {name: name in postvars for name in ORIGINAL_TOOLS.keys()}
+            explicit_scopes = {
+                SafetyScope(value)
+                for value in config_json_get("enabled_scopes", [])
+                if value in {scope.value for scope in SafetyScope}
+            }
+            enabled_tools = {
+                name: name in postvars
+                and (LEGACY_TOOLS_ENABLED or name in CANONICAL_TOOLS)
+                for name in ORIGINAL_TOOLS.keys()
+            }
         self.mcp_server.tools.methods = {
             name: func
             for name, func in ORIGINAL_TOOLS.items()
             if enabled_tools.get(name)
         }
         config_json_set("enabled_tools", enabled_tools)
+        config_json_set(
+            "enabled_scopes",
+            sorted(scope.value for scope in explicit_scopes if scope is not SafetyScope.READ),
+        )
+        _configure_scopes(
+            enabled_tools,
+            legacy_tools=LEGACY_TOOLS_ENABLED,
+            extra_scopes=explicit_scopes,
+        )
 
         # Redirect back to the config page
         self.send_response(302)

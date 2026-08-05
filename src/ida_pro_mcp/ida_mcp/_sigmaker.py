@@ -71,7 +71,7 @@ import string
 import typing
 
 import idaapi
-import idc
+import ida_funcs
 
 __author__ = "mahmoudimus"
 __version__ = "1.8.0"
@@ -844,7 +844,7 @@ class UniqueSignatureGenerator:
             raise Unexpected("Cannot create code signature for data")
 
         sig = Signature()
-        start_fn = idaapi.get_func(ea)
+        start_fn = ida_funcs.get_func(ea)
         bytes_since_last_check = 0
 
         # Seed-and-refine (issue #398): on the compiled SIMD path, scan the

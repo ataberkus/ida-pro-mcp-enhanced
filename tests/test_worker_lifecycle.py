@@ -6,6 +6,7 @@ These run outside IDA: the module imports nothing IDA-specific.
 import threading
 import time
 
+import ida_pro_mcp.worker_lifecycle as worker_lifecycle
 from ida_pro_mcp.worker_lifecycle import WorkerLifecycle
 
 
@@ -21,13 +22,15 @@ def test_check_fires_after_idle_ttl():
     assert reason is not None and "no requests" in reason
 
 
-def test_touch_resets_idle_ttl():
+def test_touch_resets_idle_ttl(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(worker_lifecycle.time, "monotonic", lambda: now[0])
     lc = WorkerLifecycle(idle_ttl_sec=0.10, poll_interval_sec=0.05)
-    time.sleep(0.06)
+    now[0] += 0.06
     lc.touch()
-    time.sleep(0.06)
+    now[0] += 0.06
     assert lc.check_shutdown_reason() is None
-    time.sleep(0.10)
+    now[0] += 0.11
     assert lc.check_shutdown_reason() is not None
 
 
@@ -50,7 +53,7 @@ def test_watchdog_fires_callback_and_exits():
 
 def test_watchdog_does_not_fire_while_touched():
     fired: list[str] = []
-    lc = WorkerLifecycle(idle_ttl_sec=0.10, poll_interval_sec=0.02)
+    lc = WorkerLifecycle(idle_ttl_sec=0.50, poll_interval_sec=0.02)
     lc.start(on_shutdown=lambda reason: fired.append(reason))
     try:
         deadline = time.monotonic() + 0.30

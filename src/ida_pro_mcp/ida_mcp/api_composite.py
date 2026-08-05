@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Annotated
 
+import ida_funcs
+
 from .rpc import tool, unsafe
 from .sync import idasync, tool_timeout, IDAError
 from .utils import (
     parse_address,
-    get_function,
     get_prototype,
     get_callees,
     get_callers,
@@ -17,7 +18,6 @@ from .utils import (
     get_all_comments,
     extract_function_strings,
     extract_function_constants,
-    get_stack_frame_variables_internal,
     decompile_function_safe,
     get_assembly_lines,
     normalize_list_input,
@@ -53,7 +53,7 @@ def _basic_block_info(ea: int) -> dict:
     """Return block count and cyclomatic complexity for the function at *ea*."""
     import idaapi
 
-    func = idaapi.get_func(ea)
+    func = ida_funcs.get_func(ea)
     if func is None:
         return {"count": 0, "cyclomatic_complexity": 0}
 
@@ -125,7 +125,7 @@ def _analyze_function_internal(ea: int, *, include_asm: bool = False) -> dict:
     result: dict = {"addr": hex(ea), "error": None}
 
     try:
-        func = idaapi.get_func(ea)
+        func = ida_funcs.get_func(ea)
         if func is None:
             result["error"] = f"No function at {hex(ea)}"
             return result
@@ -234,7 +234,7 @@ def analyze_component(
     # --- Per-function COMPACT summary (no decompile, no disasm) ---
     functions: list[dict] = []
     for ea in ea_set:
-        func = idaapi.get_func(ea)
+        func = ida_funcs.get_func(ea)
         if func is None:
             functions.append({"addr": hex(ea), "error": "No function"})
             continue
@@ -276,7 +276,7 @@ def analyze_component(
     func_globals: dict[int, set[int]] = {}
     for ea in ea_set:
         globals_accessed: set[int] = set()
-        func = idaapi.get_func(ea)
+        func = ida_funcs.get_func(ea)
         if func is None:
             func_globals[ea] = globals_accessed
             continue
@@ -284,7 +284,7 @@ def analyze_component(
             for xref in idautils.XrefsFrom(head, 0):
                 if xref.iscode:
                     continue
-                ref_func = idaapi.get_func(xref.to)
+                ref_func = ida_funcs.get_func(xref.to)
                 if ref_func is None and idaapi.is_loaded(xref.to):
                     globals_accessed.add(xref.to)
         func_globals[ea] = globals_accessed
@@ -387,7 +387,7 @@ def diff_before_after(
     except IDAError as exc:
         return {"error": str(exc)}
 
-    func = idaapi.get_func(ea)
+    func = ida_funcs.get_func(ea)
     if func is None:
         return {"error": f"No function at {hex(ea)}"}
 
@@ -505,7 +505,7 @@ def trace_data_flow(
             depth_reached = depth
 
         # Build node info.
-        func = idaapi.get_func(ea)
+        func = ida_funcs.get_func(ea)
         func_name = idaapi.get_func_name(ea) if func else None
         insn_text = idc.GetDisasm(ea) if idaapi.is_loaded(ea) else None
 

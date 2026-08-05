@@ -2,20 +2,25 @@
 
 import re
 import time
-from typing import Annotated
+from typing import Annotated, Any, TypedDict
 
 import ida_auto
 import idaapi
+import ida_bytes
 import ida_funcs
 import ida_hexrays
+import ida_kernwin
+import ida_lines
 import idautils
 import ida_loader
 import ida_nalt
+import ida_segment
 import ida_typeinf
 import idc
 
+from . import compat
 from .rpc import tool, unsafe
-from .sync import idasync
+from .sync import get_tool_deadline, idasync
 from .utils import (
     ConvertedNumber,
     EntityQuery,
@@ -125,13 +130,15 @@ def _collect_imports() -> list[Import]:
 
 
 def _segment_name_for_ea(ea: int) -> str | None:
-    seg = idaapi.getseg(ea)
-    if not seg:
-        return None
     try:
-        return idaapi.get_segm_name(seg)
-    except Exception:
+        return ida_segment.get_segment_name(ea) or None
+    except (AttributeError, TypeError):
         return None
+
+
+def _get_func(ea: int):
+    """Return function entry/range info without IDA 9.x deprecation warnings."""
+    return compat.get_func(ea)
 
 
 def _primary_text_key(kind: str) -> str:
@@ -144,7 +151,7 @@ def _collect_entities(kind: str) -> list[dict]:
     if kind == "functions":
         rows: list[dict] = []
         for ea in idautils.Functions():
-            fn = idaapi.get_func(ea)
+            fn = _get_func(ea)
             if not fn:
                 continue
             size_int = fn.end_ea - fn.start_ea
@@ -164,7 +171,7 @@ def _collect_entities(kind: str) -> list[dict]:
     if kind == "globals":
         rows = []
         for ea, name in idautils.Names():
-            if idaapi.get_func(ea) or name is None:
+            if _get_func(ea) or name is None:
                 continue
             rows.append(
                 {
@@ -208,7 +215,7 @@ def _collect_entities(kind: str) -> list[dict]:
         rows = []
         imports_by_ea = {int(imp["addr"], 16): imp for imp in _collect_imports()}
         for ea, name in idautils.Names():
-            is_function = bool(idaapi.get_func(ea))
+            is_function = bool(_get_func(ea))
             is_import = ea in imports_by_ea
             rows.append(
                 {
@@ -479,7 +486,7 @@ def func_query(
 
     all_functions: list[dict] = []
     for addr in idautils.Functions():
-        fn = idaapi.get_func(addr)
+        fn = _get_func(addr)
         if not fn:
             continue
         size_int = fn.end_ea - fn.start_ea
@@ -562,7 +569,7 @@ def list_globals(
     )
     all_globals: list[Global] = []
     for addr, name in idautils.Names():
-        if not idaapi.get_func(addr) and name is not None:
+        if not _get_func(addr) and name is not None:
             all_globals.append(Global(addr=hex(addr), name=name))
 
     results = []
@@ -789,3 +796,235 @@ def find_regex(
         "matches": matches,
         "cursor": {"next": offset + limit} if more else {"done": True},
     }
+
+
+# ============================================================================
+# Listing text search
+# ============================================================================
+
+
+class SearchTextLine(TypedDict, total=False):
+    kind: str  # "disasm" | "comment"
+    text: str
+
+
+class SearchTextHit(TypedDict, total=False):
+    addr: str
+    function: str
+    segment: str
+    matches: list[SearchTextLine]
+
+
+class SearchTextResult(TypedDict, total=False):
+    n: int
+    hits: list[SearchTextHit]
+    cursor: dict[str, Any]
+    error: str
+
+
+def _classify_hit_lines(
+    ea: int,
+    matcher,
+    want_disasm: bool,
+    want_comments: bool,
+    max_lines: int = 32,
+) -> list[SearchTextLine]:
+    """Match disasm/comment text at *ea* without spamming IDA's Output window.
+
+    Uses ``generate_disasm_line`` (one instruction line) plus explicit comment
+    getters. Avoid ``generate_disassembly``: when a head expands past
+    ``max_lines``, IDA prints ``Too many lines`` for every such address.
+    """
+    del max_lines  # retained for call-site compatibility
+    out: list[SearchTextLine] = []
+
+    if want_disasm:
+        try:
+            tagged = ida_lines.generate_disasm_line(ea, 0) or ""
+        except Exception:
+            tagged = ""
+        text = ida_lines.tag_remove(tagged) if tagged else ""
+        if text and matcher(text):
+            out.append({"kind": "disasm", "text": text})
+
+    if want_comments:
+        comments: list[str] = []
+        try:
+            for repeatable in (False, True):
+                cmt = ida_bytes.get_cmt(ea, repeatable)
+                if cmt:
+                    comments.append(cmt)
+            # Anterior/posterior extra comments (function banners, etc.).
+            for base in (ida_lines.E_PREV, ida_lines.E_NEXT):
+                idx = base
+                for _ in range(64):
+                    extra = ida_lines.get_extra_cmt(ea, idx)
+                    if not isinstance(extra, str) or not extra:
+                        break
+                    comments.append(extra)
+                    idx += 1
+        except Exception:
+            pass
+
+        seen: set[str] = set()
+        for cmt in comments:
+            text = cmt.strip()
+            if not text or text in seen or not matcher(text):
+                continue
+            seen.add(text)
+            out.append({"kind": "comment", "text": text})
+
+    return out
+
+
+def _exec_segments() -> list[tuple[int, int]]:
+    """Return [(start, end)] for executable segments in address order."""
+    ranges: list[tuple[int, int]] = []
+    for seg_ea in idautils.Segments():
+        seg = compat.get_segment_info(seg_ea)
+        if not seg:
+            continue
+        perm = seg.get_perm() if hasattr(seg, "get_perm") else getattr(seg, "perm", 0)
+        if not (perm & idaapi.SEGPERM_EXEC):
+            continue
+        ranges.append((seg.start_ea, seg.end_ea))
+    return ranges
+
+
+def _all_segments() -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    for seg_ea in idautils.Segments():
+        seg = compat.get_segment_info(seg_ea)
+        if seg:
+            ranges.append((seg.start_ea, seg.end_ea))
+    return ranges
+
+
+@tool
+@idasync
+def search_text(
+    pattern: Annotated[str, "Text to search for in the rendered listing (literal substring by default)"],
+    limit: Annotated[int, "Max hits per page (default: 30, max: 500)"] = 30,
+    start: Annotated[str, "Lower bound (hex or symbol). Empty = first segment."] = "",
+    end: Annotated[str, "Upper bound (hex or symbol, exclusive). Empty = last segment."] = "",
+    regex: Annotated[bool, "Treat pattern as a Python regex"] = False,
+    case_sensitive: Annotated[bool, "Case-sensitive match (default: false)"] = False,
+    include: Annotated[str, "'disasm' | 'comments' | 'all' (default: all)"] = "all",
+    code_only: Annotated[bool, "Restrict search to executable segments (default: true)"] = True,
+) -> SearchTextResult:
+    """Search the rendered listing for `pattern` over [start, end).
+
+    Iterates `idautils.Heads()` and matches each head via
+    `ida_lines.generate_disasm_line()` plus comment getters. Per-head
+    work is cheap and yields between heads, so the per-tool deadline and
+    UI Cancel button both interrupt the walk reliably.
+    """
+    if limit <= 0:
+        limit = 30
+    if limit > 500:
+        limit = 500
+
+    include = (include or "all").lower()
+    if include not in ("disasm", "comments", "all"):
+        return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid include: {include!r}"}
+
+    want_disasm = include in ("disasm", "all")
+    want_comments = include in ("comments", "all")
+
+    if regex:
+        try:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            rx = re.compile(pattern, flags)
+        except re.error as e:
+            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid regex: {e}"}
+        def matcher(text: str) -> bool:
+            return bool(rx.search(text))
+
+    elif case_sensitive:
+        needle = pattern
+
+        def matcher(text: str) -> bool:
+            return needle in text
+
+    else:
+        needle = pattern.lower()
+
+        def matcher(text: str) -> bool:
+            return needle in text.lower()
+
+    segments = _exec_segments() if code_only else _all_segments()
+    if not segments:
+        return {"n": 0, "hits": [], "cursor": {"done": True}}
+
+    if start:
+        try:
+            start_ea = parse_address(start)
+        except Exception as e:
+            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid start: {e}"}
+    else:
+        start_ea = segments[0][0]
+
+    if end:
+        try:
+            end_ea = parse_address(end)
+        except Exception as e:
+            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid end: {e}"}
+    else:
+        end_ea = segments[-1][1]
+
+    if end_ea <= start_ea:
+        return {"n": 0, "hits": [], "cursor": {"done": True}}
+
+    hits: list[SearchTextHit] = []
+    next_cursor: int | None = None
+    cancelled = False
+    CHUNK_BYTES = 65536
+    deadline = get_tool_deadline()
+
+    for seg_start, seg_end in segments:
+        if cancelled or len(hits) >= limit:
+            break
+        if seg_end <= start_ea:
+            continue
+        if seg_start >= end_ea:
+            break
+        walk_start = max(seg_start, start_ea)
+        walk_end = min(seg_end, end_ea)
+        chunk_ea = walk_start
+        while chunk_ea < walk_end:
+            if cancelled or len(hits) >= limit:
+                break
+            if (deadline is not None and time.monotonic() >= deadline) or ida_kernwin.user_cancelled():
+                cancelled = True
+                next_cursor = chunk_ea
+                break
+            chunk_end = min(chunk_ea + CHUNK_BYTES, walk_end)
+            for head_ea in idautils.Heads(chunk_ea, chunk_end):
+                lines = _classify_hit_lines(head_ea, matcher, want_disasm, want_comments)
+                if not lines:
+                    continue
+                entry: SearchTextHit = {"addr": hex(head_ea), "matches": lines}
+                func = compat.get_func(head_ea)
+                if func is not None:
+                    fname = ida_funcs.get_func_name(func.start_ea)
+                    if fname:
+                        entry["function"] = fname
+                sname = compat.get_segment_name(head_ea)
+                if sname:
+                    entry["segment"] = sname
+                hits.append(entry)
+                if len(hits) >= limit:
+                    size = max(1, idaapi.get_item_size(head_ea))
+                    next_cursor = head_ea + size
+                    break
+            chunk_ea = chunk_end
+
+    cursor: dict[str, Any]
+    if cancelled:
+        cursor = {"next": hex(next_cursor), "cancelled": True}
+    elif next_cursor is not None:
+        cursor = {"next": hex(next_cursor)}
+    else:
+        cursor = {"done": True}
+
+    return {"n": len(hits), "hits": hits, "cursor": cursor}

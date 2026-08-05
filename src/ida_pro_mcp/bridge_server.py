@@ -5,8 +5,24 @@ import os
 import sys
 import traceback
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
+
+try:
+    from .vnext.auth import (
+        AuthPolicy,
+        create_token,
+        default_token_path,
+        load_token_file,
+        write_token_file,
+    )
+    from .vnext.contracts import VNextError
+except ImportError:
+    from vnext.auth import (
+        AuthPolicy, create_token, default_token_path, load_token_file, write_token_file
+    )
+    from vnext.contracts import VNextError
 
 if TYPE_CHECKING:
     from ida_pro_mcp.ida_mcp.zeromcp import McpServer
@@ -296,7 +312,26 @@ def main():
         action="store_true",
         help="List all available MCP client targets",
     )
+    parser.add_argument(
+        "--auth-token-file",
+        type=str,
+        default=None,
+        help="Bearer token file for non-loopback HTTP transport.",
+    )
+    parser.add_argument("command", nargs="?", help="Optional command, currently: auth")
+    parser.add_argument(
+        "command_action", nargs="?", help="Optional command action, currently: init"
+    )
     args = parser.parse_args()
+
+    if args.command is not None:
+        if (args.command, args.command_action) != ("auth", "init"):
+            parser.error("supported command: ida-pro-mcp auth init")
+        token_path = Path(args.auth_token_file) if args.auth_token_file else default_token_path()
+        token = create_token()
+        write_token_file(token_path, token)
+        print(f"Created ida-pro-mcp bearer token at {token_path}")
+        return
 
     # Handle --list-clients independently
     if args.list_clients:
@@ -342,6 +377,19 @@ def main():
             url = urlparse(transport)
             if url.hostname is None or url.port is None:
                 raise Exception(f"Invalid transport URL: {args.transport}")
+            token = os.environ.get("IDA_MCP_AUTH_TOKEN")
+            token_path = Path(args.auth_token_file) if args.auth_token_file else None
+            if token is None and token_path is None and default_token_path().exists():
+                token_path = default_token_path()
+            if token is None and token_path is not None:
+                token = load_token_file(token_path)
+            auth_policy = AuthPolicy(url.hostname, token)
+            try:
+                auth_policy.validate_configuration()
+            except VNextError as exc:
+                raise SystemExit(str(exc)) from exc
+            if auth_policy.token_required or token:
+                mcp.http_authenticator = auth_policy.authorize_header
             # NOTE: npx -y @modelcontextprotocol/inspector for debugging
             mcp.serve(url.hostname, url.port)
             input("Server is running, press Enter or Ctrl+C to stop.")
