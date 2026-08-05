@@ -73,6 +73,137 @@ If IDA was launched from a Python virtual-environment terminal, inherited variab
 powershell -ExecutionPolicy Bypass -File .\scripts\start_ida_clean.ps1
 ```
 
+## MCP client configuration
+
+The bridge runs on **stdio** by default, which is the recommended transport because it enables multi-instance discovery and routing. The installer can write the correct configuration for you:
+
+```powershell
+uv run --no-sync ida-pro-mcp --install <client> --scope <global|project> --transport stdio
+```
+
+- `--install <client>` accepts comma-separated targets (e.g. `claude,cursor`) or an interactive selector when omitted.
+- `--scope global` writes a user-level config; `--scope project` writes a config inside the current project.
+- `--transport` selects `stdio` (default), `streamable-http`, or `sse`.
+- `--config` prints the raw JSON for the current setup; `--list-clients` lists every supported target.
+
+The examples below show the manual configuration for the most common clients. All paths must be **absolute** — replace the `C:\Users\Valo\source\ida-pro-mcp` prefix with the actual location of your checkout.
+
+### VS Code
+
+VS Code reads MCP servers from a top-level `"servers"` object. Add the entry to either:
+
+- **Project scope** — `.vscode/mcp.json` in your workspace root.
+- **User scope** — `%APPDATA%\Code\User\mcp.json` (global, applies to every workspace).
+
+```jsonc
+{
+  "servers": {
+    "ida-pro-mcp": {
+      "command": "C:\\Users\\Valo\\source\\ida-pro-mcp\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\Valo\\source\\ida-pro-mcp\\src\\ida_pro_mcp\\bridge_server.py"
+      ]
+    }
+  }
+}
+```
+
+> **Note:** When configuring through VS Code `settings.json` instead of `mcp.json`, the servers live under an extra `"mcp"` key: `{ "mcp": { "servers": { ... } } }`.
+
+### Claude Desktop
+
+Claude Desktop reads from `%APPDATA%\Claude\claude_desktop_config.json` using a top-level `"mcpServers"` object:
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-mcp": {
+      "command": "C:\\Users\\Valo\\source\\ida-pro-mcp\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\Valo\\source\\ida-pro-mcp\\src\\ida_pro_mcp\\bridge_server.py"
+      ]
+    }
+  }
+}
+```
+
+Fully quit and restart Claude Desktop after saving so it launches the server.
+
+### Claude Code
+
+Claude Code reads project-scoped servers from `.mcp.json` in the workspace root (or from `~/.claude.json` for user scope), using a top-level `"mcpServers"` object:
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-mcp": {
+      "command": "C:\\Users\\Valo\\source\\ida-pro-mcp\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\Valo\\source\\ida-pro-mcp\\src\\ida_pro_mcp\\bridge_server.py"
+      ]
+    }
+  }
+}
+```
+
+### Codex
+
+Codex stores MCP servers in `~/.codex/config.toml` (or a project-scoped `.codex/config.toml`) as `[mcp_servers.<name>]` tables. For stdio:
+
+```toml
+[mcp_servers.ida-pro-mcp]
+command = "C:\\Users\\Valo\\source\\ida-pro-mcp\\.venv\\Scripts\\python.exe"
+args = ["C:\\Users\\Valo\\source\\ida-pro-mcp\\src\\ida_pro_mcp\\bridge_server.py"]
+```
+
+You can also add it from the CLI:
+
+```powershell
+codex mcp add ida-pro-mcp -- C:\Users\Valo\source\ida-pro-mcp\.venv\Scripts\python.exe C:\Users\Valo\source\ida-pro-mcp\src\ida_pro_mcp\bridge_server.py
+```
+
+Verify with `codex mcp get ida-pro-mcp` or `codex mcp list`.
+
+### Cursor
+
+Cursor reads project-scoped servers from `.cursor/mcp.json` (or `~/.cursor/mcp.json` for user scope), using a top-level `"mcpServers"` object:
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-mcp": {
+      "command": "C:\\Users\\Valo\\source\\ida-pro-mcp\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\Valo\\source\\ida-pro-mcp\\src\\ida_pro_mcp\\bridge_server.py"
+      ]
+    }
+  }
+}
+```
+
+### Other clients and transports
+
+The installer also knows how to configure Cline, Roo Code, Kilo Code, Windsurf, Zed, Kimi Code, Gemini CLI, Qwen Coder, Copilot CLI, LM Studio, Amazon Q, and more — run `uv run --no-sync ida-pro-mcp --list-clients` to see the full list.
+
+For remote or headless setups, the bridge can also be reached over **streamable HTTP** or **SSE** instead of stdio. Start it with a transport URL and point the client at it:
+
+```powershell
+uv run --no-sync ida-pro-mcp --transport http://127.0.0.1:13337/mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-mcp": {
+      "type": "http",
+      "url": "http://127.0.0.1:13337/mcp"
+    }
+  }
+}
+```
+
+> **Note:** A direct HTTP connection reaches only that single IDA process and bypasses multi-instance discovery. Prefer stdio when you run more than one IDA database at a time.
+
 ## Agentic analysis surface
 
 The advertised vNext API is deliberately focused:
