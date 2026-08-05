@@ -45,6 +45,9 @@ class CancelledError(RequestCancelledError):
 logger = logging.getLogger(__name__)
 _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
 _DEFAULT_TOOL_TIMEOUT_SEC = 60.0
+_SEARCH_PAGE_BUDGET_ENV = "IDA_MCP_SEARCH_PAGE_BUDGET_SEC"
+_DEFAULT_SEARCH_PAGE_BUDGET_SEC = 5.0
+_MAX_SEARCH_PAGE_BUDGET_SEC = 20.0
 _SYNC_QUEUE_TIMEOUT_ENV = "IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC"
 _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC = 10.0
 _SYNC_LOG_ENV = "IDA_MCP_SYNC_LOG"
@@ -69,6 +72,20 @@ def _get_tool_timeout_seconds() -> float:
         return float(value)
     except ValueError:
         return _DEFAULT_TOOL_TIMEOUT_SEC
+
+
+def get_search_page_budget_seconds() -> float:
+    """Return a bounded search-page budget below common MCP client timeouts."""
+    value = os.getenv(_SEARCH_PAGE_BUDGET_ENV, "").strip()
+    if value == "":
+        return _DEFAULT_SEARCH_PAGE_BUDGET_SEC
+    try:
+        budget = float(value)
+    except ValueError:
+        return _DEFAULT_SEARCH_PAGE_BUDGET_SEC
+    if budget <= 0:
+        return _DEFAULT_SEARCH_PAGE_BUDGET_SEC
+    return min(budget, _MAX_SEARCH_PAGE_BUDGET_SEC)
 
 
 def _get_sync_queue_timeout_seconds() -> float:

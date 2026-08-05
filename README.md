@@ -215,6 +215,8 @@ If `tools/list` works but `entity_query`, `search`, or other IDA-backed calls ti
 
 The UI-start timeout defaults to 10 seconds and can be overridden with `IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC`. Override the diagnostic file with `IDA_MCP_SYNC_LOG`.
 
+Rendered-listing text search uses five-second pages and returns a continuation cursor before common MCP client timeouts. Override the page budget with `IDA_MCP_SEARCH_PAGE_BUDGET_SEC`; values are capped at 20 seconds.
+
 The plugin and bridge are separate runtime halves; updating only the client configuration or only the copied IDA plugin can leave an older implementation active.
 
 ## Agentic analysis surface
@@ -257,11 +259,11 @@ A direct connection to `http://127.0.0.1:13337/mcp` still works, but it connects
 
 Current Windows/IDA 9.4 release checks:
 
-- Portable suite: **242 passed, 114 subtests passed**.
+- Portable suite: **243 passed, 114 subtests passed**.
 - Multi-instance bridge suite: **17 passed**.
 - Targeted Ruff checks, `compileall`, package build, isolated installation, and CLI smoke pass.
 - Live IDA 9.4 registration, resource reads, tool listing, function analysis, transactional mutation, and IDB save have been exercised.
-- The thread-safe Qt posted-event scheduler, immediate request chaining, and late-callback abandonment are regression tested; live acceptance requires reloading the updated plugin in IDA.
+- The thread-safe Qt posted-event scheduler and immediate request chaining are live verified in IDA 9.4; search-page budgeting and late-callback abandonment are regression tested.
 - Multi-instance routing is unit verified; final two-GUI live acceptance remains pending.
 
 ## Development

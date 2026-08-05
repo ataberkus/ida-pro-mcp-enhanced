@@ -20,7 +20,7 @@ import idc
 
 from . import compat
 from .rpc import tool, unsafe
-from .sync import get_tool_deadline, idasync
+from .sync import get_search_page_budget_seconds, get_tool_deadline, idasync
 from .utils import (
     ConvertedNumber,
     EntityQuery,
@@ -820,6 +820,9 @@ class SearchTextResult(TypedDict, total=False):
     hits: list[SearchTextHit]
     cursor: dict[str, Any]
     error: str
+    elapsed_ms: float
+    partial: bool
+    reason: str
 
 
 def _classify_hit_lines(
@@ -916,8 +919,8 @@ def search_text(
 
     Iterates `idautils.Heads()` and matches each head via
     `ida_lines.generate_disasm_line()` plus comment getters. Per-head
-    work is cheap and yields between heads, so the per-tool deadline and
-    UI Cancel button both interrupt the walk reliably.
+    work is cheap and yields between heads. Each page has a bounded time
+    budget and returns a continuation cursor before common MCP client timeouts.
     """
     if limit <= 0:
         limit = 30
@@ -977,12 +980,26 @@ def search_text(
 
     hits: list[SearchTextHit] = []
     next_cursor: int | None = None
-    cancelled = False
+    stopped = False
+    stop_reason: str | None = None
     CHUNK_BYTES = 65536
-    deadline = get_tool_deadline()
+    started_at = time.monotonic()
+    page_deadline = started_at + get_search_page_budget_seconds()
+    page_deadline_reason = "time_budget"
+    tool_deadline = get_tool_deadline()
+    if tool_deadline is not None and tool_deadline < page_deadline:
+        page_deadline = tool_deadline
+        page_deadline_reason = "tool_deadline"
+
+    def current_stop_reason() -> str | None:
+        if ida_kernwin.user_cancelled():
+            return "cancelled"
+        if time.monotonic() >= page_deadline:
+            return page_deadline_reason
+        return None
 
     for seg_start, seg_end in segments:
-        if cancelled or len(hits) >= limit:
+        if stopped or len(hits) >= limit:
             break
         if seg_end <= start_ea:
             continue
@@ -992,14 +1009,23 @@ def search_text(
         walk_end = min(seg_end, end_ea)
         chunk_ea = walk_start
         while chunk_ea < walk_end:
-            if cancelled or len(hits) >= limit:
+            if stopped or len(hits) >= limit:
                 break
-            if (deadline is not None and time.monotonic() >= deadline) or ida_kernwin.user_cancelled():
-                cancelled = True
+            reason = current_stop_reason()
+            if reason is not None:
+                stopped = True
+                stop_reason = reason
                 next_cursor = chunk_ea
                 break
             chunk_end = min(chunk_ea + CHUNK_BYTES, walk_end)
-            for head_ea in idautils.Heads(chunk_ea, chunk_end):
+            for heads_seen, head_ea in enumerate(idautils.Heads(chunk_ea, chunk_end)):
+                if heads_seen % 64 == 0:
+                    reason = current_stop_reason()
+                    if reason is not None:
+                        stopped = True
+                        stop_reason = reason
+                        next_cursor = head_ea
+                        break
                 lines = _classify_hit_lines(head_ea, matcher, want_disasm, want_comments)
                 if not lines:
                     continue
@@ -1020,11 +1046,26 @@ def search_text(
             chunk_ea = chunk_end
 
     cursor: dict[str, Any]
-    if cancelled:
-        cursor = {"next": hex(next_cursor), "cancelled": True}
+    if stop_reason is not None:
+        resume_ea = next_cursor if next_cursor is not None else start_ea
+        cursor = {
+            "next": hex(resume_ea),
+            "partial": True,
+            "reason": stop_reason,
+        }
+        if stop_reason == "cancelled":
+            cursor["cancelled"] = True
     elif next_cursor is not None:
         cursor = {"next": hex(next_cursor)}
     else:
         cursor = {"done": True}
 
-    return {"n": len(hits), "hits": hits, "cursor": cursor}
+    elapsed_ms = round((time.monotonic() - started_at) * 1000, 3)
+    return {
+        "n": len(hits),
+        "hits": hits,
+        "cursor": cursor,
+        "elapsed_ms": elapsed_ms,
+        "partial": stop_reason is not None,
+        "reason": stop_reason or "complete",
+    }

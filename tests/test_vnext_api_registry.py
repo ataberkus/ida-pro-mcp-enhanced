@@ -195,6 +195,7 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
         / "sync.py"
     )
     source = sync_path.read_text(encoding="utf-8")
+    api_core_source = sync_path.with_name("api_core.py").read_text(encoding="utf-8")
 
     # Regression guards for upstream fixes accidentally overwritten by a
     # later integration: UI queue stalls and pure-C scans must never leave
@@ -211,6 +212,10 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
     assert "late_callback_skipped" in source
     assert "QTimer.singleShot(0, callback)" in source
     assert "ui_turn_released" in source
+    assert "IDA_MCP_SEARCH_PAGE_BUDGET_SEC" in source
+    assert "get_search_page_budget_seconds()" in api_core_source
+    assert "heads_seen % 64" in api_core_source
+    assert 'page_deadline_reason = "time_budget"' in api_core_source
 
 
 def _load_sync_module(
@@ -425,3 +430,16 @@ def test_sync_main_thread_bypasses_ui_queue(monkeypatch):
         monkeypatch, is_main_thread=True, post_event=post_event
     )
     assert sync._sync_wrapper(lambda: "direct") == "direct"
+
+
+def test_search_page_budget_config_is_bounded(monkeypatch):
+    sync = _load_sync_module(monkeypatch, is_main_thread=True)
+
+    monkeypatch.delenv("IDA_MCP_SEARCH_PAGE_BUDGET_SEC", raising=False)
+    assert sync.get_search_page_budget_seconds() == 5.0
+    monkeypatch.setenv("IDA_MCP_SEARCH_PAGE_BUDGET_SEC", "invalid")
+    assert sync.get_search_page_budget_seconds() == 5.0
+    monkeypatch.setenv("IDA_MCP_SEARCH_PAGE_BUDGET_SEC", "2.5")
+    assert sync.get_search_page_budget_seconds() == 2.5
+    monkeypatch.setenv("IDA_MCP_SEARCH_PAGE_BUDGET_SEC", "100")
+    assert sync.get_search_page_budget_seconds() == 20.0
