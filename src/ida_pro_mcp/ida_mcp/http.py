@@ -124,7 +124,7 @@ DEFAULT_CORS_POLICY = "local"
 # Filesystem, debugger, and Python scopes remain explicit opt-ins.
 def get_cors_policy(port: int) -> str:
     """Retrieve the current CORS policy from configuration."""
-    match config_json_get("cors_policy", DEFAULT_CORS_POLICY):
+    match _current_cors_policy:
         case "unrestricted":
             return "*"
         case "local":
@@ -136,21 +136,27 @@ def get_cors_policy(port: int) -> str:
 
 
 ORIGINAL_TOOLS = handle_enabled_tools(MCP_SERVER.tools, "enabled_tools")
+_current_cors_policy = config_json_get("cors_policy", DEFAULT_CORS_POLICY)
+
+
+def _apply_cors_policy(policy: str):
+    global _current_cors_policy
+    _current_cors_policy = policy
+    match policy:
+        case "unrestricted":
+            MCP_SERVER.cors_allowed_origins = "*"
+        case "local":
+            MCP_SERVER.cors_allowed_origins = MCP_SERVER.cors_localhost
+        case "direct":
+            MCP_SERVER.cors_allowed_origins = None
+
+
+_apply_cors_policy(_current_cors_policy)
 
 
 class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
-    def __init__(self, request, client_address, server):
-        super().__init__(request, client_address, server)
-        self.update_cors_policy()
-
-    def update_cors_policy(self):
-        match config_json_get("cors_policy", DEFAULT_CORS_POLICY):
-            case "unrestricted":
-                self.mcp_server.cors_allowed_origins = "*"
-            case "local":
-                self.mcp_server.cors_allowed_origins = self.mcp_server.cors_localhost
-            case "direct":
-                self.mcp_server.cors_allowed_origins = None
+    def update_cors_policy(self, policy: str | None = None):
+        _apply_cors_policy(policy or _current_cors_policy)
 
     def do_POST(self):
         """Handles POST requests."""
@@ -287,7 +293,7 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
 
     def _handle_config_get(self):
         """Sends the configuration page with checkboxes."""
-        cors_policy = config_json_get("cors_policy", DEFAULT_CORS_POLICY)
+        cors_policy = _current_cors_policy
 
         body = """<html>
 <head>
@@ -503,7 +509,7 @@ button.profile:hover {
         # Update CORS policy
         cors_policy = postvars.get("cors_policy", [DEFAULT_CORS_POLICY])[0]
         config_json_set("cors_policy", cors_policy)
-        self.update_cors_policy()
+        self.update_cors_policy(cors_policy)
 
         # Update the server's tools
         quick_profile = postvars.get("quick_profile", [None])[0]

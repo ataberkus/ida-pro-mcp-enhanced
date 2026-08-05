@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
-import threading
 import types
 
 import pytest
@@ -206,6 +205,7 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
     assert "return 1" in source
     assert "IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC" in source
     assert "abandoned_event.set()" in source
+    assert "MFF_NOWAIT" in source
 
 
 def _load_sync_module(monkeypatch, execute_sync, *, is_main_thread=False):
@@ -219,6 +219,7 @@ def _load_sync_module(monkeypatch, execute_sync, *, is_main_thread=False):
 
     idaapi = types.ModuleType("idaapi")
     idaapi.MFF_WRITE = 2
+    idaapi.MFF_NOWAIT = 4
     idaapi.get_kernel_version = lambda: "9.4"
     idaapi.execute_sync = execute_sync
 
@@ -254,23 +255,26 @@ def _load_sync_module(monkeypatch, execute_sync, *, is_main_thread=False):
 
 def test_sync_callback_returns_required_integer(monkeypatch):
     callback_returns = []
+    submitted_flags = []
 
-    def execute_sync(callback, _flags):
+    def execute_sync(callback, flags):
+        submitted_flags.append(flags)
         callback_returns.append(callback())
         return callback_returns[-1]
 
     sync = _load_sync_module(monkeypatch, execute_sync)
     assert sync._sync_wrapper(lambda: "ok") == "ok"
     assert callback_returns == [1]
+    assert submitted_flags == [6]
 
 
 def test_sync_queue_timeout_abandons_late_callback(monkeypatch):
-    release = threading.Event()
+    queued_callbacks = []
     side_effects = []
 
     def execute_sync(callback, _flags):
-        release.wait(1.0)
-        return callback()
+        queued_callbacks.append(callback)
+        return 0
 
     monkeypatch.setenv("IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC", "0.05")
     sync = _load_sync_module(monkeypatch, execute_sync)
@@ -278,7 +282,9 @@ def test_sync_queue_timeout_abandons_late_callback(monkeypatch):
     with pytest.raises(sync.IDASyncError, match="did not start"):
         sync._sync_wrapper(lambda: side_effects.append("ran"))
 
-    release.set()
-    assert sync._dispatch_lock.acquire(timeout=0.5)
-    sync._dispatch_lock.release()
+    assert sync._queue_stalled.is_set()
+    assert len(sync._pending_callbacks) == 1
+    assert queued_callbacks[0]() == 0
+    assert not sync._queue_stalled.is_set()
+    assert sync._pending_callbacks == set()
     assert side_effects == []
