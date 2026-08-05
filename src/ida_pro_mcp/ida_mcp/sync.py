@@ -41,16 +41,6 @@ class CancelledError(RequestCancelledError):
 logger = logging.getLogger(__name__)
 _TOOL_TIMEOUT_ENV = "IDA_MCP_TOOL_TIMEOUT_SEC"
 _DEFAULT_TOOL_TIMEOUT_SEC = 60.0
-_SYNC_QUEUE_TIMEOUT_ENV = "IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC"
-_DEFAULT_SYNC_QUEUE_TIMEOUT_SEC = 10.0
-
-# Serialize submissions from HTTP workers, retain non-blocking callbacks until
-# IDA executes them, and stop retry storms while a request remains queued.
-_dispatch_lock = threading.Lock()
-_pending_callbacks_lock = threading.Lock()
-_pending_callbacks: set[object] = set()
-_queue_stalled = threading.Event()
-
 # Per-tool monotonic deadline (or None if no timeout). Tools can read this to
 # self-monitor and return partial results before the hard timeout fires.
 _deadline_state = threading.local()
@@ -71,147 +61,64 @@ def _get_tool_timeout_seconds() -> float:
         return _DEFAULT_TOOL_TIMEOUT_SEC
 
 
-def _get_sync_queue_timeout_seconds() -> float:
-    value = os.getenv(_SYNC_QUEUE_TIMEOUT_ENV, "").strip()
-    if value == "":
-        return _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC
-    try:
-        timeout = float(value)
-    except ValueError:
-        return _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC
-    return timeout if timeout > 0 else _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC
-
-
 call_stack = queue.LifoQueue()
 
 
 def _sync_wrapper(ff):
-    """Run ff on IDA's main thread without allowing queue stalls to hang RPC."""
+    """Run ff synchronously on IDA's main thread in write-safe mode."""
 
     res_container = queue.Queue()
-    started_event = threading.Event()
-    abandoned_event = threading.Event()
-
-    def release_callback():
-        with _pending_callbacks_lock:
-            _pending_callbacks.discard(runned)
 
     def runned():
         # Hex-Rays requires execute_sync callbacks to return an integer.
-        started_event.set()
-        _queue_stalled.clear()
-        try:
-            if abandoned_event.is_set():
-                return 0
-
-            if not call_stack.empty():
-                try:
-                    last_func_name = call_stack.get_nowait()
-                except queue.Empty:
-                    last_func_name = "<empty>"
-                # execute_sync() discards exceptions escaping this callback.
-                res_container.put(
-                    IDASyncError(
-                        f"Call stack is not empty while calling the function "
-                        f"{ff.__name__} from {last_func_name}"
-                    )
-                )
-                return 0
-
-            call_stack.put(ff.__name__)
-            old_batch = None
-            result = None
+        if not call_stack.empty():
             try:
-                old_batch = idc.batch(1)
-                result = ff()
-            except Exception as x:
-                result = x
-            finally:
-                cleanup_error = None
-                if old_batch is not None:
-                    try:
-                        idc.batch(old_batch)
-                    except Exception as x:
-                        cleanup_error = x
-                try:
-                    call_stack.get_nowait()
-                except queue.Empty:
-                    pass
-                if cleanup_error is not None and not isinstance(result, Exception):
-                    result = cleanup_error
+                last_func_name = call_stack.get_nowait()
+            except queue.Empty:
+                last_func_name = "<empty>"
+            # execute_sync() discards exceptions escaping this callback.
+            res_container.put(
+                IDASyncError(
+                    f"Call stack is not empty while calling the function "
+                    f"{ff.__name__} from {last_func_name}"
+                )
+            )
+            return 0
 
-            res_container.put(result)
-            return 1
+        call_stack.put(ff.__name__)
+        old_batch = None
+        result = None
+        try:
+            old_batch = idc.batch(1)
+            result = ff()
+        except Exception as x:
+            result = x
         finally:
-            # MFF_NOWAIT requires the caller to keep the request alive until IDA
-            # executes it. The global set owns this callback across RPC timeout.
-            release_callback()
+            cleanup_error = None
+            if old_batch is not None:
+                try:
+                    idc.batch(old_batch)
+                except Exception as x:
+                    cleanup_error = x
+            # Never block the IDA main thread during re-entrant cleanup.
+            try:
+                call_stack.get_nowait()
+            except queue.Empty:
+                pass
+            if cleanup_error is not None and not isinstance(result, Exception):
+                result = cleanup_error
+
+        res_container.put(result)
+        return 1
 
     if ida_pro.is_main_thread():
-        # execute_sync is unnecessary on IDA's main thread and can deadlock on
-        # a re-entrant tool call.
         runned()
     else:
-        queue_timeout = _get_sync_queue_timeout_seconds()
-        if _queue_stalled.is_set():
-            raise IDASyncError(
-                "IDA still has a timed-out main-thread request queued; "
-                "close any modal dialog or restart IDA"
-            )
-        if not _dispatch_lock.acquire(timeout=queue_timeout):
-            raise IDASyncError(
-                "Another IDA main-thread request is still running; "
-                "wait for it to finish or restart IDA"
-            )
+        return_code = idaapi.execute_sync(runned, idaapi.MFF_WRITE)
+        if return_code == -1 and res_container.empty():
+            raise IDASyncError("IDA rejected the main-thread execution request")
 
-        try:
-            if _queue_stalled.is_set():
-                raise IDASyncError(
-                    "IDA still has a timed-out main-thread request queued; "
-                    "close any modal dialog or restart IDA"
-                )
-
-            # Submit from the original HTTP worker. Calling execute_sync from a
-            # nested helper thread is not reliably dispatched by IDA 9.4.
-            with _pending_callbacks_lock:
-                _pending_callbacks.add(runned)
-            try:
-                return_code = idaapi.execute_sync(
-                    runned,
-                    idaapi.MFF_WRITE | idaapi.MFF_NOWAIT,
-                )
-            except Exception:
-                release_callback()
-                raise
-            if return_code == -1 and not started_event.is_set():
-                release_callback()
-                raise IDASyncError("IDA rejected the main-thread execution request")
-
-            cancel_event = get_current_cancel_event()
-            queue_deadline = time.monotonic() + queue_timeout
-            while not started_event.is_set():
-                if cancel_event is not None and cancel_event.is_set():
-                    abandoned_event.set()
-                    _queue_stalled.set()
-                    raise CancelledError(
-                        "Request was cancelled before IDA dispatched it"
-                    )
-                remaining = queue_deadline - time.monotonic()
-                if remaining <= 0:
-                    abandoned_event.set()
-                    _queue_stalled.set()
-                    raise IDASyncError(
-                        "IDA main-thread queue did not start the request within "
-                        f"{queue_timeout:.2f}s; close any modal dialog or restart IDA"
-                    )
-                started_event.wait(min(0.05, remaining))
-
-            res = res_container.get()
-        finally:
-            _dispatch_lock.release()
-
-    if ida_pro.is_main_thread():
-        res = res_container.get()
+    res = res_container.get()
     if isinstance(res, Exception):
         raise res
     return res
