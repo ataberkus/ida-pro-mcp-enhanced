@@ -706,7 +706,7 @@ def get_function(addr: int, *, raise_error: Literal[False]) -> Optional[Function
 def get_function(addr, *, raise_error=True):
     from . import compat
 
-    fn = idaapi.get_func(addr)
+    fn = compat.get_func(addr)
     if fn is None:
         if raise_error:
             raise IDAError(f"No function found at address {hex(addr)}")
@@ -991,19 +991,26 @@ def parse_decls_ctypes(decls: str, hti_flags: int) -> tuple[int, list[str]]:
 def get_stack_frame_variables_internal(
     fn_addr: int, raise_error: bool
 ) -> list[StackFrameVariable]:
+    from . import compat
     from .sync import ida_major
 
     if ida_major < 9:
         return []
 
-    func = idaapi.get_func(fn_addr)
+    func = compat.get_func(fn_addr)
     if not func:
         if raise_error:
             raise IDAError(f"No function found at address {fn_addr}")
         return []
 
+    frame_id = (
+        func.get_frame_id() if hasattr(func, "get_frame_id") else getattr(func, "frame", None)
+    )
+    if frame_id is None:
+        return []
+
     tif = ida_typeinf.tinfo_t()
-    if not tif.get_type_by_tid(func.frame) or not tif.is_udt():
+    if not tif.get_type_by_tid(frame_id) or not tif.is_udt():
         return []
 
     members: list[StackFrameVariable] = []
@@ -1082,7 +1089,9 @@ def decompile_function_safe(ea: int) -> Optional[str]:
 
 def get_assembly_lines(ea: int) -> str:
     """Get assembly lines for a function in compact string format"""
-    func = idaapi.get_func(ea)
+    from . import compat
+
+    func = compat.get_func(ea)
     if not func:
         return ""
 
@@ -1124,7 +1133,9 @@ def get_all_xrefs(ea: int) -> dict:
 
 def get_all_comments(ea: int) -> dict:
     """Get all comments for an address"""
-    func = idaapi.get_func(ea)
+    from . import compat
+
+    func = compat.get_func(ea)
     if not func:
         return {}
 
@@ -1143,9 +1154,11 @@ def get_all_comments(ea: int) -> dict:
 
 def get_callees(addr: str) -> list[dict]:
     """Get callees for a single function address"""
+    from . import compat
+
     try:
         func_start = parse_address(addr)
-        func = idaapi.get_func(func_start)
+        func = compat.get_func(func_start)
         if not func:
             return []
         func_end = idc.find_func_end(func_start)
@@ -1160,7 +1173,7 @@ def get_callees(addr: str) -> list[dict]:
                 if target_type in [idaapi.o_mem, idaapi.o_near, idaapi.o_far]:
                     func_type = (
                         "internal"
-                        if idaapi.get_func(target) is not None
+                        if compat.get_func(target) is not None
                         else "external"
                     )
                     func_name = idc.get_name(target)
@@ -1225,7 +1238,9 @@ def get_xrefs_from_internal(ea: int) -> list[Xref]:
 
 def extract_function_strings(ea: int) -> list[String]:
     """Extract string references from a function"""
-    func = idaapi.get_func(ea)
+    from . import compat
+
+    func = compat.get_func(ea)
     if not func:
         return []
 
@@ -1254,7 +1269,9 @@ def extract_function_strings(ea: int) -> list[String]:
 
 def extract_function_constants(ea: int) -> list[dict]:
     """Extract immediate constants from a function"""
-    func = idaapi.get_func(ea)
+    from . import compat
+
+    func = compat.get_func(ea)
     if not func:
         return []
 
