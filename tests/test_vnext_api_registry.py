@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
+import threading
 import types
 
 import pytest
@@ -205,9 +206,17 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
     assert "execute_ui_requests" in source
     assert "IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC" in source
     assert "late_callback_skipped" in source
+    assert "QTimer.singleShot(0, callback)" in source
+    assert "ui_turn_released" in source
 
 
-def _load_sync_module(monkeypatch, execute_ui_requests, *, is_main_thread=False):
+def _load_sync_module(
+    monkeypatch,
+    execute_ui_requests,
+    *,
+    is_main_thread=False,
+    single_shot=None,
+):
     load_ida_rpc_module()
     pkg_root = (
         pathlib.Path(__file__).resolve().parents[1]
@@ -241,6 +250,23 @@ def _load_sync_module(monkeypatch, execute_ui_requests, *, is_main_thread=False)
     monkeypatch.setitem(sys.modules, "ida_pro", ida_pro)
     monkeypatch.setitem(sys.modules, "idc", idc)
 
+    if single_shot is None:
+
+        def single_shot(_delay, callback):
+            callback()
+
+    class QTimer:
+        @staticmethod
+        def singleShot(delay, callback):
+            single_shot(delay, callback)
+
+    pyside6 = types.ModuleType("PySide6")
+    qtcore = types.ModuleType("PySide6.QtCore")
+    qtcore.QTimer = QTimer
+    pyside6.QtCore = qtcore
+    monkeypatch.setitem(sys.modules, "PySide6", pyside6)
+    monkeypatch.setitem(sys.modules, "PySide6.QtCore", qtcore)
+
     module_name = "_test_stub_ida_mcp.sync_queue_test"
     sys.modules.pop(module_name, None)
     spec = importlib.util.spec_from_file_location(module_name, pkg_root / "sync.py")
@@ -263,6 +289,41 @@ def test_sync_callback_runs_once_through_ui_queue(monkeypatch):
     assert sync._sync_wrapper(lambda: "ok") == "ok"
     assert len(submitted_callbacks) == 1
     assert callback_returns == [False]
+
+
+def test_sync_worker_result_waits_for_next_ui_turn(monkeypatch):
+    timer_callbacks = []
+    timer_scheduled = threading.Event()
+    outcome = {}
+
+    def execute_ui_requests(callbacks):
+        assert [callback() for callback in callbacks] == [False]
+        return True
+
+    def single_shot(delay, callback):
+        assert delay == 0
+        timer_callbacks.append(callback)
+        timer_scheduled.set()
+
+    sync = _load_sync_module(
+        monkeypatch, execute_ui_requests, single_shot=single_shot
+    )
+
+    def worker():
+        try:
+            outcome["result"] = sync._sync_wrapper(lambda: "ok")
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    worker_thread = threading.Thread(target=worker)
+    worker_thread.start()
+    assert timer_scheduled.wait(1.0)
+    assert worker_thread.is_alive()
+
+    timer_callbacks.pop(0)()
+    worker_thread.join(1.0)
+    assert not worker_thread.is_alive()
+    assert outcome == {"result": "ok"}
 
 
 def test_sync_callback_transports_tool_exception(monkeypatch):

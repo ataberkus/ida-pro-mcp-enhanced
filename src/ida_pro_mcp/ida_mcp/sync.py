@@ -116,6 +116,17 @@ def _sync_diag(request_id: int, stage: str, **fields) -> None:
     logger.info("IDA MCP sync: %s", line)
 
 
+def _defer_until_next_ui_turn(callback) -> None:
+    """Run callback after the current native UI request has fully returned."""
+    using_pyside6 = (ida_major > 9) or (ida_major == 9 and ida_minor >= 2)
+    if using_pyside6:
+        from PySide6.QtCore import QTimer
+    else:
+        from PyQt5.QtCore import QTimer
+
+    QTimer.singleShot(0, callback)
+
+
 call_stack = queue.LifoQueue()
 _sync_diag(
     0,
@@ -143,6 +154,35 @@ def _sync_wrapper(ff):
         main_thread=on_main_thread,
         queue_timeout=queue_timeout,
     )
+
+    def release_result_after_ui_turn(result) -> None:
+        def release_result():
+            res_container.put(result)
+            _sync_diag(
+                request_id,
+                "ui_turn_released",
+                function=ff.__name__,
+                outcome="error" if isinstance(result, BaseException) else "ok",
+            )
+
+        if on_main_thread:
+            release_result()
+            return
+        try:
+            _defer_until_next_ui_turn(release_result)
+        except BaseException as exc:
+            error = IDASyncError(
+                f"Unable to defer completion of UI request {request_id} "
+                f"({ff.__name__}): {exc}; diagnostics: {_SYNC_LOG_PATH}"
+            )
+            res_container.put(error)
+            _sync_diag(
+                request_id,
+                "ui_turn_defer_exception",
+                function=ff.__name__,
+                error=repr(exc),
+                traceback=traceback.format_exc().replace("\n", "\\n"),
+            )
 
     def runned():
         with state_lock:
@@ -174,13 +214,13 @@ def _sync_wrapper(ff):
                 f"Call stack is not empty while calling the function "
                 f"{ff.__name__} from {last_func_name}"
             )
-            res_container.put(error)
             _sync_diag(
                 request_id,
                 "reentrant_rejected",
                 function=ff.__name__,
                 error=repr(error),
             )
+            release_result_after_ui_turn(error)
             return False
 
         call_stack.put(ff.__name__)
@@ -212,7 +252,6 @@ def _sync_wrapper(ff):
             if cleanup_error is not None and not isinstance(result, BaseException):
                 result = cleanup_error
 
-        res_container.put(result)
         _sync_diag(
             request_id,
             "ui_finished",
@@ -220,6 +259,9 @@ def _sync_wrapper(ff):
             elapsed=time.monotonic() - callback_started_at,
             outcome="error" if isinstance(result, BaseException) else "ok",
         )
+        # A zero-delay Qt callback runs only after this native UI request has
+        # returned, preventing immediately chained requests from losing wakeups.
+        release_result_after_ui_turn(result)
         # execute_ui_requests repeats callbacks that return True.
         return False
 
