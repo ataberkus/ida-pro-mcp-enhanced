@@ -181,3 +181,23 @@ def test_bridge_legacy_backends_are_defined_in_source():
             needles = (needles,)
         for needle in needles:
             assert needle in text, f"{filename} missing {needle}"
+
+
+def test_sync_timeout_and_reentrancy_guards_remain_in_source():
+    sync_path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src"
+        / "ida_pro_mcp"
+        / "ida_mcp"
+        / "sync.py"
+    )
+    source = sync_path.read_text(encoding="utf-8")
+
+    # Regression guards for upstream fixes accidentally overwritten by a
+    # later integration: escaping execute_sync exceptions and pure-C scans
+    # must never leave HTTP workers blocked indefinitely.
+    assert "res_container.put(" in source
+    assert "call_stack.get_nowait()" in source
+    assert "threading.Timer(timeout, _fire_native_cancel)" in source
+    assert "ida_kernwin.set_cancelled()" in source
+    assert "ida_kernwin.clr_cancelled()" in source

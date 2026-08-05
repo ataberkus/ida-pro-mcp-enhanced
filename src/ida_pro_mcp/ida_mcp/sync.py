@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import idaapi
+import ida_kernwin
 import idc
 from .rpc import McpToolError
 from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
@@ -70,11 +71,21 @@ def _sync_wrapper(ff):
 
     def runned():
         if not call_stack.empty():
-            last_func_name = call_stack.get()
-            error_str = f"Call stack is not empty while calling the function {ff.__name__} from {last_func_name}"
-            raise IDASyncError(error_str)
+            try:
+                last_func_name = call_stack.get_nowait()
+            except queue.Empty:
+                last_func_name = "<empty>"
+            # execute_sync() discards exceptions escaping this callback. Return
+            # the error through the queue so the HTTP worker cannot wait forever.
+            res_container.put(
+                IDASyncError(
+                    f"Call stack is not empty while calling the function "
+                    f"{ff.__name__} from {last_func_name}"
+                )
+            )
+            return
 
-        call_stack.put((ff.__name__))
+        call_stack.put(ff.__name__)
         # Enable batch mode for all synchronized operations
         old_batch = idc.batch(1)
         try:
@@ -83,7 +94,12 @@ def _sync_wrapper(ff):
             res_container.put(x)
         finally:
             idc.batch(old_batch)
-            call_stack.get()
+            # A synchronous re-entrant call may already have consumed our
+            # marker. Never block the IDA main thread while cleaning it up.
+            try:
+                call_stack.get_nowait()
+            except queue.Empty:
+                pass
 
     idaapi.execute_sync(runned, idaapi.MFF_WRITE)
     res = res_container.get()
@@ -117,13 +133,32 @@ def sync_wrapper(ff, timeout_override: float | None = None):
 
         def timed_ff():
             # Calculate deadline when execution starts on IDA main thread,
-            # not when the request was queued (avoids stale deadlines)
+            # not when the request was queued (avoids stale deadlines).
             deadline = time.monotonic() + timeout if timeout > 0 else None
 
+            # Python profiling cannot interrupt pure-C IDA SDK scans. The
+            # native cancellation flag is thread-safe and is polled by search,
+            # decompiler, string-list, and auto-analysis APIs.
+            ida_kernwin.clr_cancelled()
+            cancel_fired_at: list[float | None] = [None]
+            native_timer: threading.Timer | None = None
+            if deadline is not None:
+
+                def _fire_native_cancel():
+                    cancel_fired_at[0] = time.monotonic()
+                    ida_kernwin.set_cancelled()
+
+                native_timer = threading.Timer(timeout, _fire_native_cancel)
+                native_timer.daemon = True
+                native_timer.start()
+
             def profilefunc(frame, event, arg):
-                # Check cancellation first (higher priority)
                 if cancel_event is not None and cancel_event.is_set():
+                    ida_kernwin.set_cancelled()
                     raise CancelledError("Request was cancelled")
+                fired_at = cancel_fired_at[0]
+                if fired_at is not None and time.monotonic() < fired_at + 5.0:
+                    return
                 if deadline is not None and time.monotonic() >= deadline:
                     raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
 
@@ -134,6 +169,9 @@ def sync_wrapper(ff, timeout_override: float | None = None):
                 return ff()
             finally:
                 sys.setprofile(old_profile)
+                if native_timer is not None:
+                    native_timer.cancel()
+                ida_kernwin.clr_cancelled()
                 _deadline_state.deadline = None
 
         timed_ff.__name__ = ff.__name__

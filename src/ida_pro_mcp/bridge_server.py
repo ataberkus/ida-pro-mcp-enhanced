@@ -69,6 +69,21 @@ _registry = _load_helper("ida_mcp_registry", "registry.py")
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
 BRIDGE_SESSION_ID = str(uuid.uuid4())
+_BRIDGE_TIMEOUT_ENV = "IDA_MCP_BRIDGE_TIMEOUT_SEC"
+_DEFAULT_BRIDGE_TIMEOUT_SEC = 240.0
+
+
+def _get_bridge_timeout_seconds() -> float:
+    """Keep the proxy alive longer than the longest IDA-side tool deadline."""
+    value = os.getenv(_BRIDGE_TIMEOUT_ENV, "").strip()
+    if not value:
+        return _DEFAULT_BRIDGE_TIMEOUT_SEC
+    try:
+        timeout = float(value)
+    except ValueError:
+        return _DEFAULT_BRIDGE_TIMEOUT_SEC
+    return timeout if timeout > 0 else _DEFAULT_BRIDGE_TIMEOUT_SEC
+
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
@@ -80,7 +95,7 @@ _tool_table_signature: tuple | None = None
 
 def _post_to_ida(payload: bytes, host: str, port: int) -> dict:
     """POST a JSON-RPC payload to an IDA plugin's HTTP server."""
-    conn = http.client.HTTPConnection(host, port, timeout=30)
+    conn = http.client.HTTPConnection(host, port, timeout=_get_bridge_timeout_seconds())
     try:
         conn.request(
             "POST",
