@@ -201,7 +201,7 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
     # later integration: UI queue stalls and pure-C scans must never leave
     # HTTP workers blocked indefinitely.
     assert "res_container.put(" in source
-    assert "call_stack.get_nowait()" in source
+    assert "call_stack.pop()" in source
     assert "threading.Timer(timeout, _fire_native_cancel)" in source
     assert "ida_kernwin.set_cancelled()" in source
     assert "ida_kernwin.clr_cancelled()" in source
@@ -212,6 +212,10 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
     assert "late_callback_skipped" in source
     assert "QTimer.singleShot(0, callback)" in source
     assert "ui_turn_released" in source
+    assert "ui_event_deferred" in source
+    assert "tool_reported_error" in source
+    assert "ida_pro_enhanced_logs" in source
+    assert "IDA_MCP_ERROR_LOG" in source
     assert "IDA_MCP_SEARCH_PAGE_BUDGET_SEC" in source
     assert "get_search_page_budget_seconds()" in api_core_source
     assert "heads_seen % 64" in api_core_source
@@ -352,6 +356,69 @@ def test_sync_immediately_chained_qt_events_are_not_lost(monkeypatch):
     worker_thread.join(1.0)
     assert not worker_thread.is_alive()
     assert outcome == {"results": ["first", "second"]}
+
+
+def test_sync_dispatcher_defers_recursive_qt_delivery(monkeypatch):
+    posted_events = []
+    order = []
+
+    def post_event(receiver, event):
+        posted_events.append((receiver, event))
+
+    sync = _load_sync_module(monkeypatch, post_event=post_event)
+
+    def second():
+        order.append("second")
+
+    def first():
+        order.append("first-start")
+        sync._post_to_main_thread(second)
+        nested_receiver, nested_event = posted_events.pop(0)
+        assert nested_receiver.event(nested_event) is True
+        order.append("first-end")
+
+    sync._post_to_main_thread(first)
+    receiver, event = posted_events.pop(0)
+    assert receiver.event(event) is True
+    assert order == ["first-start", "first-end"]
+
+    drain_receiver, drain_event = posted_events.pop(0)
+    assert drain_receiver.event(drain_event) is True
+    assert order == ["first-start", "first-end", "second"]
+    assert posted_events == []
+
+
+def test_sync_reports_structured_tool_errors(monkeypatch):
+    sync = _load_sync_module(monkeypatch, is_main_thread=True)
+
+    result = {
+        "data": [
+            {"addr": "0x401000", "code": None, "error": "Decompilation failed"},
+            {"addr": "0x402000", "ok": False},
+        ]
+    }
+    summary = sync._reported_error_summary(result)
+
+    assert "$.data[0].error='Decompilation failed'" in summary
+    assert "$.data[1].ok=False" in summary
+    assert sync._result_outcome(result) == "reported_error"
+    assert sync._result_outcome({"error": None}) == "ok"
+
+
+def test_sync_writes_reported_errors_to_dedicated_log(monkeypatch, tmp_path):
+    sync_log = tmp_path / "sync.log"
+    error_log = tmp_path / "errors.log"
+    monkeypatch.setenv("IDA_MCP_SYNC_LOG", str(sync_log))
+    monkeypatch.setenv("IDA_MCP_ERROR_LOG", str(error_log))
+    sync = _load_sync_module(monkeypatch, is_main_thread=True)
+
+    result = sync._sync_wrapper(lambda: {"error": "Decompilation failed"})
+
+    assert result == {"error": "Decompilation failed"}
+    assert "stage=tool_reported_error" in sync_log.read_text(encoding="utf-8")
+    error_text = error_log.read_text(encoding="utf-8")
+    assert "stage=tool_reported_error" in error_text
+    assert "Decompilation failed" in error_text
 
 
 def test_sync_worker_result_waits_for_next_ui_turn(monkeypatch):

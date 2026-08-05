@@ -211,9 +211,11 @@ If `tools/list` works but `entity_query`, `search`, or other IDA-backed calls ti
 1. Run `codex mcp get ida-pro-mcp` and confirm both stdio paths point to the intended checkout.
 2. From that checkout, run `uv sync --all-groups` followed by `uv run --no-sync ida-pro-mcp --install codex --scope global --transport stdio`.
 3. Completely restart IDA so it loads the refreshed plugin package, then restart the MCP client so it launches the refreshed bridge.
-4. Inspect `%TEMP%\ida-pro-mcp-sync-<ida-pid>.log`. Each request records its ID, worker/UI thread, queue delay, execution time, scheduler, outcome, and exception traceback. `queue_start_timeout` means IDA's Qt event loop never dispatched the posted event; `ui_started` followed by no `ui_finished` identifies a tool that stalled after dispatch; `ui_finished` should be followed by `ui_turn_released` on a later Qt turn.
+4. Inspect `%TEMP%\ida_pro_enhanced_logs\ida-pro-mcp-sync-<ida-pid>.log`. Each request records its ID, worker/UI thread, queue delay, execution time, scheduler, outcome, and exception traceback. `queue_start_timeout` means IDA's Qt event loop never dispatched the posted event; `ui_started` followed by no `ui_finished` identifies a tool that stalled after dispatch; `ui_event_deferred` means a nested Qt delivery was safely queued behind an active IDA call; and `ui_finished` should be followed by `ui_turn_released` on a later Qt turn.
 
-The UI-start timeout defaults to 10 seconds and can be overridden with `IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC`. Override the diagnostic file with `IDA_MCP_SYNC_LOG`.
+The same directory contains `ida-pro-mcp-errors-<ida-pid>.log`, a smaller error-only stream for queue failures, exceptions, structured tool errors, decompiler failures, and call-stack inconsistencies. The UI-start timeout defaults to 10 seconds and can be overridden with `IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC`. Override the files with `IDA_MCP_SYNC_LOG` and `IDA_MCP_ERROR_LOG`.
+
+Returned failures are logged as `tool_reported_error` with outcome `reported_error`, rather than being mistaken for successful calls. Decompiler failures additionally emit `decompile_failed` with the input and resolved function addresses, function name, Hex-Rays error code/name and description, exact failure address when supplied by Hex-Rays, exception details, and the diagnostic-log path. The `decompile` response carries the same bounded details plus a `disassemble` fallback target.
 
 Rendered-listing text search uses five-second pages and returns a continuation cursor before common MCP client timeouts. Override the page budget with `IDA_MCP_SEARCH_PAGE_BUDGET_SEC`; values are capped at 20 seconds.
 

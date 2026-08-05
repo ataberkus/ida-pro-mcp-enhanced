@@ -1034,60 +1034,193 @@ def get_stack_frame_variables_internal(
     return members
 
 
+class DecompilationError(IDAError):
+    """Hex-Rays failure with machine-readable diagnostic details."""
+
+    def __init__(self, message: str, details: dict[str, Any]):
+        super().__init__(message)
+        self.details = details
+
+
+def _hexrays_failure_details(addr: int, failure) -> dict[str, Any]:
+    try:
+        code = int(failure.code)
+    except Exception:
+        code = None
+    code_name = None
+    if code is not None:
+        for name in dir(ida_hexrays):
+            if not name.startswith("MERR_"):
+                continue
+            try:
+                if int(getattr(ida_hexrays, name)) == code:
+                    code_name = name
+                    break
+            except Exception:
+                continue
+    try:
+        description = str(failure.desc() or "")
+    except Exception:
+        description = ""
+    try:
+        detail = str(failure.str or "")
+    except Exception:
+        detail = ""
+    try:
+        error_address = int(failure.errea)
+    except Exception:
+        error_address = idaapi.BADADDR
+
+    return {
+        "resolved_addr": hex(addr),
+        "hexrays_code": code,
+        "hexrays_code_name": code_name,
+        "hexrays_description": description or None,
+        "hexrays_detail": detail or None,
+        "failure_addr": (
+            None if error_address == idaapi.BADADDR else hex(error_address)
+        ),
+    }
+
+
 def decompile_checked(addr: int):
-    """Decompile a function and raise IDAError on failure (uses cache)"""
+    """Decompile a function and raise a detailed error on failure (uses cache)."""
     if not ida_hexrays.init_hexrays_plugin():
-        raise IDAError("Hex-Rays decompiler is not available")
-    hf = ida_hexrays.hexrays_failure_t()
-    cfunc = ida_hexrays.decompile(addr, hf)
+        raise DecompilationError(
+            "Hex-Rays decompiler is not available",
+            {
+                "resolved_addr": hex(addr),
+                "reason": "decompiler_unavailable",
+            },
+        )
+    failure = ida_hexrays.hexrays_failure_t()
+    decompile_function = getattr(ida_hexrays, "decompile_function", None)
+    try:
+        if decompile_function is None:
+            cfunc = ida_hexrays.decompile(addr, failure)
+        else:
+            cfunc = decompile_function(addr, failure)
+    except Exception as exc:
+        raise DecompilationError(
+            f"Hex-Rays raised {type(exc).__name__} while decompiling {hex(addr)}: {exc}",
+            {
+                "resolved_addr": hex(addr),
+                "reason": "decompiler_exception",
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+            },
+        ) from exc
     if not cfunc:
-        if hf.code == ida_hexrays.MERR_LICENSE:
-            raise IDAError(
-                "Decompiler license is not available. Use `disassemble_function` to get the assembly code instead."
+        details = _hexrays_failure_details(addr, failure)
+        if failure.code == ida_hexrays.MERR_LICENSE:
+            details["reason"] = "license_unavailable"
+            raise DecompilationError(
+                "Decompiler license is not available; use `disassemble` for assembly instead",
+                details,
             )
 
+        details["reason"] = "hexrays_failure"
+        explanation = details.get("hexrays_detail") or details.get(
+            "hexrays_description"
+        )
         message = f"Decompilation failed at {hex(addr)}"
-        if hf.str:
-            message += f": {hf.str}"
-        if hf.errea != idaapi.BADADDR:
-            message += f" (address: {hex(hf.errea)})"
-        raise IDAError(message)
+        if explanation:
+            message += f": {explanation}"
+        if details.get("failure_addr"):
+            message += f" (failure address: {details['failure_addr']})"
+        if details.get("hexrays_code_name"):
+            message += f" [{details['hexrays_code_name']}]"
+        raise DecompilationError(message, details)
     return cfunc
 
 
-def decompile_function_safe(ea: int) -> Optional[str]:
-    """Safely decompile a function, returning None on failure (uses cache)"""
+def _render_decompiled_function(cfunc) -> str:
     import ida_lines
     import ida_kernwin
 
+    sv = cfunc.get_pseudocode()
+    lines = []
+    for sl in sv:
+        sl: ida_kernwin.simpleline_t
+        item = ida_hexrays.ctree_item_t()
+        line_ea = None
+        if cfunc.get_line_item(sl.line, 0, False, None, item, None):
+            dstr: str | None = item.dstr()
+            if dstr:
+                ds = dstr.split(": ")
+                if len(ds) == 2:
+                    try:
+                        line_ea = int(ds[0], 16)
+                    except ValueError:
+                        pass
+        text = ida_lines.tag_remove(sl.line)
+        if line_ea is not None:
+            lines.append(f"{text} /*{line_ea:#x}*/")
+        else:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def decompile_function_detailed(ea: int) -> str:
+    """Decompile and render pseudocode, preserving the exact failure reason."""
+    cfunc = decompile_checked(ea)
     try:
-        if not ida_hexrays.init_hexrays_plugin():
-            return None
-        cfunc = ida_hexrays.decompile(ea)
-        if not cfunc:
-            return None
-        sv = cfunc.get_pseudocode()
-        lines = []
-        for sl in sv:
-            sl: ida_kernwin.simpleline_t
-            item = ida_hexrays.ctree_item_t()
-            line_ea = None
-            if cfunc.get_line_item(sl.line, 0, False, None, item, None):
-                dstr: str | None = item.dstr()
-                if dstr:
-                    ds = dstr.split(": ")
-                    if len(ds) == 2:
-                        try:
-                            line_ea = int(ds[0], 16)
-                        except ValueError:
-                            pass
-            text = ida_lines.tag_remove(sl.line)
-            if line_ea is not None:
-                lines.append(f"{text} /*{line_ea:#x}*/")
-            else:
-                lines.append(text)
-        return "\n".join(lines)
-    except Exception:
+        return _render_decompiled_function(cfunc)
+    except Exception as exc:
+        raise DecompilationError(
+            f"Pseudocode rendering failed at {hex(ea)}: {exc}",
+            {
+                "resolved_addr": hex(ea),
+                "reason": "pseudocode_render_exception",
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+            },
+        ) from exc
+
+
+def decompile_function_safe(
+    ea: int, *, error_out: dict[str, Any] | None = None
+) -> Optional[str]:
+    """Safely decompile a function while logging and optionally returning details."""
+    try:
+        return decompile_function_detailed(ea)
+    except DecompilationError as exc:
+        if error_out is not None:
+            error_out.update(exc.details)
+            error_out["message"] = str(exc)
+        try:
+            from .sync import log_tool_diagnostic
+
+            log_tool_diagnostic(
+                "decompile_failed",
+                addr=hex(ea),
+                error=str(exc),
+                details=exc.details,
+            )
+        except Exception:
+            pass
+        return None
+    except Exception as exc:
+        details = {
+            "resolved_addr": hex(ea),
+            "reason": "unexpected_exception",
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+        }
+        if error_out is not None:
+            error_out.update(details)
+            error_out["message"] = f"Unexpected decompilation failure: {exc}"
+        try:
+            from .sync import log_tool_diagnostic
+
+            log_tool_diagnostic(
+                "decompile_failed",
+                addr=hex(ea),
+                error=repr(exc),
+                details=details,
+            )
+        except Exception:
+            pass
         return None
 
 

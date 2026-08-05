@@ -1,5 +1,6 @@
 from itertools import islice
 import struct
+import traceback
 from typing import Annotated, Optional
 import ida_lines
 import ida_funcs
@@ -15,7 +16,14 @@ import ida_xref
 import ida_ua
 import ida_name
 from .rpc import tool
-from .sync import idasync, tool_timeout, IDAError
+from .sync import (
+    idasync,
+    tool_timeout,
+    IDAError,
+    get_error_log_path,
+    get_sync_log_path,
+    log_tool_diagnostic,
+)
 from .utils import (
     parse_address,
     normalize_list_input,
@@ -25,6 +33,8 @@ from .utils import (
     paginate,
     pattern_filter,
     get_stack_frame_variables_internal,
+    DecompilationError,
+    decompile_function_detailed,
     decompile_function_safe,
     get_assembly_lines,
     get_all_xrefs,
@@ -387,12 +397,85 @@ def decompile(
                     "error": f"Function not found: {addr!r}",
                 }
             start = ea
-        code = decompile_function_safe(start)
-        if code is None:
-            return {"addr": addr, "code": None, "error": "Decompilation failed"}
-        return {"addr": addr, "code": code}
-    except Exception as e:
-        return {"addr": addr, "code": None, "error": str(e)}
+        function = ida_funcs.get_func(start)
+        if function is None:
+            details = {
+                "input": addr,
+                "resolved_addr": hex(start),
+                "reason": "function_not_defined",
+                "diagnostic_log": get_sync_log_path(),
+                "error_log": get_error_log_path(),
+            }
+            error = f"No function is defined at {hex(start)}"
+            log_tool_diagnostic(
+                "decompile_failed", addr=addr, error=error, details=details
+            )
+            return {
+                "addr": addr,
+                "code": None,
+                "error": error,
+                "details": details,
+                "fallback": {"tool": "disassemble", "addr": hex(start)},
+            }
+
+        function_start = int(function.start_ea)
+        function_name = ida_funcs.get_func_name(function_start) or None
+        try:
+            code = decompile_function_detailed(function_start)
+        except DecompilationError as exc:
+            details = {
+                **exc.details,
+                "input": addr,
+                "function_addr": hex(function_start),
+                "function_name": function_name,
+                "diagnostic_log": get_sync_log_path(),
+                "error_log": get_error_log_path(),
+            }
+            log_tool_diagnostic(
+                "decompile_failed",
+                addr=addr,
+                error=str(exc),
+                details=details,
+                traceback=traceback.format_exc(),
+            )
+            return {
+                "addr": addr,
+                "code": None,
+                "error": str(exc),
+                "details": details,
+                "fallback": {
+                    "tool": "disassemble",
+                    "addr": hex(function_start),
+                },
+            }
+        return {
+            "addr": addr,
+            "function_addr": hex(function_start),
+            "function_name": function_name,
+            "code": code,
+        }
+    except Exception as exc:
+        details = {
+            "input": addr,
+            "reason": "unexpected_exception",
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+            "diagnostic_log": get_sync_log_path(),
+            "error_log": get_error_log_path(),
+        }
+        log_tool_diagnostic(
+            "decompile_failed",
+            addr=addr,
+            error=repr(exc),
+            details=details,
+            traceback=traceback.format_exc(),
+        )
+        return {
+            "addr": addr,
+            "code": None,
+            "error": f"Unexpected decompilation failure: {exc}",
+            "details": details,
+        }
 
 
 @tool
@@ -758,6 +841,7 @@ def analyze_batch(
                 "prototype": None,
                 "decompile": None,
                 "decompile_error": None,
+                "decompile_error_details": None,
                 "disasm": None,
                 "xrefs": None,
                 "callers": None,
@@ -781,10 +865,16 @@ def analyze_batch(
                 analysis["prototype"] = get_prototype(fn)
 
             if include_decompile:
-                code = decompile_function_safe(fn.start_ea)
+                decompile_failure: dict = {}
+                code = decompile_function_safe(
+                    fn.start_ea, error_out=decompile_failure
+                )
                 analysis["decompile"] = code
                 if code is None:
-                    analysis["decompile_error"] = "Decompilation failed"
+                    analysis["decompile_error"] = decompile_failure.pop(
+                        "message", "Decompilation failed without diagnostic details"
+                    )
+                    analysis["decompile_error_details"] = decompile_failure or None
 
             if include_disasm:
                 lines, disasm_truncated = _disasm_lines_limited(fn, max_disasm_insns)
@@ -1925,7 +2015,15 @@ def export_funcs(
 
             if format == "json":
                 func_data["asm"] = get_assembly_lines(ea)
-                func_data["code"] = decompile_function_safe(ea)
+                decompile_failure: dict = {}
+                func_data["code"] = decompile_function_safe(
+                    func.start_ea, error_out=decompile_failure
+                )
+                if func_data["code"] is None:
+                    func_data["decompile_error"] = decompile_failure.pop(
+                        "message", "Decompilation failed without diagnostic details"
+                    )
+                    func_data["decompile_error_details"] = decompile_failure or None
                 func_data["xrefs"] = get_all_xrefs(ea)
 
             results.append(func_data)

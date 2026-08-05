@@ -51,8 +51,10 @@ _MAX_SEARCH_PAGE_BUDGET_SEC = 20.0
 _SYNC_QUEUE_TIMEOUT_ENV = "IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC"
 _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC = 10.0
 _SYNC_LOG_ENV = "IDA_MCP_SYNC_LOG"
+_ERROR_LOG_ENV = "IDA_MCP_ERROR_LOG"
 _sync_request_ids = itertools.count(1)
 _sync_diag_lock = threading.Lock()
+_tool_context = threading.local()
 
 # Per-tool monotonic deadline (or None if no timeout). Tools can read this to
 # self-monitor and return partial results before the hard timeout fires.
@@ -99,16 +101,48 @@ def _get_sync_queue_timeout_seconds() -> float:
     return timeout if timeout > 0 else _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC
 
 
+def _get_default_log_directory() -> str:
+    directory = os.path.join(tempfile.gettempdir(), "ida_pro_enhanced_logs")
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return tempfile.gettempdir()
+    return directory
+
+
 def _get_sync_log_path() -> str:
     override = os.getenv(_SYNC_LOG_ENV, "").strip()
     if override:
         return os.path.abspath(os.path.expandvars(os.path.expanduser(override)))
     return os.path.join(
-        tempfile.gettempdir(), f"ida-pro-mcp-sync-{os.getpid()}.log"
+        _get_default_log_directory(), f"ida-pro-mcp-sync-{os.getpid()}.log"
     )
 
 
 _SYNC_LOG_PATH = _get_sync_log_path()
+
+
+def _get_error_log_path() -> str:
+    override = os.getenv(_ERROR_LOG_ENV, "").strip()
+    if override:
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(override)))
+    return os.path.join(
+        os.path.dirname(_SYNC_LOG_PATH), f"ida-pro-mcp-errors-{os.getpid()}.log"
+    )
+
+
+_ERROR_LOG_PATH = _get_error_log_path()
+_ERROR_STAGES = {
+    "call_stack_mismatch",
+    "cleanup_exception",
+    "decompile_failed",
+    "queue_start_timeout",
+    "queue_submit_exception",
+    "reentrant_rejected",
+    "tool_exception",
+    "tool_reported_error",
+    "ui_turn_defer_exception",
+}
 
 
 def get_sync_log_path() -> str:
@@ -116,21 +150,99 @@ def get_sync_log_path() -> str:
     return _SYNC_LOG_PATH
 
 
+def get_error_log_path() -> str:
+    """Return the error-only diagnostic log path."""
+    return _ERROR_LOG_PATH
+
+
+def _append_diagnostic_line(path: str, line: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as log_file:
+        log_file.write(line + "\n")
+
+
 def _sync_diag(request_id: int, stage: str, **fields) -> None:
     """Append one structured synchronization event without risking the request."""
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    details = " ".join(
+        f"{key}={_bounded_repr(value)}" for key, value in fields.items()
+    )
     line = (
         f"{timestamp} pid={os.getpid()} tid={threading.get_ident()} "
         f"request={request_id} stage={stage} {details}".rstrip()
     )
     try:
         with _sync_diag_lock:
-            with open(_SYNC_LOG_PATH, "a", encoding="utf-8") as log_file:
-                log_file.write(line + "\n")
+            _append_diagnostic_line(_SYNC_LOG_PATH, line)
+            if stage in _ERROR_STAGES:
+                _append_diagnostic_line(_ERROR_LOG_PATH, line)
     except OSError:
         logger.exception("Unable to write IDA MCP sync diagnostics")
     logger.info("IDA MCP sync: %s", line)
+
+
+def _bounded_repr(value, limit: int = 2000) -> str:
+    """Return a single-line bounded representation suitable for diagnostics."""
+    try:
+        rendered = repr(value)
+    except BaseException as exc:
+        rendered = f"<unrepresentable {type(value).__name__}: {exc}>"
+    rendered = rendered.replace("\r", "\\r").replace("\n", "\\n")
+    if len(rendered) > limit:
+        rendered = rendered[: limit - 3] + "..."
+    return rendered
+
+
+def log_tool_diagnostic(stage: str, **fields) -> None:
+    """Append a diagnostic event associated with the active IDA tool request."""
+    request_id = getattr(_tool_context, "request_id", 0)
+    function = getattr(_tool_context, "function", None)
+    if function is not None and "function" not in fields:
+        fields["function"] = function
+    _sync_diag(request_id, stage, **fields)
+
+
+_REPORTED_ERROR_KEYS = {"error", "errors", "failure", "failures", "decompile_error"}
+
+
+def _reported_error_summary(value, *, max_depth: int = 4, max_items: int = 32) -> str | None:
+    """Summarize structured failures returned as ordinary tool values."""
+    findings: list[str] = []
+
+    def visit(item, path: str, depth: int) -> None:
+        if len(findings) >= max_items or depth > max_depth:
+            return
+        if isinstance(item, dict):
+            if item.get("ok") is False:
+                findings.append(f"{path}.ok=False")
+            status = item.get("status")
+            if isinstance(status, str) and status.lower() in {"error", "failed", "failure"}:
+                findings.append(f"{path}.status={_bounded_repr(status, 200)}")
+            for key, child in item.items():
+                child_path = f"{path}.{key}"
+                if str(key).lower() in _REPORTED_ERROR_KEYS:
+                    if child not in (None, False, "", [], {}):
+                        findings.append(f"{child_path}={_bounded_repr(child, 500)}")
+                elif isinstance(child, (dict, list, tuple)):
+                    visit(child, child_path, depth + 1)
+        elif isinstance(item, (list, tuple)):
+            for index, child in enumerate(item[:max_items]):
+                visit(child, f"{path}[{index}]", depth + 1)
+
+    visit(value, "$", 0)
+    if not findings:
+        return None
+    return "; ".join(findings)[:2000]
+
+
+def _result_outcome(result) -> str:
+    if isinstance(result, BaseException):
+        return "error"
+    if _reported_error_summary(result) is not None:
+        return "reported_error"
+    return "ok"
 
 
 def _load_qt_core():
@@ -153,11 +265,48 @@ class _QtDispatchEvent(_qt_core.QEvent):
 
 
 class _QtMainThreadDispatcher(_qt_core.QObject):
+    def __init__(self):
+        super().__init__()
+        self._pending_callbacks = []
+        self._active_callback = None
+
+    def _run_next(self):
+        if self._active_callback is not None or not self._pending_callbacks:
+            return
+        callback = self._pending_callbacks.pop(0)
+        self._active_callback = callback
+        try:
+            callback()
+        finally:
+            self._active_callback = None
+            if self._pending_callbacks:
+                # Drain on a fresh event-loop turn. Hex-Rays may pump nested Qt
+                # events while decompiling; keeping the dispatcher active until
+                # the callback returns prevents those deliveries from entering
+                # IDA concurrently.
+                _qt_core.QCoreApplication.postEvent(
+                    self, _QtDispatchEvent(None)
+                )
+
     def event(self, event):
         if event.type() == _DISPATCH_EVENT_TYPE:
             callback = event.callback
             event.callback = None
-            callback()
+            if callback is not None:
+                self._pending_callbacks.append(callback)
+            if self._active_callback is not None:
+                request_id = getattr(callback, "_ida_mcp_request_id", 0)
+                _sync_diag(
+                    request_id,
+                    "ui_event_deferred",
+                    function=getattr(callback, "_ida_mcp_function", "<drain>"),
+                    active_request=getattr(
+                        self._active_callback, "_ida_mcp_request_id", None
+                    ),
+                    pending=len(self._pending_callbacks),
+                )
+                return True
+            self._run_next()
             return True
         return super().event(event)
 
@@ -176,13 +325,14 @@ def _defer_until_next_ui_turn(callback) -> None:
     _qt_core.QTimer.singleShot(0, callback)
 
 
-call_stack = queue.LifoQueue()
+call_stack: list[str] = []
 _sync_diag(
     0,
     "module_loaded",
     queue_timeout=_get_sync_queue_timeout_seconds(),
     scheduler="qt_post_event",
     log_path=_SYNC_LOG_PATH,
+    error_log_path=_ERROR_LOG_PATH,
 )
 
 
@@ -212,7 +362,7 @@ def _sync_wrapper(ff):
                 request_id,
                 "ui_turn_released",
                 function=ff.__name__,
-                outcome="error" if isinstance(result, BaseException) else "ok",
+                outcome=_result_outcome(result),
             )
 
         if on_main_thread:
@@ -255,11 +405,8 @@ def _sync_wrapper(ff):
             queued_for=callback_started_at - queued_at,
             main_thread=ida_pro.is_main_thread(),
         )
-        if not call_stack.empty():
-            try:
-                last_func_name = call_stack.get_nowait()
-            except queue.Empty:
-                last_func_name = "<empty>"
+        if call_stack:
+            last_func_name = call_stack[-1]
             error = IDASyncError(
                 f"Call stack is not empty while calling the function "
                 f"{ff.__name__} from {last_func_name}"
@@ -273,12 +420,24 @@ def _sync_wrapper(ff):
             release_result_after_ui_turn(error)
             return False
 
-        call_stack.put(ff.__name__)
+        call_stack.append(ff.__name__)
         old_batch = None
         result = None
+        previous_request_id = getattr(_tool_context, "request_id", None)
+        previous_function = getattr(_tool_context, "function", None)
+        _tool_context.request_id = request_id
+        _tool_context.function = ff.__name__
         try:
             old_batch = idc.batch(1)
             result = ff()
+            reported_error = _reported_error_summary(result)
+            if reported_error is not None:
+                _sync_diag(
+                    request_id,
+                    "tool_reported_error",
+                    function=ff.__name__,
+                    summary=reported_error,
+                )
         except BaseException as exc:
             result = exc
             _sync_diag(
@@ -295,10 +454,31 @@ def _sync_wrapper(ff):
                     idc.batch(old_batch)
                 except BaseException as exc:
                     cleanup_error = exc
-            try:
-                call_stack.get_nowait()
-            except queue.Empty:
-                pass
+                    _sync_diag(
+                        request_id,
+                        "cleanup_exception",
+                        function=ff.__name__,
+                        error=repr(exc),
+                        traceback=traceback.format_exc(),
+                    )
+            if call_stack and call_stack[-1] == ff.__name__:
+                call_stack.pop()
+            else:
+                _sync_diag(
+                    request_id,
+                    "call_stack_mismatch",
+                    function=ff.__name__,
+                    stack=list(call_stack),
+                )
+                call_stack.clear()
+            if previous_request_id is None:
+                _tool_context.__dict__.pop("request_id", None)
+            else:
+                _tool_context.request_id = previous_request_id
+            if previous_function is None:
+                _tool_context.__dict__.pop("function", None)
+            else:
+                _tool_context.function = previous_function
             if cleanup_error is not None and not isinstance(result, BaseException):
                 result = cleanup_error
 
@@ -307,12 +487,15 @@ def _sync_wrapper(ff):
             "ui_finished",
             function=ff.__name__,
             elapsed=time.monotonic() - callback_started_at,
-            outcome="error" if isinstance(result, BaseException) else "ok",
+            outcome=_result_outcome(result),
         )
         # Release the worker on a later Qt turn. A chained request can then be
         # posted safely even if this dispatch event has not returned yet.
         release_result_after_ui_turn(result)
         return False
+
+    runned._ida_mcp_request_id = request_id
+    runned._ida_mcp_function = ff.__name__
 
     if on_main_thread:
         runned()
@@ -364,7 +547,7 @@ def _sync_wrapper(ff):
         "worker_received",
         function=ff.__name__,
         total_elapsed=time.monotonic() - queued_at,
-        outcome="error" if isinstance(res, BaseException) else "ok",
+        outcome=_result_outcome(res),
     )
     if isinstance(res, BaseException):
         raise res
