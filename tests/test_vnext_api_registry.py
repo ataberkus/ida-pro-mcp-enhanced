@@ -213,6 +213,7 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
     assert "QTimer.singleShot(0, callback)" in source
     assert "ui_turn_released" in source
     assert "ui_event_deferred" in source
+    assert "nested_main_thread_call" in source
     assert "tool_reported_error" in source
     assert "ida_pro_enhanced_logs" in source
     assert "IDA_MCP_ERROR_LOG" in source
@@ -400,9 +401,20 @@ def test_sync_reports_structured_tool_errors(monkeypatch):
     summary = sync._reported_error_summary(result)
 
     assert "$.data[0].error='Decompilation failed'" in summary
+    assert "context={'addr': '0x401000'}" in summary
     assert "$.data[1].ok=False" in summary
     assert sync._result_outcome(result) == "reported_error"
     assert sync._result_outcome({"error": None}) == "ok"
+
+
+def test_sync_allows_nested_calls_already_on_main_thread(monkeypatch):
+    sync = _load_sync_module(monkeypatch, is_main_thread=True)
+
+    def outer():
+        return sync._sync_wrapper(lambda: "inner")
+
+    assert sync._sync_wrapper(outer) == "inner"
+    assert sync.call_stack == []
 
 
 def test_sync_writes_reported_errors_to_dedicated_log(monkeypatch, tmp_path):

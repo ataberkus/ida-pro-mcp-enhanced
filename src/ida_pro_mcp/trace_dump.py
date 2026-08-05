@@ -5,9 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-# idapro must come first to initialize idalib.
-import idapro
-from ida_pro_mcp.ida_mcp.trace import iter_idb_records
+from ida_pro_mcp.vnext.trace_reader import iter_netnode_records
 
 
 def main() -> int:
@@ -25,6 +23,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # Load idalib only after parsing so --help works without importing the GUI
+    # plugin package or its PySide6-only main-thread dispatcher.
+    import idapro
+
     if not args.idb.exists():
         parser.error(f"IDB not found: {args.idb}")
 
@@ -36,7 +38,7 @@ def main() -> int:
         out = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
         try:
             count = 0
-            for rec in iter_idb_records():
+            for rec in iter_netnode_records():
                 out.write(json.dumps(rec, separators=(",", ":"), default=str))
                 out.write("\n")
                 count += 1

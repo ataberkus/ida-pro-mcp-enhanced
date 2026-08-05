@@ -217,6 +217,8 @@ The same directory contains `ida-pro-mcp-errors-<ida-pid>.log`, a smaller error-
 
 Returned failures are logged as `tool_reported_error` with outcome `reported_error`, rather than being mistaken for successful calls. Decompiler failures additionally emit `decompile_failed` with the input and resolved function addresses, function name, Hex-Rays error code/name and description, exact failure address when supplied by Hex-Rays, exception details, and the diagnostic-log path. The `decompile` response carries the same bounded details plus a `disassemble` fallback target.
 
+For argument-level history, export the trace embedded in a closed IDB with `uv run --no-sync ida-mcp-trace-dump <database.i64> --output <trace.jsonl>`. The reader is IDALib-only and does not load the GUI plugin or PySide6. Structured errors include safe context fields such as the original input, resolved address, and reason; Python execution exceptions include an explicit `error` field alongside captured stdout/stderr.
+
 Rendered-listing text search uses five-second pages and returns a continuation cursor before common MCP client timeouts. Override the page budget with `IDA_MCP_SEARCH_PAGE_BUDGET_SEC`; values are capped at 20 seconds.
 
 The plugin and bridge are separate runtime halves; updating only the client configuration or only the copied IDA plugin can leave an older implementation active.

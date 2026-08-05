@@ -174,13 +174,14 @@ def py_eval(
             "stderr": stderr_text,
         }
 
-    except Exception:
+    except Exception as exc:
         import traceback
 
         return {
             "result": "",
-            "stdout": "",
+            "stdout": stdout_capture.getvalue(),
             "stderr": traceback.format_exc(),
+            "error": f"{type(exc).__name__}: {exc}",
         }
     finally:
         sys.stdout = old_stdout
@@ -200,7 +201,8 @@ def py_exec_file(
     code in the script.
     """
     if not os.path.isfile(file_path):
-        return {"result": "", "stdout": "", "stderr": f"File not found: {file_path}"}
+        error = f"File not found: {file_path}"
+        return {"result": "", "stdout": "", "stderr": error, "error": error}
 
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
@@ -234,13 +236,14 @@ def py_exec_file(
             "stderr": stderr_text,
         }
 
-    except Exception:
+    except Exception as exc:
         import traceback
 
         return {
             "result": "",
             "stdout": stdout_capture.getvalue(),
             "stderr": traceback.format_exc(),
+            "error": f"{type(exc).__name__}: {exc}",
         }
     finally:
         sys.stdout = old_stdout

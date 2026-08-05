@@ -19,15 +19,23 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
+from ida_pro_mcp.vnext.trace_reader import (
+    CHUNK_SIZE,
+    IDB_NETNODE_NAME,
+    TAG_DATA,
+    TAG_INDEX,
+    TAG_META,
+    iter_records_from_blobs,
+    read_netnode_blobs,
+)
 from .rpc import MCP_SERVER
 from .sync import idasync
 
 
-IDB_NETNODE_NAME = "$ ida_mcp.trace"
-_TAG_META = ord("M")
-_TAG_INDEX = ord("I")
-_TAG_DATA = ord("D")
-_CHUNK = 1024  # MAXSPECSIZE: one netnode supval
+_TAG_META = TAG_META
+_TAG_INDEX = TAG_INDEX
+_TAG_DATA = TAG_DATA
+_CHUNK = CHUNK_SIZE  # MAXSPECSIZE: one netnode supval
 _FORMAT_VERSION = 1
 
 _META_VERSION = 0
@@ -79,24 +87,7 @@ def _netnode_flush_segment(payload: bytes, record_count: int) -> None:
 @idasync
 def _netnode_iter_blobs() -> list[bytes]:
     """Return every segment's compressed blob in segment-id order."""
-    import ida_netnode
-    node = ida_netnode.netnode(IDB_NETNODE_NAME, 0, False)
-    if node == ida_netnode.BADNODE:
-        return []
-    pairs: list[tuple[int, int]] = []
-    i = node.altfirst(_TAG_INDEX)
-    while i != ida_netnode.BADNODE:
-        pairs.append((i, node.altval(i, _TAG_INDEX)))
-        i = node.altnext(i, _TAG_INDEX)
-    pairs.sort()
-    blobs: list[bytes] = []
-    for _, start in pairs:
-        blob = node.getblob(start, _TAG_DATA)
-        if isinstance(blob, tuple):
-            blob = blob[0]
-        if blob:
-            blobs.append(bytes(blob))
-    return blobs
+    return read_netnode_blobs()
 
 
 class NetnodeBackend:
@@ -143,7 +134,9 @@ class NetnodeBackend:
                 # Re-prepend the failed batch so retries keep wall-clock order.
                 with self._lock:
                     self._buffer[:0] = to_flush
-                    self._buffered_bytes = sum(len(l) + 1 for l in self._buffer)
+                    self._buffered_bytes = sum(
+                        len(line) + 1 for line in self._buffer
+                    )
                 return
 
     def close(self) -> None:
@@ -153,18 +146,7 @@ class NetnodeBackend:
 
     def iter_records(self) -> Iterator[dict]:
         self.flush()
-        for blob in _netnode_iter_blobs():
-            try:
-                raw = gzip.decompress(blob)
-            except OSError:
-                continue
-            for line in raw.splitlines():
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        yield from iter_records_from_blobs(_netnode_iter_blobs())
 
 
 def _ensure_atexit() -> None:
@@ -253,17 +235,7 @@ def iter_idb_records() -> Iterator[dict]:
     with _state_lock:
         backend = _state["idb_backend"]
     if backend is None:
-        for blob in _netnode_iter_blobs():
-            try:
-                raw = gzip.decompress(blob)
-            except OSError:
-                continue
-            for line in raw.splitlines():
-                if line:
-                    try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+        yield from iter_records_from_blobs(_netnode_iter_blobs())
         return
     yield from backend.iter_records()
 

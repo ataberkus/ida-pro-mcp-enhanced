@@ -236,7 +236,21 @@ def analyze_component(
     for ea in ea_set:
         func = ida_funcs.get_func(ea)
         if func is None:
-            functions.append({"addr": hex(ea), "error": "No function"})
+            mapped = bool(idaapi.is_loaded(ea))
+            reason = "function_not_defined" if mapped else "address_not_mapped"
+            entry = {
+                "input": ea_map[ea],
+                "addr": hex(ea),
+                "reason": reason,
+                "error": (
+                    f"No function is defined at {hex(ea)}"
+                    if mapped
+                    else f"Address {hex(ea)} is not mapped in the database"
+                ),
+            }
+            if mapped:
+                entry["fallback"] = {"tool": "disassemble", "addr": hex(ea)}
+            functions.append(entry)
             continue
         name = idaapi.get_func_name(ea) or ""
         strings_raw = extract_function_strings(ea)

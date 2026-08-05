@@ -224,7 +224,27 @@ def _reported_error_summary(value, *, max_depth: int = 4, max_items: int = 32) -
                 child_path = f"{path}.{key}"
                 if str(key).lower() in _REPORTED_ERROR_KEYS:
                     if child not in (None, False, "", [], {}):
-                        findings.append(f"{child_path}={_bounded_repr(child, 500)}")
+                        context = {
+                            context_key: item[context_key]
+                            for context_key in (
+                                "input",
+                                "addr",
+                                "function_addr",
+                                "function_name",
+                                "name",
+                                "index",
+                                "kind",
+                                "reason",
+                            )
+                            if context_key in item
+                            and not isinstance(item[context_key], (dict, list, tuple))
+                        }
+                        context_text = (
+                            f" context={_bounded_repr(context, 500)}" if context else ""
+                        )
+                        findings.append(
+                            f"{child_path}={_bounded_repr(child, 500)}{context_text}"
+                        )
                 elif isinstance(child, (dict, list, tuple)):
                     visit(child, child_path, depth + 1)
         elif isinstance(item, (list, tuple)):
@@ -405,7 +425,7 @@ def _sync_wrapper(ff):
             queued_for=callback_started_at - queued_at,
             main_thread=ida_pro.is_main_thread(),
         )
-        if call_stack:
+        if call_stack and not on_main_thread:
             last_func_name = call_stack[-1]
             error = IDASyncError(
                 f"Call stack is not empty while calling the function "
@@ -419,6 +439,14 @@ def _sync_wrapper(ff):
             )
             release_result_after_ui_turn(error)
             return False
+        if call_stack:
+            _sync_diag(
+                request_id,
+                "nested_main_thread_call",
+                function=ff.__name__,
+                parent_function=call_stack[-1],
+                depth=len(call_stack) + 1,
+            )
 
         call_stack.append(ff.__name__)
         old_batch = None
