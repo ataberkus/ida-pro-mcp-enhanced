@@ -219,7 +219,7 @@ Returned failures are logged as `tool_reported_error` with outcome `reported_err
 
 For argument-level history, export the trace embedded in a closed IDB with `uv run --no-sync ida-mcp-trace-dump <database.i64> --output <trace.jsonl>`. The reader is IDALib-only and does not load the GUI plugin or PySide6. Structured errors include safe context fields such as the original input, resolved address, and reason; Python execution exceptions include an explicit `error` field alongside captured stdout/stderr.
 
-Rendered-listing text search uses five-second pages and returns a continuation cursor before common MCP client timeouts. Override the page budget with `IDA_MCP_SEARCH_PAGE_BUDGET_SEC`; values are capped at 20 seconds.
+Rendered-listing text search uses five-second pages and returns a continuation cursor before common MCP client timeouts. When other IDA UI requests are queued, it yields a shorter 250 ms page with reason `queue_pressure` so concurrent searches can make progress instead of timing out in the main-thread queue. Override the normal page budget with `IDA_MCP_SEARCH_PAGE_BUDGET_SEC` (capped at 20 seconds) and the contended budget with `IDA_MCP_CONTENDED_SEARCH_PAGE_BUDGET_SEC` (capped at one second).
 
 The plugin and bridge are separate runtime halves; updating only the client configuration or only the copied IDA plugin can leave an older implementation active.
 

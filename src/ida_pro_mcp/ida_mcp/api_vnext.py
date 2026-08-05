@@ -387,6 +387,12 @@ def _decode_cursor(cursor: str | None) -> int:
 
 def _search_next_cursor(result: Any) -> str | None:
     """Convert a legacy search cursor into the canonical opaque cursor."""
+    if isinstance(result, list):
+        for item in result:
+            cursor = _search_next_cursor(item)
+            if cursor is not None:
+                return cursor
+        return None
     if not isinstance(result, dict):
         return None
     legacy_cursor = result.get("cursor")
@@ -418,6 +424,7 @@ def search(
 
     offset = _decode_cursor(cursor)
     normalized = kind.lower()
+    legacy_tool = normalized
     if normalized == "text":
         if len(targets) != 1:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Text search accepts one pattern")
@@ -434,20 +441,50 @@ def search(
                 "code_only": False,
             },
         )
+        legacy_tool = "search_text"
     elif normalized == "regex":
         if len(targets) != 1:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Regex search accepts one pattern")
         result = _legacy_call("find_regex", {"pattern": targets[0], "limit": limit, "offset": offset})
+        legacy_tool = "find_regex"
     elif normalized == "bytes":
         result = _legacy_call("find_bytes", {"patterns": targets, "limit": limit, "offset": offset})
-    elif normalized in {"constant", "instruction"}:
-        result = _legacy_call("find", {"type": normalized, "targets": targets, "limit": limit, "offset": offset})
+        legacy_tool = "find_bytes"
+    elif normalized == "constant":
+        result = _legacy_call(
+            "find",
+            {
+                "type": "immediate",
+                "targets": targets,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        legacy_tool = "find"
+    elif normalized == "instruction":
+        result = _legacy_call(
+            "insn_query",
+            {
+                "queries": [
+                    {
+                        "mnem": target,
+                        "offset": offset,
+                        "count": limit,
+                        "max_scan_insns": 200000,
+                        "allow_broad": True,
+                        "include_disasm": True,
+                    }
+                    for target in targets
+                ]
+            },
+        )
+        legacy_tool = "insn_query"
     else:
         raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported search kind: {kind}")
     next_cursor = _search_next_cursor(result)
     return ToolEnvelope(
         result,
-        provenance={"legacy_tool": normalized},
+        provenance={"legacy_tool": legacy_tool},
         truncated=next_cursor is not None,
         next_cursor=next_cursor,
     ).to_dict()

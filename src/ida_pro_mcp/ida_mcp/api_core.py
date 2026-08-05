@@ -20,7 +20,12 @@ import idc
 
 from . import compat
 from .rpc import tool, unsafe
-from .sync import get_search_page_budget_seconds, get_tool_deadline, idasync
+from .sync import (
+    get_pending_ui_request_count,
+    get_search_page_budget_seconds,
+    get_tool_deadline,
+    idasync,
+)
 from .utils import (
     ConvertedNumber,
     EntityQuery,
@@ -823,6 +828,7 @@ class SearchTextResult(TypedDict, total=False):
     elapsed_ms: float
     partial: bool
     reason: str
+    queue_depth: int
 
 
 def _classify_hit_lines(
@@ -985,6 +991,9 @@ def search_text(
     CHUNK_BYTES = 65536
     started_at = time.monotonic()
     page_deadline = started_at + get_search_page_budget_seconds()
+    contended_page_deadline = started_at + get_search_page_budget_seconds(
+        contended=True
+    )
     page_deadline_reason = "time_budget"
     tool_deadline = get_tool_deadline()
     if tool_deadline is not None and tool_deadline < page_deadline:
@@ -994,8 +1003,14 @@ def search_text(
     def current_stop_reason() -> str | None:
         if ida_kernwin.user_cancelled():
             return "cancelled"
-        if time.monotonic() >= page_deadline:
+        now = time.monotonic()
+        if now >= page_deadline:
             return page_deadline_reason
+        if (
+            now >= contended_page_deadline
+            and get_pending_ui_request_count() > 0
+        ):
+            return "queue_pressure"
         return None
 
     for seg_start, seg_end in segments:
@@ -1061,6 +1076,9 @@ def search_text(
         cursor = {"done": True}
 
     elapsed_ms = round((time.monotonic() - started_at) * 1000, 3)
+    queue_depth = (
+        get_pending_ui_request_count() if stop_reason == "queue_pressure" else 0
+    )
     return {
         "n": len(hits),
         "hits": hits,
@@ -1068,4 +1086,5 @@ def search_text(
         "elapsed_ms": elapsed_ms,
         "partial": stop_reason is not None,
         "reason": stop_reason or "complete",
+        "queue_depth": queue_depth,
     }

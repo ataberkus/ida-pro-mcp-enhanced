@@ -146,6 +146,67 @@ def test_text_search_uses_and_returns_canonical_cursor(monkeypatch):
     assert result["next_cursor"] == api_vnext._encode_cursor(0x401010)
 
 
+def test_constant_search_maps_to_legacy_immediate(monkeypatch):
+    _rpc, api_vnext = _load_vnext_api()
+    calls = []
+
+    def fake_legacy_call(name, arguments=None):
+        calls.append((name, arguments))
+        return [{"cursor": {"next": 35}, "matches": []}]
+
+    monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
+    incoming = api_vnext._encode_cursor(10)
+    result = api_vnext.search("constant", ["0x1234"], 25, incoming)
+
+    assert calls == [
+        (
+            "find",
+            {
+                "type": "immediate",
+                "targets": ["0x1234"],
+                "limit": 25,
+                "offset": 10,
+            },
+        )
+    ]
+    assert result["provenance"]["legacy_tool"] == "find"
+    assert result["next_cursor"] == api_vnext._encode_cursor(35)
+
+
+def test_instruction_search_maps_to_broad_insn_query(monkeypatch):
+    _rpc, api_vnext = _load_vnext_api()
+    calls = []
+
+    def fake_legacy_call(name, arguments=None):
+        calls.append((name, arguments))
+        return [{"cursor": {"next": 17}, "matches": []}]
+
+    monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
+    incoming = api_vnext._encode_cursor(7)
+    result = api_vnext.search("instruction", ["mov", "xor"], 10, incoming)
+
+    assert calls == [
+        (
+            "insn_query",
+            {
+                "queries": [
+                    {
+                        "mnem": mnemonic,
+                        "offset": 7,
+                        "count": 10,
+                        "max_scan_insns": 200000,
+                        "allow_broad": True,
+                        "include_disasm": True,
+                    }
+                    for mnemonic in ("mov", "xor")
+                ]
+            },
+        )
+    ]
+    assert result["provenance"]["legacy_tool"] == "insn_query"
+    assert result["next_cursor"] == api_vnext._encode_cursor(17)
+
+
 def test_mutation_aliases_reshape_set_name_and_rename_func():
     _rpc, api_vnext = _load_vnext_api()
     ops = api_vnext._parse_operations(
@@ -218,7 +279,10 @@ def test_sync_timeout_and_reentrancy_guards_remain_in_source():
     assert "ida_pro_enhanced_logs" in source
     assert "IDA_MCP_ERROR_LOG" in source
     assert "IDA_MCP_SEARCH_PAGE_BUDGET_SEC" in source
+    assert "IDA_MCP_CONTENDED_SEARCH_PAGE_BUDGET_SEC" in source
     assert "get_search_page_budget_seconds()" in api_core_source
+    assert "get_pending_ui_request_count()" in api_core_source
+    assert 'return "queue_pressure"' in api_core_source
     assert "heads_seen % 64" in api_core_source
     assert 'page_deadline_reason = "time_budget"' in api_core_source
 
@@ -376,6 +440,7 @@ def test_sync_dispatcher_defers_recursive_qt_delivery(monkeypatch):
         sync._post_to_main_thread(second)
         nested_receiver, nested_event = posted_events.pop(0)
         assert nested_receiver.event(nested_event) is True
+        assert sync.get_pending_ui_request_count() == 1
         order.append("first-end")
 
     sync._post_to_main_thread(first)
@@ -387,6 +452,7 @@ def test_sync_dispatcher_defers_recursive_qt_delivery(monkeypatch):
     assert drain_receiver.event(drain_event) is True
     assert order == ["first-start", "first-end", "second"]
     assert posted_events == []
+    assert sync.get_pending_ui_request_count() == 0
 
 
 def test_sync_reports_structured_tool_errors(monkeypatch):
@@ -515,10 +581,18 @@ def test_search_page_budget_config_is_bounded(monkeypatch):
     sync = _load_sync_module(monkeypatch, is_main_thread=True)
 
     monkeypatch.delenv("IDA_MCP_SEARCH_PAGE_BUDGET_SEC", raising=False)
+    monkeypatch.delenv("IDA_MCP_CONTENDED_SEARCH_PAGE_BUDGET_SEC", raising=False)
     assert sync.get_search_page_budget_seconds() == 5.0
+    assert sync.get_search_page_budget_seconds(contended=True) == 0.25
     monkeypatch.setenv("IDA_MCP_SEARCH_PAGE_BUDGET_SEC", "invalid")
     assert sync.get_search_page_budget_seconds() == 5.0
+    monkeypatch.setenv("IDA_MCP_CONTENDED_SEARCH_PAGE_BUDGET_SEC", "invalid")
+    assert sync.get_search_page_budget_seconds(contended=True) == 0.25
     monkeypatch.setenv("IDA_MCP_SEARCH_PAGE_BUDGET_SEC", "2.5")
     assert sync.get_search_page_budget_seconds() == 2.5
+    monkeypatch.setenv("IDA_MCP_CONTENDED_SEARCH_PAGE_BUDGET_SEC", "0.1")
+    assert sync.get_search_page_budget_seconds(contended=True) == 0.1
+    monkeypatch.setenv("IDA_MCP_SEARCH_PAGE_BUDGET_SEC", "0.05")
+    assert sync.get_search_page_budget_seconds(contended=True) == 0.05
     monkeypatch.setenv("IDA_MCP_SEARCH_PAGE_BUDGET_SEC", "100")
     assert sync.get_search_page_budget_seconds() == 20.0
