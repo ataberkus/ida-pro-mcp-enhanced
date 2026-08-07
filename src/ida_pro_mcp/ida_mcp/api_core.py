@@ -15,6 +15,7 @@ import idautils
 import ida_loader
 import ida_nalt
 import ida_segment
+import ida_strlist
 import ida_typeinf
 import idc
 
@@ -50,11 +51,39 @@ _strings_cache: list[tuple[int, str]] | None = None
 _server_started_at = time.time()
 
 
+def _decode_strlist_item(si: "ida_strlist.string_info_t") -> str:
+    """Decode a strlist item to text without constructing idautils.Strings()."""
+    if getattr(si, "type", None) == ida_nalt.STRTYPE_DECOMP:
+        text = getattr(si, "decompiler_string", "") or ""
+        return text if isinstance(text, str) else str(text)
+    raw = ida_bytes.get_strlit_contents(si.ea, si.length, si.type)
+    if not raw:
+        return ""
+    if isinstance(raw, (bytes, bytearray)):
+        return raw.decode("UTF-8", "replace")
+    return str(raw)
+
+
 def _get_strings_cache() -> list[tuple[int, str]]:
-    """Get cached strings, building cache on first access."""
+    """Get cached strings, building cache on first access.
+
+    Uses the existing IDA string list. Does NOT call idautils.Strings(),
+    which always rebuilds via build_strlist() and can take minutes on large IDBs.
+    """
     global _strings_cache
     if _strings_cache is None:
-        _strings_cache = [(s.ea, str(s)) for s in idautils.Strings() if s is not None]
+        qty = int(ida_strlist.get_strlist_qty())
+        # Only build when the list is empty; never force a full rebuild on cache miss.
+        if qty <= 0:
+            ida_strlist.build_strlist()
+            qty = int(ida_strlist.get_strlist_qty())
+        built: list[tuple[int, str]] = []
+        si = ida_strlist.string_info_ex_t()
+        for idx in range(qty):
+            if not ida_strlist.get_strlist_item_ex(si, idx):
+                continue
+            built.append((si.ea, _decode_strlist_item(si)))
+        _strings_cache = built
     return _strings_cache
 
 
