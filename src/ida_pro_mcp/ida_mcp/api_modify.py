@@ -412,6 +412,23 @@ def rename(batch: RenameBatch | dict) -> dict:
                 ea = parse_address(addr_text)
                 func = ida_funcs.get_func(ea)
                 if not func:
+                    if ea != idaapi.BADADDR:
+                        old_name = idaapi.get_name(ea) or None
+                        success, error = _set_name_checked(ea, str(new_name))
+                        result = {
+                            "addr": addr_text,
+                            "old": old_name,
+                            "name": str(new_name),
+                            "ok": success,
+                            "error": error,
+                            "dry_run": dry_run,
+                        }
+                        results.append(result)
+                        if not success and stop_on_error:
+                            halted = True
+                            break
+                        continue
+
                     result = {
                         "addr": addr_text,
                         "name": new_name,

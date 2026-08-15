@@ -990,6 +990,8 @@ _MUTATION_KIND_ALIASES = {
     "set_name": "rename",
     "rename_func": "rename",
     "rename_function": "rename",
+    "rename_global": "rename",
+    "rename_data": "rename",
 }
 
 _RENAME_BATCH_KEYS = frozenset({"func", "data", "global", "globals", "local", "stack"})
@@ -1062,7 +1064,7 @@ def _reshape_mutation_arguments(kind: str, arguments: dict[str, Any], *, index: 
 
     if canonical == "rename":
         if any(key in args for key in _RENAME_BATCH_KEYS):
-            for key in ("func", "data", "local", "stack"):
+            for key in ("func", "data", "global", "globals", "local", "stack"):
                 items = _as_dict_list(args.get(key))
                 if items is None:
                     continue

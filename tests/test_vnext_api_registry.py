@@ -230,6 +230,23 @@ def test_mutation_aliases_reshape_set_name_and_rename_func():
     assert ops[1].arguments == {"func": [{"addr": "0x402000", "name": "bar"}]}
     assert ops[2].arguments == {"func": [{"addr": "0x403000", "name": "baz"}]}
 
+    # Verify global and data rename aliases and batch forms
+    global_ops = api_vnext._parse_operations(
+        [
+            {
+                "kind": "rename_global",
+                "arguments": {"addr": "0x58ABC1B8", "name": "g_pSecurityContext"},
+            },
+            {
+                "kind": "rename",
+                "arguments": {"global": [{"addr": "0x58ABC230", "name": "g_pK32GetMappedFileNameW"}]},
+            },
+        ]
+    )
+    assert [op.kind for op in global_ops] == ["rename", "rename"]
+    assert global_ops[0].arguments == {"func": [{"addr": "0x58ABC1B8", "name": "g_pSecurityContext"}]}
+    assert global_ops[1].arguments == {"global": [{"addr": "0x58ABC230", "name": "g_pK32GetMappedFileNameW"}]}
+
 
 def test_parse_operations_keeps_flat_sibling_fields():
     _rpc, api_vnext = _load_vnext_api()
