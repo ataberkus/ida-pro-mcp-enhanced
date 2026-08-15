@@ -60,13 +60,29 @@ _DEBUG_SNAPSHOTS: dict[str, dict[str, Any]] = {}
 
 
 def _ida_synchronized(func):
-    """Apply the IDA main-thread wrapper lazily to preserve pure imports."""
+    """Run *func* on the IDA main thread, lazily wrapping with idasync.
+
+    Direct-call when already on the IDA main thread so IDB hooks and nested
+    helpers do not re-enter the sync queue. Worker/job threads still dispatch.
+    """
+
+    synced = None
 
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
+        nonlocal synced
+        try:
+            import ida_pro
+
+            if ida_pro.is_main_thread():
+                return func(*args, **kwargs)
+        except Exception:
+            pass
         from .sync import idasync
 
-        return idasync(func)(*args, **kwargs)
+        if synced is None:
+            synced = idasync(func)
+        return synced(*args, **kwargs)
 
     return wrapped
 
@@ -160,7 +176,8 @@ def _legacy_call(name: str, arguments: dict[str, Any] | None = None) -> Any:
     return response.get("result") if response else None
 
 
-def _database_id() -> str:
+def _database_id_lookup() -> str:
+    """Resolve the IDB identity. Must run on the IDA main thread."""
     try:
         import ida_loader
 
@@ -178,6 +195,19 @@ def _database_id() -> str:
     except Exception:
         pass
     return get_current_transport_session_id() or "active"
+
+
+_database_id_sync = _ida_synchronized(_database_id_lookup)
+
+
+def _database_id() -> str:
+    """Return the IDB identity.
+
+    IDA 9.4 raises "Function can be called from the main thread only" for the
+    path lookups above, so this dispatches to the IDA main thread when called
+    from an MCP worker or job thread.
+    """
+    return _database_id_sync()
 
 
 def _revision_changed(event: str) -> None:
@@ -342,6 +372,11 @@ def _install_debug_hook() -> None:
 
 
 def _ida_capabilities() -> CapabilityManifest:
+    """Return runtime capabilities, resolving IDA state on the main thread."""
+    return _ida_capabilities_sync()
+
+
+def _ida_capabilities_impl() -> CapabilityManifest:
     ida_version = None
     runtime = "gui"
     hexrays = False
@@ -381,6 +416,9 @@ def _ida_capabilities() -> CapabilityManifest:
         resource_subscriptions=MCP_SERVER.resource_subscriptions_supported,
         database_revision=_REVISIONS.current(_database_id()),
     )
+
+
+_ida_capabilities_sync = _ida_synchronized(_ida_capabilities_impl)
 
 
 def _encode_cursor(offset: int) -> str:
@@ -543,7 +581,7 @@ def memory_read(
     queries: Annotated[
         list[dict[str, Any]] | list[str],
         "Address queries. bytes: '0x...' (size defaults to 16) or {addr,size}; "
-        "integer: {addr,ty}; string/global: address or name strings",
+        "integer: {addr,ty} where ty is u8/u32/uint32/i16le/u64be/etc; string/global: address or name strings",
     ],
 ) -> dict[str, Any]:
     """Read static database bytes, integers, strings, or globals."""
@@ -1114,6 +1152,7 @@ def _mutation_before_state(operation: MutationOperation) -> Any:
     return None
 
 
+@_ida_synchronized
 def _perform_undo() -> bool:
     try:
         import ida_undo

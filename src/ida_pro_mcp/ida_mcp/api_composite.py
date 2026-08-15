@@ -424,9 +424,12 @@ def diff_before_after(
             type_str = action_args.get("type")
             if not type_str:
                 return {"error": "action_args must contain 'type'"}
+            decl_str = type_str.strip()
+            if not decl_str.endswith(";"):
+                decl_str += ";"
             tif = ida_typeinf.tinfo_t()
             til = ida_typeinf.get_idati()
-            parsed = ida_typeinf.parse_decl(tif, til, type_str, ida_typeinf.PT_SIL)
+            parsed = ida_typeinf.parse_decl(tif, til, decl_str, ida_typeinf.PT_SIL)
             if parsed is None:
                 return {"error": f"Failed to parse type: {type_str!r}"}
             ok = ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)

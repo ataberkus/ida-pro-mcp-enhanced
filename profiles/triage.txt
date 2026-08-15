@@ -1,20 +1,10 @@
-# Minimal triage profile for ida-pro-mcp
-#
-# A focused starter set for first-pass binary assessment:
-# enumerate, decompile, trace xrefs.
-# Small enough to keep small models on-task.
-#
-# Use with: idalib-mcp --profile profiles/triage.txt <binary>
+# Minimal vNext triage profile for ida-pro-mcp
+# schema-version: 2026-08-01
 
-list_funcs
-list_globals
-imports
-lookup_funcs
-
+server_capabilities
+entity_query
+search
+memory_read
+disassemble
 decompile
-disasm
-
-xrefs_to
-callees
-
-get_string
+analysis_run

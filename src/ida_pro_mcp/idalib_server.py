@@ -17,10 +17,7 @@ from ida_pro_mcp.ida_mcp import (
     configure_tool_policy,
     configure_workspace_policy,
 )
-from ida_pro_mcp.ida_mcp.api_core import (
-    ServerWarmupResult,
-    server_warmup,
-)
+from ida_pro_mcp.ida_mcp.api_core import server_warmup
 from ida_pro_mcp.ida_mcp.discovery import register_instance, unregister_instance
 from ida_pro_mcp.ida_mcp.http import IdaMcpHttpRequestHandler
 from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile, load_profile_scopes
@@ -48,7 +45,7 @@ class IdalibSessionListInfo(IdalibSessionInfo, total=False):
 class IdalibOpenResult(TypedDict, total=False):
     success: bool
     session: IdalibSessionInfo
-    warmup: ServerWarmupResult | None
+    warmup: dict[str, Any] | None
     message: str
     error: str
 
@@ -129,7 +126,7 @@ def idb_open(
             session_id=preferred_session_id or None,
         )
         session = manager.activate_session(opened_session_id)
-        warmup: ServerWarmupResult | None = None
+        warmup: dict[str, Any] | None = None
         if build_caches or init_hexrays:
             warmup = server_warmup(
                 wait_auto_analysis=False,

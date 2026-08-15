@@ -65,14 +65,27 @@ def test_get_int_reads_common_integer_sizes():
         skip_test("binary has no segments")
 
     start_addr, _ = seg
-    for ty in ("u8", "u16", "u32", "u64"):
+    for ty, prefix in (
+        ("u8", "u8"),
+        ("u16", "u16"),
+        ("u32", "u32"),
+        ("u64", "u64"),
+        ("uint32", "u32"),
+        ("uint64", "u64"),
+        ("uint32_t", "u32"),
+        ("int32", "i32"),
+    ):
         result = get_int({"addr": start_addr, "ty": ty})
         assert_is_list(result, min_length=1)
         entry = result[0]
         assert entry["addr"] == start_addr
-        assert entry["ty"].startswith(ty)
+        assert entry["ty"].startswith(prefix), f"{ty} normalized to {entry['ty']!r}"
         assert entry["error"] is None
         assert isinstance(entry["value"], int)
+
+    rejected = get_int({"addr": start_addr, "ty": "uint"})[0]
+    assert rejected.get("error")
+    assert "Invalid integer class" in rejected["error"]
 
 
 @test(binary="crackme03.elf")

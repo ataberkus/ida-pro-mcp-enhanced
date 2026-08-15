@@ -49,7 +49,12 @@ def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[dict]:
     return results
 
 
-_INT_CLASS_RE = re.compile(r"^(?P<sign>[iu])(?P<bits>8|16|32|64)(?P<endian>le|be)?$")
+_INT_CLASS_RE = re.compile(
+    r"^(?:(?P<unsigned>u(?:int)?)|(?P<signed>i(?:nt)?))"
+    r"(?P<bits>8|16|32|64)"
+    r"(?:_t)?"
+    r"(?P<endian>le|be)?$"
+)
 
 
 def _parse_int_class(text: str) -> tuple[int, bool, str, str]:
@@ -62,7 +67,7 @@ def _parse_int_class(text: str) -> tuple[int, bool, str, str]:
         raise ValueError(f"Invalid integer class: {text}")
 
     bits = int(match.group("bits"))
-    signed = match.group("sign") == "i"
+    signed = match.group("signed") is not None
     endian = match.group("endian") or "le"
     byte_order = "little" if endian == "le" else "big"
     normalized = f"{'i' if signed else 'u'}{bits}{endian}"
@@ -90,7 +95,7 @@ def _parse_int_value(text: str, signed: bool, bits: int) -> int:
 def get_int(
     queries: Annotated[
         list[IntRead] | IntRead,
-        "Integer read requests (ty, addr). ty: i8/u64/i16le/i16be/etc",
+        "Integer read requests (ty, addr). ty: u8/u32/uint32/i16le/u64be/etc",
     ],
 ) -> list[dict]:
     """Read integer values from memory addresses"""

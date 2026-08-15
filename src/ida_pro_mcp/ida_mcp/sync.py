@@ -319,74 +319,101 @@ def _load_qt_core():
     return QtCore
 
 
-_qt_core = _load_qt_core()
-_DISPATCH_EVENT_TYPE = _qt_core.QEvent.Type(_qt_core.QEvent.registerEventType())
+_HEADLESS = False
+
+try:
+    _qt_core = _load_qt_core()
+except ImportError:
+    # Headless idalib (IDA 9.2+): PySide6/PyQt5 refuse to load outside the
+    # GUI. Fall back to IDA's execute_sync scheduler, which works in both
+    # GUI and headless modes.
+    _HEADLESS = True
+    _qt_core = None
+
+if _HEADLESS:
+    _DISPATCH_EVENT_TYPE = None
+    _QtDispatchEvent = None  # type: ignore[assignment,misc]
+    _QtMainThreadDispatcher = None  # type: ignore[assignment,misc]
+    _qt_main_thread_dispatcher = None
+else:
+    _DISPATCH_EVENT_TYPE = _qt_core.QEvent.Type(_qt_core.QEvent.registerEventType())
 
 
-class _QtDispatchEvent(_qt_core.QEvent):
-    def __init__(self, callback):
-        super().__init__(_DISPATCH_EVENT_TYPE)
-        self.callback = callback
+    class _QtDispatchEvent(_qt_core.QEvent):
+        def __init__(self, callback):
+            super().__init__(_DISPATCH_EVENT_TYPE)
+            self.callback = callback
 
 
-class _QtMainThreadDispatcher(_qt_core.QObject):
-    def __init__(self):
-        super().__init__()
-        self._pending_callbacks = []
-        self._active_callback = None
-
-    def _run_next(self):
-        if self._active_callback is not None or not self._pending_callbacks:
-            return
-        callback = self._pending_callbacks.pop(0)
-        self._active_callback = callback
-        try:
-            callback()
-        finally:
+    class _QtMainThreadDispatcher(_qt_core.QObject):
+        def __init__(self):
+            super().__init__()
+            self._pending_callbacks = []
             self._active_callback = None
-            if self._pending_callbacks:
-                # Drain on a fresh event-loop turn. Hex-Rays may pump nested Qt
-                # events while decompiling; keeping the dispatcher active until
-                # the callback returns prevents those deliveries from entering
-                # IDA concurrently.
-                _qt_core.QCoreApplication.postEvent(
-                    self, _QtDispatchEvent(None)
-                )
 
-    def event(self, event):
-        if event.type() == _DISPATCH_EVENT_TYPE:
-            callback = event.callback
-            event.callback = None
-            if callback is not None:
-                self._pending_callbacks.append(callback)
-            if self._active_callback is not None:
-                request_id = getattr(callback, "_ida_mcp_request_id", 0)
-                _sync_diag(
-                    request_id,
-                    "ui_event_deferred",
-                    function=getattr(callback, "_ida_mcp_function", "<drain>"),
-                    active_request=getattr(
-                        self._active_callback, "_ida_mcp_request_id", None
-                    ),
-                    pending=len(self._pending_callbacks),
-                )
+        def _run_next(self):
+            if self._active_callback is not None or not self._pending_callbacks:
+                return
+            callback = self._pending_callbacks.pop(0)
+            self._active_callback = callback
+            try:
+                callback()
+            finally:
+                self._active_callback = None
+                if self._pending_callbacks:
+                    # Drain on a fresh event-loop turn. Hex-Rays may pump nested Qt
+                    # events while decompiling; keeping the dispatcher active until
+                    # the callback returns prevents those deliveries from entering
+                    # IDA concurrently.
+                    _qt_core.QCoreApplication.postEvent(
+                        self, _QtDispatchEvent(None)
+                    )
+
+        def event(self, event):
+            if event.type() == _DISPATCH_EVENT_TYPE:
+                callback = event.callback
+                event.callback = None
+                if callback is not None:
+                    self._pending_callbacks.append(callback)
+                if self._active_callback is not None:
+                    request_id = getattr(callback, "_ida_mcp_request_id", 0)
+                    _sync_diag(
+                        request_id,
+                        "ui_event_deferred",
+                        function=getattr(callback, "_ida_mcp_function", "<drain>"),
+                        active_request=getattr(
+                            self._active_callback, "_ida_mcp_request_id", None
+                        ),
+                        pending=len(self._pending_callbacks),
+                    )
+                    return True
+                self._run_next()
                 return True
-            self._run_next()
-            return True
-        return super().event(event)
+            return super().event(event)
 
 
-_qt_main_thread_dispatcher = _QtMainThreadDispatcher()
+    _qt_main_thread_dispatcher = _QtMainThreadDispatcher()
+
+
+_SYNC_SCHEDULER = "execute_sync" if _HEADLESS else "qt_post_event"
 
 
 def _post_to_main_thread(callback) -> None:
     """Post a thread-safe event to the Qt object owned by IDA's main thread."""
+    if _HEADLESS:
+        idaapi.execute_sync(callback, idaapi.MFF_WRITE)
+        return
     event = _QtDispatchEvent(callback)
     _qt_core.QCoreApplication.postEvent(_qt_main_thread_dispatcher, event)
 
 
 def _defer_until_next_ui_turn(callback) -> None:
     """Run callback on a later Qt event-loop turn."""
+    if _HEADLESS:
+        # No Qt event loop exists; execute_sync already ran the callback on
+        # the IDA main thread, so release the worker immediately.
+        callback()
+        return
     _qt_core.QTimer.singleShot(0, callback)
 
 
@@ -395,7 +422,7 @@ _sync_diag(
     0,
     "module_loaded",
     queue_timeout=_get_sync_queue_timeout_seconds(),
-    scheduler="qt_post_event",
+    scheduler=_SYNC_SCHEDULER,
     log_path=_SYNC_LOG_PATH,
     error_log_path=_ERROR_LOG_PATH,
 )
@@ -580,7 +607,7 @@ def _sync_wrapper(ff):
                 request_id,
                 "queue_submit_exception",
                 function=ff.__name__,
-                scheduler="qt_post_event",
+                scheduler=_SYNC_SCHEDULER,
                 error=repr(exc),
                 traceback=traceback.format_exc().replace("\n", "\\n"),
             )
@@ -593,7 +620,7 @@ def _sync_wrapper(ff):
             request_id,
             "queued",
             function=ff.__name__,
-            scheduler="qt_post_event",
+            scheduler=_SYNC_SCHEDULER,
         )
 
         # Wait for UI start. If another MCP tool is already running on the UI
@@ -768,6 +795,8 @@ def tool_timeout(seconds: float):
 
 def is_window_active():
     """Returns whether IDA is currently active."""
+    if _HEADLESS:
+        return False
     # Source: https://github.com/OALabs/hexcopy-ida/blob/8b0b2a3021d7dc9010c01821b65a80c47d491b61/hexcopy.py#L30
     using_pyside6 = (ida_major > 9) or (ida_major == 9 and ida_minor >= 2)
 

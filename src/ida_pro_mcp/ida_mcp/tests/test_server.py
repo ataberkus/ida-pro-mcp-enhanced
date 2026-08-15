@@ -203,11 +203,11 @@ def test_unsafe_tools_registered():
 
 
 @test()
-def test_unsafe_tools_present_by_default():
-    """Unsafe tools should be in the registry by default (plugin behavior)."""
+def test_unsafe_tools_hidden_by_default():
+    """Python tools remain opt-in and are hidden from the default vNext profile."""
     tool_names = set(MCP_SERVER.tools.methods)
     for name in ("py_eval", "py_exec_file"):
-        assert name in tool_names, f"{name} should be present by default"
+        assert name not in tool_names, f"{name} should be hidden by default"
 
 
 @test()

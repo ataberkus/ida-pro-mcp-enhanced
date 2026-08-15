@@ -65,14 +65,14 @@ class IntRead(TypedDict):
     """Integer read request"""
 
     addr: Annotated[str, "Address to read from (hex or decimal)"]
-    ty: Annotated[str, "Integer class (i8/u64/i16le/i16be/etc)"]
+    ty: Annotated[str, "Integer class (u8/u32/uint32/i16le/u64be/etc)"]
 
 
 class IntWrite(TypedDict):
     """Integer write request"""
 
     addr: Annotated[str, "Address to write to (hex or decimal)"]
-    ty: Annotated[str, "Integer class (i8/u64/i16le/i16be/etc)"]
+    ty: Annotated[str, "Integer class (u8/u32/uint32/i16le/u64be/etc)"]
     value: Annotated[
         str,
         "Integer value as string (decimal or 0x..; negatives allowed for signed)",

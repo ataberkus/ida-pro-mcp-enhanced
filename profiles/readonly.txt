@@ -1,52 +1,22 @@
-# Read-only profile for ida-pro-mcp
-#
-# Exposes analysis tools that never mutate the IDB: decompilation, disassembly,
-# xrefs, queries, reads. No renaming, commenting, typing, or patching.
-#
-# Use with: idalib-mcp --profile profiles/readonly.txt <binary>
+# ida-pro-mcp vNext canonical read-only profile
+# schema-version: 2026-08-01
 
-# --- Core metadata & listings ---
-server_health
-list_funcs
-list_globals
-imports
-imports_query
-lookup_funcs
-func_query
+server_capabilities
 entity_query
-int_convert
-find_regex
-
-# --- Analysis (decomp / disasm / xrefs) ---
+search
+memory_read
+disassemble
 decompile
-disasm
-func_profile
-analyze_batch
-xrefs_to
-xref_query
-xrefs_to_field
-callees
-basic_blocks
-find_bytes
-find
-insn_query
-export_funcs
-callgraph
-
-# --- Composite analyses ---
-analyze_function
-analyze_component
-trace_data_flow
-
-# --- Types (read-only) ---
-read_struct
 type_query
-
-# --- Memory reads ---
-get_bytes
-get_int
-get_string
-get_global_value
-
-# --- Stack (read-only) ---
-stack_frame
+int_convert
+signature_create
+analysis_run
+graph_query
+dataflow_trace
+taint_analyze
+job_status
+job_cancel
+job_result
+investigation_start
+investigation_get
+mutation_preview

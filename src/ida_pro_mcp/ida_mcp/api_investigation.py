@@ -380,7 +380,7 @@ def _next_actions(leads: list[dict[str, Any]]) -> list[dict[str, Any]]:
 @tool
 @idasync
 @tool_timeout(120.0)
-def mcpinvestigate_binary(
+def investigate_binary(
     goal: Annotated[str, "Analysis goal: general|malware|vuln|crackme|comprehension"] = "general",
     depth: Annotated[str, "Analysis depth; only 'fast' is implemented in this version"] = "fast",
     max_leads: Annotated[int, "Maximum ranked leads to return, capped at 50"] = 15,
