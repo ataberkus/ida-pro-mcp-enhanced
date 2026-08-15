@@ -241,6 +241,21 @@ def dbg_exit():
 @unsafe
 @tool
 @idasync
+def dbg_detach():
+    """Detach the debugger without terminating the process."""
+    dbg_ensure_running()
+    detach = getattr(ida_dbg, "detach_process", None) or getattr(idaapi, "detach_process", None)
+    if detach is None:
+        raise IDAError("Debugger backend does not support detach")
+    if detach():
+        return
+    raise IDAError("Failed to detach debugger")
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
 def dbg_continue() -> str:
     """Resume execution in active debugger session."""
     dbg_ensure_running()

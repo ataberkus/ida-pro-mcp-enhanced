@@ -1,4 +1,5 @@
 import functools
+import re
 import itertools
 import logging
 import os
@@ -20,7 +21,12 @@ from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
 # IDA Synchronization & Error Handling
 # ============================================================================
 
-ida_major, ida_minor = map(int, idaapi.get_kernel_version().split("."))
+def _parse_kernel_version(version: str) -> tuple[int, int]:
+    nums = [int(part) for part in re.findall(r"\d+", version)]
+    return (nums[0] if nums else 0, nums[1] if len(nums) > 1 else 0)
+
+
+ida_major, ida_minor = _parse_kernel_version(idaapi.get_kernel_version())
 
 
 class IDAError(McpToolError):
@@ -115,6 +121,18 @@ def get_pending_ui_request_count() -> int:
         return 0
     pending = getattr(dispatcher, "_pending_callbacks", ())
     return len(pending)
+
+
+def get_active_ui_request_function() -> str | None:
+    """Return the function name of the active Qt UI request, if any."""
+    dispatcher = globals().get("_qt_main_thread_dispatcher")
+    if dispatcher is None:
+        return None
+    active = getattr(dispatcher, "_active_callback", None)
+    if active is None:
+        return None
+    name = getattr(active, "_ida_mcp_function", None)
+    return str(name) if name else "<active>"
 
 
 def _get_sync_queue_timeout_seconds() -> float:
@@ -578,21 +596,48 @@ def _sync_wrapper(ff):
             scheduler="qt_post_event",
         )
 
-        if not started_event.wait(queue_timeout):
+        # Wait for UI start. If another MCP tool is already running on the UI
+        # thread (e.g. survey_binary for 20s+), keep extending the idle timer so
+        # concurrent callers do not abandon and skip late callbacks.
+        idle_deadline = time.monotonic() + queue_timeout
+        while not started_event.is_set():
+            remaining = idle_deadline - time.monotonic()
+            if remaining <= 0:
+                if started_event.is_set():
+                    break
+                active_function = get_active_ui_request_function()
+                if active_function is not None:
+                    idle_deadline = time.monotonic() + queue_timeout
+                    _sync_diag(
+                        request_id,
+                        "queue_wait_extended",
+                        function=ff.__name__,
+                        waited=time.monotonic() - queued_at,
+                        active_function=active_function,
+                        queue_timeout=queue_timeout,
+                    )
+                    continue
+                break
+            started_event.wait(timeout=min(1.0, max(remaining, 0.05)))
+
+        if not state["started"]:
             with state_lock:
                 timed_out_before_start = not state["started"]
                 if timed_out_before_start:
                     state["abandoned"] = True
             if timed_out_before_start:
+                waited = time.monotonic() - queued_at
                 _sync_diag(
                     request_id,
                     "queue_start_timeout",
                     function=ff.__name__,
-                    waited=queue_timeout,
+                    waited=waited,
+                    queue_timeout=queue_timeout,
                 )
                 raise IDASyncError(
                     f"IDA Qt UI queue did not start request {request_id} "
-                    f"({ff.__name__}) within {queue_timeout:.2f}s; "
+                    f"({ff.__name__}) within {waited:.2f}s idle "
+                    f"(limit {queue_timeout:.2f}s); "
                     f"diagnostics: {_SYNC_LOG_PATH}"
                 )
 

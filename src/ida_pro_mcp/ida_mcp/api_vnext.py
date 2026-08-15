@@ -19,6 +19,11 @@ from typing import Annotated, Any
 from urllib.parse import quote, unquote
 from uuid import uuid4
 
+from ida_pro_mcp.vnext.analysis import (
+    node_matches,
+    normalize_reference_flow_graph,
+    normalized_match_token,
+)
 from ida_pro_mcp.vnext.contracts import (
     AnalysisEngine,
     AnalysisGraph,
@@ -135,6 +140,8 @@ def _legacy_call(name: str, arguments: dict[str, Any] | None = None) -> Any:
             return implementation(**(arguments or {}))
         except VNextError:
             raise
+        except (TypeError, ValueError, KeyError) as exc:
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"Legacy tool failed: {name}: {exc}") from exc
         except Exception as exc:
             raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool failed: {name}: {exc}") from exc
 
@@ -154,6 +161,14 @@ def _legacy_call(name: str, arguments: dict[str, Any] | None = None) -> Any:
 
 
 def _database_id() -> str:
+    try:
+        import ida_loader
+
+        path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+        if path:
+            return str(Path(path).resolve())
+    except Exception:
+        pass
     try:
         import idaapi
 
@@ -605,23 +620,33 @@ def analysis_run(
         return ToolEnvelope(_analysis_sync(normalized, targets, effective_options), provenance={"mode": normalized}).to_dict()
 
     def run(context: JobContext) -> dict[str, Any]:
-        results: list[Any] = []
         context.progress(0.05, "triage")
-        results.append(_analysis_sync("triage", [], effective_options))
+        triage = _analysis_sync("triage", [], effective_options)
+        functions: list[dict[str, Any]] = []
         total = max(1, len(targets))
+        depth = max(1, min(int(effective_options.get("max_depth", 3) or 3), 20))
+        direction = str(effective_options.get("direction", "both") or "both")
         for index, target in enumerate(targets):
             context.check_cancelled()
-            results.append(_analysis_sync("function", [target], effective_options))
+            analysis = _analysis_sync("function", [target], effective_options)
+            try:
+                flow = dataflow_trace(target, direction, depth)
+            except Exception as exc:
+                flow = {"error": str(exc), "target": target}
+            functions.append({"target": target, "analysis": analysis, "dataflow": flow})
             context.progress(0.1 + 0.8 * ((index + 1) / total), f"analyzed {target}")
         context.progress(0.95, "assembling result")
-        return ToolEnvelope(results, provenance={"mode": "deep", "database": _database_id()}).to_dict()
+        return ToolEnvelope(
+            {"triage": triage, "functions": functions},
+            provenance={"mode": "deep", "database": _database_id()},
+        ).to_dict()
 
     return _jobs().submit("analysis.deep", run, database=_database_id(), resumable=True).to_dict(include_result=False)
 
 
 @tool
 def graph_query(
-    kind: Annotated[str, "xrefs, calls, or cfg"],
+    kind: Annotated[str, "xrefs, xrefs_from, xrefs_both, calls, or cfg"],
     targets: Annotated[list[str], "Root functions or addresses"],
     max_depth: Annotated[int, "Maximum traversal depth"] = 3,
     limit: Annotated[int, "Maximum nodes or blocks"] = 1000,
@@ -630,6 +655,16 @@ def graph_query(
 
     if kind == "xrefs":
         result = _legacy_call("xrefs_to", {"addrs": targets, "limit": limit})
+    elif kind == "xrefs_from":
+        result = _legacy_call(
+            "xref_query",
+            {"queries": [{"query": target, "direction": "from", "count": limit} for target in targets]},
+        )
+    elif kind == "xrefs_both":
+        result = _legacy_call(
+            "xref_query",
+            {"queries": [{"query": target, "direction": "both", "count": limit} for target in targets]},
+        )
     elif kind == "calls":
         result = _legacy_call("callgraph", {"roots": targets, "max_depth": max_depth, "max_nodes": limit, "max_edges": limit * 2, "max_edges_per_func": 100})
     elif kind == "cfg":
@@ -656,19 +691,24 @@ def dataflow_trace(
             raise
         fallback_warning = f"Hex-Rays microcode unavailable: {exc}"
 
-    legacy_direction = "forward" if direction == "both" else direction
-    result = _legacy_call("trace_data_flow", {"addr": addr, "direction": legacy_direction, "max_depth": max_depth})
+    if direction not in {"forward", "backward", "both"}:
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid data-flow direction: {direction}")
+    result = _legacy_call("trace_data_flow", {"addr": addr, "direction": direction, "max_depth": max_depth})
+    nodes, edges, truncated = normalize_reference_flow_graph(result if isinstance(result, dict) else {})
+    warnings = [fallback_warning, "Result is reference flow, not semantic data flow"]
+    if isinstance(result, dict) and result.get("error"):
+        warnings.append(str(result["error"]))
     graph = AnalysisGraph(
         engine=AnalysisEngine.REFERENCE_FLOW,
         fidelity="reference",
-        nodes=list(result.get("nodes", [])) if isinstance(result, dict) else [],
-        edges=list(result.get("edges", [])) if isinstance(result, dict) else [],
+        nodes=nodes,
+        edges=edges,
         unsupported_edges=[
             {"kind": "semantic_def_use", "reason": "Hex-Rays microcode is unavailable"},
             {"kind": "memory_alias", "reason": "reference flow does not model aliases"},
         ],
-        warnings=[fallback_warning, "Result is reference flow, not semantic data flow"],
-        truncated=bool(result.get("truncated", False)) if isinstance(result, dict) else False,
+        warnings=warnings,
+        truncated=truncated,
     )
     return graph.to_dict()
 
@@ -687,31 +727,37 @@ def taint_analyze(
     effective_options = options or {}
     max_paths = max(1, min(int(effective_options.get("max_paths", 100)), 1000))
     enabled_domains = set(effective_options.get("domains", ["register", "stack", "global", "memory"]))
-    sink_set = {_normalized_match_token(sink) for sink in sinks}
-    sanitizer_set = {_normalized_match_token(item) for item in sanitizers}
+    sink_set = {normalized_match_token(sink) for sink in sinks}
+    sanitizer_set = {normalized_match_token(item) for item in sanitizers}
     hits: list[dict[str, Any]] = []
     sanitizer_annotations: list[dict[str, Any]] = []
+    warnings: list[str] = []
     for source, trace in zip(sources, traces):
-        nodes = {node["id"]: node for node in trace.get("nodes", []) if "id" in node}
+        nodes = {str(node["id"]): node for node in trace.get("nodes", []) if node.get("id") is not None}
         adjacency: dict[str, list[str]] = {}
         for edge in trace.get("edges", []):
-            adjacency.setdefault(str(edge.get("source")), []).append(str(edge.get("target")))
-        source_token = _normalized_match_token(source)
-        starts = [node_id for node_id, node in nodes.items() if _node_matches(node, {source_token})]
-        if not starts and nodes:
-            starts = [next(iter(nodes))]
+            src = edge.get("source") or edge.get("from")
+            dst = edge.get("target") or edge.get("to")
+            if src is None or dst is None:
+                continue
+            adjacency.setdefault(str(src), []).append(str(dst))
+        source_token = normalized_match_token(source)
+        starts = [node_id for node_id, node in nodes.items() if node_matches(node, {source_token})]
+        if not starts:
+            warnings.append(f"Source {source!r} was not found in the trace graph")
+            continue
         queue = [(node_id, [node_id]) for node_id in starts]
         visited = set(starts)
         while queue and len(hits) < max_paths:
             node_id, path = queue.pop(0)
             node = nodes[node_id]
-            matched_sanitizers = sorted(token for token in sanitizer_set if _node_matches(node, {token}))
+            matched_sanitizers = sorted(token for token in sanitizer_set if node_matches(node, {token}))
             if matched_sanitizers:
                 sanitizer_annotations.append(
                     {"source": source, "node": node_id, "sanitizers": matched_sanitizers, "action": "propagation_stopped"}
                 )
                 continue
-            matched_sinks = sorted(token for token in sink_set if _node_matches(node, {token}))
+            matched_sinks = sorted(token for token in sink_set if node_matches(node, {token}))
             if matched_sinks:
                 domains = sorted(_node_domains([nodes[item] for item in path]) & enabled_domains)
                 fidelity = str(trace.get("fidelity", "reference"))
@@ -720,7 +766,7 @@ def taint_analyze(
                         "source": source,
                         "sinks": matched_sinks,
                         "path": path,
-                        "addresses": [nodes[item].get("address") for item in path if nodes[item].get("address")],
+                        "addresses": [nodes[item].get("address") or nodes[item].get("addr") for item in path if nodes[item].get("address") or nodes[item].get("addr")],
                         "domains": domains,
                         "confidence": 0.9 if fidelity.startswith("semantic") else 0.4,
                         "engine": trace.get("engine", AnalysisEngine.REFERENCE_FLOW.value),
@@ -734,6 +780,8 @@ def taint_analyze(
                     queue.append((neighbor, [*path, neighbor]))
     engines = sorted({str(trace.get("engine", AnalysisEngine.REFERENCE_FLOW.value)) for trace in traces})
     semantic = engines == [AnalysisEngine.HEXRAYS_MICROCODE.value]
+    if not semantic:
+        warnings.append("At least one trace used reference-flow fallback")
     return {
         "engine": engines[0] if len(engines) == 1 else "mixed",
         "fidelity": "semantic_intraprocedural" if semantic else "reference_or_mixed",
@@ -749,21 +797,8 @@ def taint_analyze(
             {"kind": "interprocedural_alias", "reason": "callee summaries are not yet available for every call"},
             {"kind": "thread_handoff", "reason": "concurrent taint propagation is not modeled"},
         ],
-        "warnings": [] if semantic else ["At least one trace used reference-flow fallback"],
+        "warnings": warnings,
     }
-
-
-def _normalized_match_token(value: str) -> str:
-    text = value.strip().lower()
-    try:
-        return hex(int(text, 0))
-    except ValueError:
-        return text
-
-
-def _node_matches(node: dict[str, Any], tokens: set[str]) -> bool:
-    rendered = json.dumps(node, sort_keys=True).lower()
-    return any(token and token in rendered for token in tokens)
 
 
 def _node_domains(nodes: list[dict[str, Any]]) -> set[str]:
@@ -940,9 +975,19 @@ def _reshape_mutation_arguments(kind: str, arguments: dict[str, Any]) -> tuple[s
 
 def _parse_operations(values: list[dict[str, Any]]) -> list[MutationOperation]:
     operations = []
-    for value in values:
+    for index, value in enumerate(values):
+        if not isinstance(value, dict):
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"Mutation operation {index} must be an object")
         raw_kind = str(value.get("kind", ""))
-        kind, arguments = _reshape_mutation_arguments(raw_kind, dict(value.get("arguments", {})))
+        raw_arguments = value.get("arguments", {})
+        if raw_arguments is None:
+            raw_arguments = {}
+        if not isinstance(raw_arguments, dict):
+            raise VNextError(
+                ErrorCode.INVALID_OPERATION,
+                f"Mutation operation {index} arguments must be an object",
+            )
+        kind, arguments = _reshape_mutation_arguments(raw_kind, dict(raw_arguments))
         target = _OPERATION_TARGETS.get(kind)
         if target is None:
             allowed = ", ".join(sorted(_OPERATION_TARGETS))
@@ -954,12 +999,36 @@ def _parse_operations(values: list[dict[str, Any]]) -> list[MutationOperation]:
     return operations
 
 
+def _legacy_result_failed(result: Any) -> str | None:
+    if isinstance(result, dict):
+        if result.get("ok") is False:
+            return str(result.get("error") or "operation failed")
+        if result.get("error") and result.get("ok") is not True:
+            return str(result["error"])
+        return None
+    if isinstance(result, list):
+        errors = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            if item.get("ok") is False or (item.get("error") and item.get("ok") is not True):
+                errors.append(str(item.get("error") or item))
+        if errors:
+            return "; ".join(errors)
+    return None
+
+
 def _checkpoint_path(transaction_id: str) -> str:
     cache_root = Path(os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     directory = cache_root / "ida-pro-mcp" / "checkpoints"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{transaction_id}.i64"
-    _legacy_call("idb_save", {"path": str(path)})
+    result = _legacy_call("idb_save", {"path": str(path)})
+    failure = _legacy_result_failed(result)
+    if failure:
+        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Failed to write recovery checkpoint: {failure}")
+    if isinstance(result, dict) and result.get("ok") is False:
+        raise VNextError(ErrorCode.NOT_SUPPORTED, "Failed to write recovery checkpoint")
     return str(path)
 
 
@@ -967,10 +1036,82 @@ def _apply_operation(operation: MutationOperation) -> Any:
     tool_name, argument_name, _scope = _OPERATION_TARGETS[operation.kind]
     arguments = operation.arguments
     if argument_name == "item":
-        return _legacy_call(tool_name, arguments)
-    if argument_name == "path":
-        return _legacy_call(tool_name, {"path": arguments.get("path", "")})
-    return _legacy_call(tool_name, {argument_name: arguments.get(argument_name, arguments.get("items", arguments))})
+        result = _legacy_call(tool_name, arguments)
+    elif argument_name == "path":
+        result = _legacy_call(tool_name, {"path": arguments.get("path", "")})
+    else:
+        result = _legacy_call(tool_name, {argument_name: arguments.get(argument_name, arguments.get("items", arguments))})
+    failure = _legacy_result_failed(result)
+    if failure:
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"{operation.kind} failed: {failure}")
+    return result
+
+
+@_ida_synchronized
+def _mutation_before_state(operation: MutationOperation) -> Any:
+    """Capture current names/comments/bytes so preview is useful for reversing."""
+
+    try:
+        import ida_bytes
+        import ida_name
+        import idaapi
+
+        from .utils import parse_address
+    except Exception:
+        return None
+
+    def _addr(item: Any) -> int | None:
+        if not isinstance(item, dict):
+            return None
+        raw = item.get("addr") or item.get("ea") or item.get("func_addr")
+        if raw is None:
+            return None
+        try:
+            return parse_address(str(raw))
+        except Exception:
+            return None
+
+    try:
+        if operation.kind == "rename":
+            before: dict[str, list[dict[str, str]]] = {}
+            for group, items in operation.arguments.items():
+                if not isinstance(items, list):
+                    continue
+                names = []
+                for item in items:
+                    ea = _addr(item)
+                    if ea is None:
+                        continue
+                    names.append({"addr": hex(ea), "name": ida_name.get_name(ea) or ""})
+                if names:
+                    before[str(group)] = names
+            return before or None
+        if operation.kind in {"comment", "append_comment"}:
+            items = operation.arguments.get("items") or operation.arguments.get("item") or []
+            if isinstance(items, dict):
+                items = [items]
+            comments = []
+            for item in items:
+                ea = _addr(item)
+                if ea is None:
+                    continue
+                comments.append({"addr": hex(ea), "comment": idaapi.get_cmt(ea, False) or ""})
+            return comments or None
+        if operation.kind in {"patch_bytes", "patch_asm", "write_integer"}:
+            items = operation.arguments.get("items") or operation.arguments.get("patches") or []
+            if isinstance(items, dict):
+                items = [items]
+            snapshots = []
+            for item in items:
+                ea = _addr(item)
+                if ea is None:
+                    continue
+                size = max(1, min(int(item.get("size", 16) or 16), 64))
+                snapshots.append({"addr": hex(ea), "bytes": ida_bytes.get_bytes(ea, size).hex() if ida_bytes.get_bytes(ea, size) else None})
+            return snapshots or None
+    except Exception:
+        return None
+    return None
 
 
 def _perform_undo() -> bool:
@@ -1122,7 +1263,7 @@ def mutation_preview(
             "kind": operation.kind,
             "arguments": operation.arguments,
             "validated": True,
-            "before": None,
+            "before": _mutation_before_state(operation),
             "after": operation.arguments,
         },
     )
@@ -1162,7 +1303,7 @@ def mutation_rollback(transaction_id: Annotated[str, "Committed transaction iden
 def debug_session(action: Annotated[str, "start, attach, detach, terminate, or status"], target: Annotated[dict[str, Any] | None, "Process launch or attach target"] = None) -> dict[str, Any]:
     """Manage debugger lifecycle through one capability-gated tool."""
 
-    mapping = {"start": "dbg_start", "status": "dbg_status", "terminate": "dbg_exit", "detach": "dbg_exit"}
+    mapping = {"start": "dbg_start", "status": "dbg_status", "terminate": "dbg_exit", "detach": "dbg_detach"}
     if action == "attach":
         pid = (target or {}).get("pid")
         if pid is None:

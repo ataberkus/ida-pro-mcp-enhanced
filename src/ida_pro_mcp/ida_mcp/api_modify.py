@@ -137,7 +137,7 @@ def set_comments(items: list[CommentOp] | CommentOp):
                     {
                         "addr": addr_str,
                         "ok": True,
-                        "error": f"Failed to set decompiler comment at {hex(ea)}",
+                        "decompiler_comment": False, "warning": f"Disassembly comment set; decompiler comment failed at {hex(ea)}",
                     }
                 )
                 continue
@@ -164,7 +164,7 @@ def set_comments(items: list[CommentOp] | CommentOp):
                     {
                         "addr": addr_str,
                         "ok": True,
-                        "error": f"Failed to set decompiler comment at {hex(ea)}",
+                        "decompiler_comment": False, "warning": f"Disassembly comment set; decompiler comment failed at {hex(ea)}",
                     }
                 )
         except Exception as e:
@@ -259,27 +259,26 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
 
         try:
             ea = parse_address(addr_str)
-            assembles = instructions.split(";")
-            for assemble in assembles:
-                assemble = assemble.strip()
+            statements = [part.strip() for part in instructions.split(";") if part.strip()]
+            assembled: list[tuple[int, bytes]] = []
+            cursor = ea
+            assemble_error = None
+            for assemble in statements:
                 try:
-                    (check_assemble, bytes_to_patch) = idautils.Assemble(ea, assemble)
+                    check_assemble, bytes_to_patch = idautils.Assemble(cursor, assemble)
                     if not check_assemble:
-                        results.append(
-                            {
-                                "addr": addr_str,
-                                "error": f"Failed to assemble: {assemble}",
-                            }
-                        )
+                        assemble_error = f"Failed to assemble: {assemble}"
                         break
-                    ida_bytes.patch_bytes(ea, bytes_to_patch)
-                    ea += len(bytes_to_patch)
+                    assembled.append((cursor, bytes_to_patch))
+                    cursor += len(bytes_to_patch)
                 except Exception as e:
-                    results.append(
-                        {"addr": addr_str, "error": f"Failed at {hex(ea)}: {e}"}
-                    )
+                    assemble_error = f"Failed at {hex(cursor)}: {e}"
                     break
+            if assemble_error:
+                results.append({"addr": addr_str, "ok": False, "error": assemble_error})
             else:
+                for patch_ea, data in assembled:
+                    ida_bytes.patch_bytes(patch_ea, data)
                 results.append({"addr": addr_str, "ok": True})
         except Exception as e:
             results.append({"addr": addr_str, "error": str(e)})
@@ -1089,7 +1088,16 @@ def make_data(
 
             if delete_existing and size > 0:
                 ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, size)
-                idc.SetType(ea, decl)
+                apply_ok = idc.SetType(ea, decl)
+                if not apply_ok:
+                    results.append(
+                        {
+                            "addr": addr_str,
+                            "ok": False,
+                            "error": f"SetType failed after deleting existing items: {decl!r}",
+                        }
+                    )
+                    continue
 
             if name:
                 ida_name.set_name(ea, name, ida_name.SN_NOCHECK | ida_name.SN_FORCE)

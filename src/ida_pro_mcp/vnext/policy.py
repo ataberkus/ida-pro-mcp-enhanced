@@ -196,6 +196,7 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
         "dbg_start",
         "dbg_status",
         "dbg_exit",
+        "dbg_detach",
         "dbg_continue",
         "dbg_run_to",
         "dbg_step_into",

@@ -488,8 +488,8 @@ def trace_data_flow(
     import idc
     from collections import deque
 
-    if direction not in ("forward", "backward"):
-        return {"error": f"direction must be 'forward' or 'backward', got {direction!r}"}
+    if direction not in ("forward", "backward", "both"):
+        return {"error": f"direction must be 'forward', 'backward', or 'both', got {direction!r}"}
 
     try:
         start_ea = _resolve_addr(addr)
@@ -541,33 +541,30 @@ def trace_data_flow(
         if depth >= max_depth:
             continue
 
-        # Follow xrefs in the requested direction.
-        if direction == "forward":
-            xrefs = list(idautils.XrefsFrom(ea, 0))
-        else:
-            xrefs = list(idautils.XrefsTo(ea, 0))
+        hops: list[tuple[int, str]] = []
+        if direction in ("forward", "both"):
+            hops.extend((xref.to, "code" if xref.iscode else "data") for xref in idautils.XrefsFrom(ea, 0))
+        if direction in ("backward", "both"):
+            hops.extend((xref.frm, "code" if xref.iscode else "data") for xref in idautils.XrefsTo(ea, 0))
 
-        for xref in xrefs:
+        for target, xtype in hops:
             if len(edges) >= _MAX_TRACE_EDGES:
                 break
-            target = xref.to if direction == "forward" else xref.frm
-            # Classify xref type.
-            xtype = "code" if xref.iscode else "data"
-
             edges.append({
-                "from": hex(ea) if direction == "forward" else hex(target),
-                "to": hex(target) if direction == "forward" else hex(ea),
+                "from": hex(ea),
+                "to": hex(target),
                 "type": xtype,
             })
-
             if target not in visited and len(nodes) + len(queue) < _MAX_TRACE_NODES:
                 visited.add(target)
                 queue.append((target, depth + 1))
 
+    truncated = bool(queue) or len(nodes) >= _MAX_TRACE_NODES or len(edges) >= _MAX_TRACE_EDGES
     return {
         "start": hex(start_ea),
         "direction": direction,
         "depth_reached": depth_reached,
         "nodes": nodes,
         "edges": edges,
+        "truncated": truncated,
     }

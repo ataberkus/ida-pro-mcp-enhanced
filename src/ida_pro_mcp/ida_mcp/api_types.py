@@ -504,8 +504,18 @@ def type_query(
     for query in queries:
         filter_pattern = str(query.get("filter", "") or "")
         kind = str(query.get("kind", "any") or "any").lower()
-        if kind not in {"any", "struct", "union", "enum", "typedef", "func", "ptr", "udt"}:
-            kind = "any"
+        allowed_kinds = {"any", "struct", "union", "enum", "typedef", "func", "ptr", "udt"}
+        if kind not in allowed_kinds:
+            results.append(
+                {
+                    "kind": kind,
+                    "data": [],
+                    "next_offset": None,
+                    "total": 0,
+                    "error": f"Unsupported kind: {kind}. Allowed: {', '.join(sorted(allowed_kinds))}",
+                }
+            )
+            continue
 
         offset = int(query.get("offset", 0) or 0)
         count = int(query.get("count", 100) or 100)

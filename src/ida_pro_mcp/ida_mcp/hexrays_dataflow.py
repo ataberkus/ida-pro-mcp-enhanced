@@ -7,9 +7,9 @@ Python graph crosses the runtime boundary.
 
 from __future__ import annotations
 
-from collections import deque
 from typing import Any
 
+from ida_pro_mcp.vnext.analysis import bounded_subgraph
 from ida_pro_mcp.vnext.contracts import AnalysisEngine, AnalysisGraph, ErrorCode, VNextError
 
 from .sync import IDAError, idasync
@@ -67,33 +67,13 @@ def _instructions(block: Any, limit: int) -> list[Any]:
     return result
 
 
-def _bounded_subgraph(graph: AnalysisGraph, seed_ea: int, direction: str, max_depth: int) -> AnalysisGraph:
-    seed_ids = {node["id"] for node in graph.nodes if node.get("address") == hex(seed_ea)}
-    if not seed_ids:
-        return graph
-
-    adjacency: dict[str, set[str]] = {}
-    for edge in graph.edges:
-        source, target = edge["source"], edge["target"]
-        if direction in {"forward", "both"}:
-            adjacency.setdefault(source, set()).add(target)
-        if direction in {"backward", "both"}:
-            adjacency.setdefault(target, set()).add(source)
-
-    kept = set(seed_ids)
-    queue = deque((node_id, 0) for node_id in sorted(seed_ids))
-    while queue:
-        node_id, depth = queue.popleft()
-        if depth >= max_depth:
-            continue
-        for neighbor in sorted(adjacency.get(node_id, ())):
-            if neighbor not in kept:
-                kept.add(neighbor)
-                queue.append((neighbor, depth + 1))
-    graph.nodes = [node for node in graph.nodes if node["id"] in kept]
-    graph.edges = [edge for edge in graph.edges if edge["source"] in kept and edge["target"] in kept]
-    graph.evidence = [item for item in graph.evidence if item.get("source") in kept and item.get("target") in kept]
-    return graph
+def _term_mba(mba: Any) -> None:
+    term = getattr(mba, "term", None)
+    if callable(term):
+        try:
+            term()
+        except Exception:
+            pass
 
 
 @idasync
@@ -122,6 +102,7 @@ def trace_microcode(
     if function is None:
         raise VNextError(ErrorCode.INVALID_OPERATION, f"Address is not inside a function: {addr}")
 
+    mba = None
     try:
         failure = ida_hexrays.hexrays_failure_t()
         # IDA 9.x replaced mba_ranges_t with decomp_ranges_t for this API.
@@ -137,128 +118,133 @@ def trace_microcode(
             getattr(ida_hexrays, "DECOMP_NO_WAIT", 0),
             ida_hexrays.MMAT_GLBOPT3,
         )
+        if mba is None:
+            reason = getattr(failure, "desc", lambda: "decompiler unavailable")()
+            raise VNextError(
+                ErrorCode.NOT_SUPPORTED,
+                "Hex-Rays microcode is unavailable for this function",
+                details={"reason": str(reason)},
+            )
+
+        blocks: list[Any] = []
+        instructions: list[tuple[int, int, Any, Any, Any]] = []
+        block_instruction_ids: dict[int, list[int]] = {}
+        truncated = False
+        for serial in range(int(mba.qty)):
+            block = mba.get_mblock(serial)
+            blocks.append(block)
+            block.make_lists_ready()
+            ids: list[int] = []
+            for ordinal, instruction in enumerate(_instructions(block, max_nodes + 1)):
+                if len(instructions) >= max_nodes:
+                    truncated = True
+                    break
+                definitions = block.build_def_list(instruction, ida_hexrays.MUST_ACCESS)
+                if definitions.empty():
+                    definitions = block.build_def_list(instruction, ida_hexrays.MAY_ACCESS)
+                uses = block.build_use_list(instruction, ida_hexrays.MAY_ACCESS)
+                ids.append(len(instructions))
+                instructions.append((serial, ordinal, instruction, definitions, uses))
+            block_instruction_ids[serial] = ids
+            if truncated:
+                break
+
+        nodes: list[dict[str, Any]] = []
+        node_ids: list[str] = []
+        for serial, ordinal, instruction, definitions, uses in instructions:
+            instruction_ea = int(instruction.ea)
+            address = None if instruction_ea < 0 else hex(instruction_ea)
+            node_id = f"micro:{serial}:{ordinal}:{address or 'synthetic'}"
+            node_ids.append(node_id)
+            nodes.append(
+                {
+                    "id": node_id,
+                    "address": address,
+                    "block": serial,
+                    "ordinal": ordinal,
+                    "instruction": str(instruction.dstr()),
+                    "definitions": _location_text(definitions),
+                    "uses": _location_text(uses),
+                }
+            )
+
+        # Forward fixed-point analysis. Each state is a set of instruction indexes
+        # whose definitions can reach the current program point.
+        in_defs = {serial: set() for serial in block_instruction_ids}
+        out_defs = {serial: set() for serial in block_instruction_ids}
+        for _ in range(max(1, len(block_instruction_ids) * 4)):
+            changed = False
+            for serial, ids in block_instruction_ids.items():
+                incoming: set[int] = set()
+                if serial < len(blocks):
+                    for predecessor in _predecessors(blocks[serial]):
+                        incoming.update(out_defs.get(predecessor, set()))
+                current = set(incoming)
+                for index in ids:
+                    definitions = instructions[index][3]
+                    if not definitions.empty():
+                        current = {prior for prior in current if not _has_common(instructions[prior][3], definitions)}
+                        current.add(index)
+                if incoming != in_defs[serial] or current != out_defs[serial]:
+                    in_defs[serial] = incoming
+                    out_defs[serial] = current
+                    changed = True
+            if not changed:
+                break
+
+        edges: list[dict[str, Any]] = []
+        evidence: list[dict[str, Any]] = []
+        edge_keys: set[tuple[int, int]] = set()
+        for serial, ids in block_instruction_ids.items():
+            current = set(in_defs[serial])
+            for index in ids:
+                definitions, uses = instructions[index][3], instructions[index][4]
+                if not uses.empty():
+                    for prior in sorted(current):
+                        if _has_common(instructions[prior][3], uses) and (prior, index) not in edge_keys:
+                            edge_keys.add((prior, index))
+                            edges.append(
+                                {
+                                    "source": node_ids[prior],
+                                    "target": node_ids[index],
+                                    "kind": "def_use",
+                                    "confidence": 0.95,
+                                }
+                            )
+                            evidence.append(
+                                {
+                                    "source": node_ids[prior],
+                                    "target": node_ids[index],
+                                    "definition_locations": _location_text(instructions[prior][3]),
+                                    "use_locations": _location_text(uses),
+                                }
+                            )
+                if not definitions.empty():
+                    current = {prior for prior in current if not _has_common(instructions[prior][3], definitions)}
+                    current.add(index)
+
+        graph = AnalysisGraph(
+            engine=AnalysisEngine.HEXRAYS_MICROCODE,
+            fidelity="semantic_intraprocedural",
+            nodes=nodes,
+            edges=edges,
+            evidence=evidence,
+            unsupported_edges=[
+                {"kind": "interprocedural_alias", "reason": "callee side effects require call-specific summaries"},
+                {"kind": "concurrent_memory", "reason": "microcode reaching definitions are single-threaded"},
+            ],
+            warnings=["Direct def-use edges come from Hex-Rays microcode location lists."],
+            truncated=truncated,
+        )
+        return bounded_subgraph(graph, ea, direction, max(0, max_depth)).to_dict()
+    except VNextError:
+        raise
     except Exception as exc:
         raise VNextError(
             ErrorCode.NOT_SUPPORTED,
             "Hex-Rays microcode generation failed",
             details={"reason": str(exc)},
         ) from exc
-    if mba is None:
-        reason = getattr(failure, "desc", lambda: "decompiler unavailable")()
-        raise VNextError(
-            ErrorCode.NOT_SUPPORTED,
-            "Hex-Rays microcode is unavailable for this function",
-            details={"reason": str(reason)},
-        )
-
-    blocks: list[Any] = []
-    instructions: list[tuple[int, int, Any, Any, Any]] = []
-    block_instruction_ids: dict[int, list[int]] = {}
-    truncated = False
-    for serial in range(int(mba.qty)):
-        block = mba.get_mblock(serial)
-        blocks.append(block)
-        block.make_lists_ready()
-        ids: list[int] = []
-        for ordinal, instruction in enumerate(_instructions(block, max_nodes + 1)):
-            if len(instructions) >= max_nodes:
-                truncated = True
-                break
-            definitions = block.build_def_list(instruction, ida_hexrays.MUST_ACCESS)
-            if definitions.empty():
-                definitions = block.build_def_list(instruction, ida_hexrays.MAY_ACCESS)
-            uses = block.build_use_list(instruction, ida_hexrays.MAY_ACCESS)
-            ids.append(len(instructions))
-            instructions.append((serial, ordinal, instruction, definitions, uses))
-        block_instruction_ids[serial] = ids
-        if truncated:
-            break
-
-    nodes: list[dict[str, Any]] = []
-    node_ids: list[str] = []
-    for serial, ordinal, instruction, definitions, uses in instructions:
-        instruction_ea = int(instruction.ea)
-        address = None if instruction_ea < 0 else hex(instruction_ea)
-        node_id = f"micro:{serial}:{ordinal}:{address or 'synthetic'}"
-        node_ids.append(node_id)
-        nodes.append(
-            {
-                "id": node_id,
-                "address": address,
-                "block": serial,
-                "ordinal": ordinal,
-                "instruction": str(instruction.dstr()),
-                "definitions": _location_text(definitions),
-                "uses": _location_text(uses),
-            }
-        )
-
-    # Forward fixed-point analysis. Each state is a set of instruction indexes
-    # whose definitions can reach the current program point.
-    in_defs = {serial: set() for serial in block_instruction_ids}
-    out_defs = {serial: set() for serial in block_instruction_ids}
-    for _ in range(max(1, len(block_instruction_ids) * 4)):
-        changed = False
-        for serial, ids in block_instruction_ids.items():
-            incoming: set[int] = set()
-            if serial < len(blocks):
-                for predecessor in _predecessors(blocks[serial]):
-                    incoming.update(out_defs.get(predecessor, set()))
-            current = set(incoming)
-            for index in ids:
-                definitions = instructions[index][3]
-                if not definitions.empty():
-                    current = {prior for prior in current if not _has_common(instructions[prior][3], definitions)}
-                    current.add(index)
-            if incoming != in_defs[serial] or current != out_defs[serial]:
-                in_defs[serial] = incoming
-                out_defs[serial] = current
-                changed = True
-        if not changed:
-            break
-
-    edges: list[dict[str, Any]] = []
-    evidence: list[dict[str, Any]] = []
-    edge_keys: set[tuple[int, int]] = set()
-    for serial, ids in block_instruction_ids.items():
-        current = set(in_defs[serial])
-        for index in ids:
-            definitions, uses = instructions[index][3], instructions[index][4]
-            if not uses.empty():
-                for prior in sorted(current):
-                    if _has_common(instructions[prior][3], uses) and (prior, index) not in edge_keys:
-                        edge_keys.add((prior, index))
-                        edges.append(
-                            {
-                                "source": node_ids[prior],
-                                "target": node_ids[index],
-                                "kind": "def_use",
-                                "confidence": 0.95,
-                            }
-                        )
-                        evidence.append(
-                            {
-                                "source": node_ids[prior],
-                                "target": node_ids[index],
-                                "definition_locations": _location_text(instructions[prior][3]),
-                                "use_locations": _location_text(uses),
-                            }
-                        )
-            if not definitions.empty():
-                current = {prior for prior in current if not _has_common(instructions[prior][3], definitions)}
-                current.add(index)
-
-    graph = AnalysisGraph(
-        engine=AnalysisEngine.HEXRAYS_MICROCODE,
-        fidelity="semantic_intraprocedural",
-        nodes=nodes,
-        edges=edges,
-        evidence=evidence,
-        unsupported_edges=[
-            {"kind": "interprocedural_alias", "reason": "callee side effects require call-specific summaries"},
-            {"kind": "concurrent_memory", "reason": "microcode reaching definitions are single-threaded"},
-        ],
-        warnings=["Direct def-use edges come from Hex-Rays microcode location lists."],
-        truncated=truncated,
-    )
-    return _bounded_subgraph(graph, ea, direction, max(0, max_depth)).to_dict()
+    finally:
+        if mba is not None:
+            _term_mba(mba)

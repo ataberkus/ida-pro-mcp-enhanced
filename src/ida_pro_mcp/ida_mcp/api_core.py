@@ -657,12 +657,14 @@ def entity_query(
         if filter_pattern:
             rows = pattern_filter(rows, filter_pattern, primary_key)
 
+        query_error = None
         regex = str(query.get("regex", "") or "")
         if regex:
             try:
                 compiled = re.compile(regex)
                 rows = [row for row in rows if compiled.search(str(row.get(primary_key, "")))]
-            except re.error:
+            except re.error as exc:
+                query_error = f"Invalid regex: {exc}"
                 rows = []
 
         segment_filter = str(query.get("segment", "") or "")
@@ -674,19 +676,21 @@ def entity_query(
             rows = pattern_filter(rows, module_filter, "module")
 
         min_addr = query.get("min_addr")
-        if min_addr not in (None, ""):
+        if min_addr not in (None, "") and query_error is None:
             try:
                 min_ea = parse_address(min_addr)
                 rows = [row for row in rows if int(str(row["addr"]), 16) >= min_ea]
             except Exception:
+                query_error = f"Invalid min_addr: {min_addr!r}"
                 rows = []
 
         max_addr = query.get("max_addr")
-        if max_addr not in (None, ""):
+        if max_addr not in (None, "") and query_error is None:
             try:
                 max_ea = parse_address(max_addr)
                 rows = [row for row in rows if int(str(row["addr"]), 16) <= max_ea]
             except Exception:
+                query_error = f"Invalid max_addr: {max_addr!r}"
                 rows = []
 
         sort_by = str(query.get("sort_by", "addr") or "addr")
@@ -723,7 +727,7 @@ def entity_query(
                 "data": data,
                 "next_offset": page["next_offset"],
                 "total": len(rows),
-                "error": None,
+                "error": query_error,
             }
         )
 

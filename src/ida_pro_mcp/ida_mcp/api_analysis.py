@@ -2088,7 +2088,17 @@ def callgraph(
 
     for root in roots:
         try:
-            ea = parse_address(root)
+            ea, resolve_error = _resolve_function_start(root)
+            if ea is None:
+                results.append(
+                    {
+                        "root": root,
+                        "error": resolve_error or "Function not found",
+                        "nodes": [],
+                        "edges": [],
+                    }
+                )
+                continue
             func = ida_funcs.get_func(ea)
             if not func:
                 results.append(

@@ -22,7 +22,6 @@ import ida_bytes
 import ida_funcs
 import ida_nalt
 import ida_segment
-import ida_segment
 import ida_typeinf
 
 # ============================================================================
@@ -154,23 +153,53 @@ def inf_is_64bit() -> bool:
 
 
 def get_func(ea: int):
-    """Return the function containing *ea* without IDA 9.x warnings.
+    """Return the function containing *ea*.
 
-    On IDA 9.2+, prefer func_entry_info_t via get_func_entry_info().
-    Falls back to legacy get_func()/idaapi.get_func() on older IDA.
+    Prefer ``func_t`` so callers can use ``end_ea``, flowcharts, and ranges.
+    ``func_entry_info_t`` is only a fallback when ``get_func`` is unavailable.
     """
+    try:
+        fn = ida_funcs.get_func(ea)
+        if fn is not None:
+            return fn
+    except (AttributeError, TypeError):
+        pass
     try:
         info = ida_funcs.func_entry_info_t()
         if ida_funcs.get_func_entry_info(info, ea):
+            try:
+                fn = ida_funcs.get_func(info.start_ea)
+                if fn is not None:
+                    return fn
+            except (AttributeError, TypeError):
+                pass
             return info
         return None
     except (AttributeError, TypeError):
-        # Older IDA: func_entry_info_t / get_func_entry_info unavailable.
         pass
     try:
-        return ida_funcs.get_func(ea)
-    except (AttributeError, TypeError):
         return idaapi.get_func(ea)
+    except (AttributeError, TypeError):
+        return None
+
+
+def get_func_end_ea(func) -> int:
+    """Return the exclusive end address for func_t or func_entry_info_t."""
+    if func is None:
+        return 0
+    end = getattr(func, "end_ea", None)
+    if isinstance(end, int) and end:
+        return int(end)
+    start = int(getattr(func, "start_ea", 0) or 0)
+    try:
+        import idc
+
+        found = int(idc.find_func_end(start))
+        if found not in (0, -1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF):
+            return found
+    except Exception:
+        pass
+    return start
 
 
 def get_func_flags(func) -> int:

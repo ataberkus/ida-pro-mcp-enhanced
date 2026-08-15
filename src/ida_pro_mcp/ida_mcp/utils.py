@@ -714,8 +714,9 @@ def get_function(addr, *, raise_error=True):
         return None
 
     name = compat.get_func_name(fn)
+    end_ea = compat.get_func_end_ea(fn)
 
-    return Function(addr=hex(fn.start_ea), name=name, size=hex(fn.end_ea - fn.start_ea))
+    return Function(addr=hex(fn.start_ea), name=name, size=hex(end_ea - fn.start_ea))
 
 
 def get_prototype(fn: ida_funcs.func_t) -> Optional[str]:
@@ -1292,70 +1293,67 @@ def get_callees(addr: str) -> list[dict]:
     """Get callees for a single function address"""
     from . import compat
 
-    try:
-        func_start = parse_address(addr)
-        func = compat.get_func(func_start)
-        if not func:
-            return []
-        func_end = idc.find_func_end(func_start)
-        callees: list[dict[str, str]] = []
-        current_ea = func_start
-        while current_ea < func_end:
-            insn = idaapi.insn_t()
-            idaapi.decode_insn(insn, current_ea)
-            if insn.itype in [idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni]:
-                target = idc.get_operand_value(current_ea, 0)
-                target_type = idc.get_operand_type(current_ea, 0)
-                if target_type in [idaapi.o_mem, idaapi.o_near, idaapi.o_far]:
-                    func_type = (
-                        "internal"
-                        if compat.get_func(target) is not None
-                        else "external"
-                    )
-                    func_name = idc.get_name(target)
-                    if func_name is not None:
-                        callees.append(
-                            {
-                                "addr": hex(target),
-                                "name": func_name,
-                                "type": func_type,
-                            }
-                        )
-            current_ea = idc.next_head(current_ea, func_end)
-
-        unique_callee_tuples = {tuple(callee.items()) for callee in callees}
-        unique_callees = [dict(callee) for callee in unique_callee_tuples]
-        return unique_callees
-    except Exception:
+    func_start = parse_address(addr)
+    func = compat.get_func(func_start)
+    if not func:
         return []
+    func_end = compat.get_func_end_ea(func)
+    callees: list[dict[str, str]] = []
+    current_ea = func_start
+    while current_ea < func_end:
+        insn = idaapi.insn_t()
+        if not idaapi.decode_insn(insn, current_ea):
+            current_ea = idc.next_head(current_ea, func_end)
+            continue
+        if insn.itype in [idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni]:
+            target = idc.get_operand_value(current_ea, 0)
+            target_type = idc.get_operand_type(current_ea, 0)
+            if target_type in [idaapi.o_mem, idaapi.o_near, idaapi.o_far]:
+                func_type = (
+                    "internal"
+                    if compat.get_func(target) is not None
+                    else "external"
+                )
+                func_name = idc.get_name(target)
+                if func_name is not None:
+                    callees.append(
+                        {
+                            "addr": hex(target),
+                            "name": func_name,
+                            "type": func_type,
+                        }
+                    )
+        current_ea = idc.next_head(current_ea, func_end)
+
+    unique_callee_tuples = {tuple(callee.items()) for callee in callees}
+    unique_callees = [dict(callee) for callee in unique_callee_tuples]
+    return unique_callees
 
 
 def get_callers(addr: str, limit: int = 50) -> list[Function]:
     """Get callers for a single function address"""
-    try:
-        callers = {}
-        iterations = 0
-        max_iterations = limit * 100
-        for caller_addr in idautils.CodeRefsTo(parse_address(addr), 0):
-            iterations += 1
-            if len(callers) >= limit or iterations >= max_iterations:
-                break
-            func = get_function(caller_addr, raise_error=False)
-            if not func:
-                continue
-            insn = idaapi.insn_t()
-            idaapi.decode_insn(insn, caller_addr)
-            if insn.itype not in [
-                idaapi.NN_call,
-                idaapi.NN_callfi,
-                idaapi.NN_callni,
-            ]:
-                continue
-            callers[func["addr"]] = func
+    callers = {}
+    iterations = 0
+    max_iterations = limit * 100
+    for caller_addr in idautils.CodeRefsTo(parse_address(addr), 0):
+        iterations += 1
+        if len(callers) >= limit or iterations >= max_iterations:
+            break
+        func = get_function(caller_addr, raise_error=False)
+        if not func:
+            continue
+        insn = idaapi.insn_t()
+        if not idaapi.decode_insn(insn, caller_addr):
+            continue
+        if insn.itype not in [
+            idaapi.NN_call,
+            idaapi.NN_callfi,
+            idaapi.NN_callni,
+        ]:
+            continue
+        callers[func["addr"]] = func
 
-        return list(callers.values())
-    except Exception:
-        return []
+    return list(callers.values())
 
 
 def get_xrefs_from_internal(ea: int) -> list[Xref]:

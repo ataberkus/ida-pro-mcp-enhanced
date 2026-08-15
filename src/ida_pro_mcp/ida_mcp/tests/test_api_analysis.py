@@ -507,6 +507,19 @@ def test_callgraph_main_contains_expected_nodes():
         assert edge["type"] == "call"
 
 
+@test(binary="crackme03.elf")
+def test_callgraph_resolves_function_name_root():
+    """callgraph accepts symbolic function names, not only 0x addresses."""
+    result = callgraph("main")
+    assert_is_list(result, min_length=1)
+    entry = result[0]
+    assert entry.get("error") in (None, "")
+    assert_is_list(entry["nodes"], min_length=1)
+    assert any(node.get("addr") == CRACKME_MAIN for node in entry["nodes"])
+    names = {node["name"] for node in entry["nodes"]}
+    assert "main" in names
+
+
 @test(binary="typed_fixture.elf")
 def test_callgraph_depth_zero_keeps_only_root_node():
     """callgraph(max_depth=0) still returns the root node deterministically."""
