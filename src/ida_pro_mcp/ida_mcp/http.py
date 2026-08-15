@@ -61,9 +61,8 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     """Changed to registry to enable configured tools, returns original tools."""
     original_tools = registry.methods.copy()
     # Keep the complete implementation registry available to vNext's internal
-    # orchestration.  Legacy tools remain hidden from external tools/list on a
-    # new installation, but canonical analysis workflows may still call them
-    # as implementation primitives (for example survey_binary during triage).
+    # orchestration. A new install enables every registered tool; quick
+    # profiles can still hide subsets from tools/list.
     registry._all_methods = original_tools
     stored_tools = config_json_get(config_key, None)
     is_new_install = stored_tools is None
@@ -84,7 +83,9 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
             enabled_tools.pop(name)
 
     if new_tools:
-        enabled_tools.update({name: False for name in new_tools})
+        enabled_tools.update(
+            {name: default_profile_enabled(name, MCP_POLICY) for name in new_tools}
+        )
 
     if is_new_install or enabled_tools != original_enabled_tools:
         config_json_set(config_key, enabled_tools)

@@ -92,6 +92,11 @@ def test_quick_profiles_bound_tools_and_scopes():
     assert modify_tools["debug_state"] is False
     assert modify_tools["python_execute"] is False
     assert default_profile_enabled("mutation_commit", registry) is True
+    assert default_profile_enabled("python_execute", registry) is True
+    assert default_profile_enabled("debug_state", registry) is True
+    assert default_profile_enabled("idb_save", registry) is True
+    assert default_profile_enabled("list_funcs", registry) is True
+    assert default_profile_enabled("py_eval", registry) is True
 
     with pytest.raises(ValueError, match="Choose read, annotate, or modify"):
         quick_profile_selection("unknown", tools, registry)

@@ -8,8 +8,8 @@ from .contracts import SafetyScope
 from .policy import CANONICAL_TOOLS, ToolPolicyRegistry
 
 
-# The default keeps the agent useful for IDB investigation and mutation while
-# requiring an explicit opt-in for filesystem, debugger, and Python access.
+# Quick profiles stay bounded. A new install enables every registered tool;
+# _configure_scopes then activates whatever safety scopes those tools need.
 DEFAULT_PROFILE_SCOPES = frozenset(
     {SafetyScope.READ, SafetyScope.ANNOTATE, SafetyScope.MODIFY}
 )
@@ -22,10 +22,14 @@ QUICK_PROFILE_SCOPES: dict[str, frozenset[SafetyScope]] = {
 
 
 def default_profile_enabled(name: str, policy_registry: ToolPolicyRegistry) -> bool:
-    """Return whether *name* belongs to the bounded default profile."""
+    """Return whether *name* is enabled on a new install.
 
-    policy = policy_registry.get(name)
-    return name in CANONICAL_TOOLS and policy.scopes <= DEFAULT_PROFILE_SCOPES
+    The default profile is allow-all. Bounded subsets are the Read / Annotate /
+    Modify quick profiles, not the first-run selection.
+    """
+
+    del name, policy_registry
+    return True
 
 
 def quick_profile_selection(

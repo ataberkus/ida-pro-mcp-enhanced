@@ -64,7 +64,7 @@ def test_vnext_only_profile_hides_legacy_commit_debug_and_python_tools():
 
     rpc.tool(legacy_probe)
     try:
-        rpc.configure_tool_policy(scopes={"read"}, legacy_tools=True)
+        rpc.configure_tool_policy(scopes={"read"}, legacy_tools=False)
         names = {tool["name"] for tool in call_rpc(rpc.MCP_SERVER, "tools/list")["tools"]}
         assert names <= CANONICAL_TOOLS
         assert "mutation_preview" in names

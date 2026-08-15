@@ -16,9 +16,9 @@ from .zeromcp import (
 
 MCP_UNSAFE: set[str] = set()
 MCP_EXTENSIONS: dict[str, set[str]] = {}  # group -> set of function names
-# vNext-first test mode: keep legacy implementations available to internal
-# orchestration, but never advertise them as external MCP tools.
-LEGACY_TOOLS_ENABLED = False
+# Advertise legacy implementations on the default allow-all profile.
+# Quick profiles and --api-profile canonical can still hide them.
+LEGACY_TOOLS_ENABLED = True
 MCP_SERVER = McpServer("ida-pro-mcp", extensions=MCP_EXTENSIONS)
 MCP_POLICY = ToolPolicyRegistry()
 register_builtin_policies(MCP_POLICY)

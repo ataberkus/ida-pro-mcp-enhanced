@@ -203,11 +203,17 @@ def test_unsafe_tools_registered():
 
 
 @test()
-def test_unsafe_tools_hidden_by_default():
-    """Python tools remain opt-in and are hidden from the default vNext profile."""
-    tool_names = set(MCP_SERVER.tools.methods)
+def test_unsafe_tools_enabled_on_default_profile():
+    """The default allow-all profile enables Python tools for new installs."""
+    from ida_pro_mcp.vnext.profiles import default_profile_enabled
+    from ..rpc import MCP_POLICY
+    from .. import http as http_mod
+
     for name in ("py_eval", "py_exec_file"):
-        assert name not in tool_names, f"{name} should be hidden by default"
+        assert name in http_mod.ORIGINAL_TOOLS, f"{name} not registered"
+        assert default_profile_enabled(name, MCP_POLICY), (
+            f"{name} should be enabled by the default profile"
+        )
 
 
 @test()
