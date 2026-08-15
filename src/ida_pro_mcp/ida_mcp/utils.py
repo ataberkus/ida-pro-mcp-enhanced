@@ -604,12 +604,15 @@ def get_image_size() -> int:
 
 
 def parse_address(addr: str | int) -> int:
+    if addr is None or (isinstance(addr, str) and not addr.strip()):
+        raise IDAError("Failed to parse address: empty address")
     if isinstance(addr, int):
         return addr
     try:
         return int(addr, 0)
-    except ValueError:
-        for ch in addr:
+    except (TypeError, ValueError):
+        text = str(addr)
+        for ch in text:
             if ch not in "0123456789abcdefABCDEF":
                 raise IDAError(f"Failed to parse address: {addr}")
         raise IDAError(f"Failed to parse address (missing 0x prefix): {addr}")

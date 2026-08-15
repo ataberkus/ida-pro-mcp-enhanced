@@ -231,6 +231,104 @@ def test_mutation_aliases_reshape_set_name_and_rename_func():
     assert ops[2].arguments == {"func": [{"addr": "0x403000", "name": "baz"}]}
 
 
+def test_parse_operations_keeps_flat_sibling_fields():
+    _rpc, api_vnext = _load_vnext_api()
+    ops = api_vnext._parse_operations(
+        [
+            {
+                "kind": "rename",
+                "addr": "0x7ff6509202d0",
+                "name": "AC_RZGuardSplashThreadProc",
+            },
+            {
+                "kind": "comment",
+                "addr": "0x7ff6509202d0",
+                "comment": "splash thread",
+            },
+            {
+                "kind": "declare_type",
+                "decl": "struct AC_RZGuardSplashCtx { int x; };",
+            },
+            {
+                "kind": "set_type",
+                "addr": "0x7ff6509202d0",
+                "type": "__int64 __fastcall AC_RZGuardSplashThreadProc(void *ctx);",
+            },
+        ]
+    )
+    assert ops[0].kind == "rename"
+    assert ops[0].arguments == {
+        "func": [{"addr": "0x7ff6509202d0", "name": "AC_RZGuardSplashThreadProc"}]
+    }
+    assert ops[1].kind == "comment"
+    assert ops[1].arguments == {
+        "items": [{"addr": "0x7ff6509202d0", "comment": "splash thread"}]
+    }
+    assert ops[2].kind == "declare_type"
+    assert ops[2].arguments == {"decls": "struct AC_RZGuardSplashCtx { int x; };"}
+    assert ops[3].kind == "set_type"
+    assert ops[3].arguments == {
+        "edits": [
+            {
+                "addr": "0x7ff6509202d0",
+                "type": "__int64 __fastcall AC_RZGuardSplashThreadProc(void *ctx);",
+            }
+        ]
+    }
+
+
+def test_parse_operations_comment_accepts_text_alias():
+    _rpc, api_vnext = _load_vnext_api()
+    ops = api_vnext._parse_operations(
+        [{"kind": "comment", "addr": "0x401000", "text": "note"}]
+    )
+    assert ops[0].arguments == {"items": [{"addr": "0x401000", "comment": "note"}]}
+
+
+def test_parse_operations_rejects_empty_or_incomplete_payloads():
+    _rpc, api_vnext = _load_vnext_api()
+    with pytest.raises(VNextError, match="empty|missing"):
+        api_vnext._parse_operations([{"kind": "rename"}])
+    with pytest.raises(VNextError, match="empty|missing"):
+        api_vnext._parse_operations([{"kind": "rename", "arguments": {}}])
+    with pytest.raises(VNextError, match="empty|missing|addr|name"):
+        api_vnext._parse_operations([{"kind": "rename", "addr": "0x401000"}])
+    with pytest.raises(VNextError, match="empty|missing"):
+        api_vnext._parse_operations([{"kind": "comment", "addr": "0x401000"}])
+    with pytest.raises(VNextError, match="empty address"):
+        api_vnext._parse_operations(
+            [{"kind": "rename", "arguments": {"addr": "", "name": "foo"}}]
+        )
+
+
+def test_mutation_preview_schema_documents_flat_and_nested_shapes():
+    rpc, _module = _load_vnext_api()
+    tools = call_rpc(rpc.MCP_SERVER, "tools/list")["tools"]
+    preview = next(tool for tool in tools if tool["name"] == "mutation_preview")
+    description = preview["inputSchema"]["properties"]["operations"]["description"]
+    assert "arguments" in description
+    assert "addr" in description
+    assert "{kind, addr, name}" in description or "kind, addr, name" in description
+
+
+def test_apply_operation_uses_reshaped_flat_rename(monkeypatch):
+    _rpc, api_vnext = _load_vnext_api()
+    calls = []
+
+    def fake_legacy_call(name, arguments=None):
+        calls.append((name, arguments))
+        return {"summary": {"total": 1, "ok": 1, "failed": 0}}
+
+    monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
+    ops = api_vnext._parse_operations(
+        [{"kind": "rename", "addr": "0x401000", "name": "Foo"}]
+    )
+    api_vnext._apply_operation(ops[0])
+    assert calls == [
+        ("rename", {"batch": {"func": [{"addr": "0x401000", "name": "Foo"}]}})
+    ]
+
+
 def test_bridge_legacy_backends_are_defined_in_source():
     root = pathlib.Path(__file__).resolve().parents[1] / "src" / "ida_pro_mcp" / "ida_mcp"
     expected = {

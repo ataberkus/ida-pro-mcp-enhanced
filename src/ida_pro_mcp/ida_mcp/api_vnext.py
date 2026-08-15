@@ -993,22 +993,180 @@ _MUTATION_KIND_ALIASES = {
 }
 
 _RENAME_BATCH_KEYS = frozenset({"func", "data", "global", "globals", "local", "stack"})
+_RENAME_PASSTHROUGH_KEYS = ("allow_overwrite", "dry_run", "stop_on_error")
+_MUTATION_META_KEYS = frozenset({"kind", "arguments"})
 
 
-def _reshape_mutation_arguments(kind: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def _as_dict_list(value: Any) -> list[dict[str, Any]] | None:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [value]
+    return None
+
+
+def _first_present(args: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in args and args[key] not in (None, ""):
+            return args[key]
+    return None
+
+
+def _parse_mutation_address(raw: Any, *, index: int, field: str = "addr") -> str:
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raise VNextError(
+            ErrorCode.INVALID_OPERATION,
+            f"Mutation operation {index} has an empty address",
+        )
+    if isinstance(raw, int):
+        return hex(raw)
+    text = str(raw).strip()
+    try:
+        int(text, 0)
+    except ValueError as exc:
+        raise VNextError(
+            ErrorCode.INVALID_OPERATION,
+            f"Mutation operation {index} failed to parse {field}: {text}",
+        ) from exc
+    return text
+
+
+def _copy_passthrough(source: dict[str, Any], dest: dict[str, Any], keys: tuple[str, ...]) -> None:
+    for key in keys:
+        if key in source:
+            dest[key] = source[key]
+
+
+def _normalize_comment_item(item: dict[str, Any], *, index: int) -> dict[str, Any]:
+    addr = _parse_mutation_address(
+        item.get("addr") or item.get("ea") or item.get("func_addr"),
+        index=index,
+    )
+    comment = item.get("comment")
+    if comment is None:
+        comment = item.get("text")
+    if comment is None:
+        raise VNextError(
+            ErrorCode.INVALID_OPERATION,
+            f"Mutation operation {index} comment is missing comment text",
+        )
+    normalized = {"addr": addr, "comment": str(comment)}
+    _copy_passthrough(item, normalized, ("scope", "dedupe"))
+    return normalized
+
+
+def _reshape_mutation_arguments(kind: str, arguments: dict[str, Any], *, index: int = 0) -> tuple[str, dict[str, Any]]:
     """Normalize agent-friendly mutation kinds/args into canonical forms."""
     canonical = _MUTATION_KIND_ALIASES.get(kind, kind)
     args = dict(arguments)
 
     if canonical == "rename":
         if any(key in args for key in _RENAME_BATCH_KEYS):
+            for key in ("func", "data", "local", "stack"):
+                items = _as_dict_list(args.get(key))
+                if items is None:
+                    continue
+                for item in items:
+                    if any(field in item for field in ("addr", "ea", "func_addr")):
+                        item["addr"] = _parse_mutation_address(
+                            item.get("addr") or item.get("func_addr") or item.get("ea"),
+                            index=index,
+                        )
             return canonical, args
-        addr = args.get("addr") or args.get("func_addr") or args.get("ea")
-        name = args.get("name") or args.get("new") or args.get("new_name")
-        if addr and name:
-            return canonical, {"func": [{"addr": str(addr), "name": str(name)}]}
+        if any(key in args for key in ("addr", "func_addr", "ea", "name", "new", "new_name")):
+            addr = args.get("addr", args.get("func_addr", args.get("ea")))
+            name = _first_present(args, "name", "new", "new_name")
+            parsed_addr = _parse_mutation_address(addr, index=index)
+            if not name:
+                raise VNextError(
+                    ErrorCode.INVALID_OPERATION,
+                    f"Mutation operation {index} rename is missing name",
+                )
+            reshaped: dict[str, Any] = {
+                "func": [{"addr": parsed_addr, "name": str(name)}]
+            }
+            _copy_passthrough(args, reshaped, _RENAME_PASSTHROUGH_KEYS)
+            return canonical, reshaped
+
+    elif canonical in {"comment", "append_comment"}:
+        items = _as_dict_list(args.get("items") if "items" in args else args.get("item"))
+        if items is not None:
+            return canonical, {"items": [_normalize_comment_item(item, index=index) for item in items]}
+        if any(key in args for key in ("addr", "ea", "func_addr", "comment", "text")):
+            item = {
+                "addr": args.get("addr", args.get("ea", args.get("func_addr"))),
+                "comment": args["comment"] if "comment" in args else args.get("text"),
+            }
+            _copy_passthrough(args, item, ("scope", "dedupe"))
+            return canonical, {"items": [_normalize_comment_item(item, index=index)]}
+
+    elif canonical == "set_type":
+        edits = _as_dict_list(args.get("edits"))
+        if edits is not None:
+            for edit in edits:
+                if any(field in edit for field in ("addr", "ea", "func_addr")):
+                    edit["addr"] = _parse_mutation_address(
+                        edit.get("addr") or edit.get("ea") or edit.get("func_addr"),
+                        index=index,
+                    )
+            return canonical, {"edits": edits, **{k: v for k, v in args.items() if k != "edits"}}
+        addr = args.get("addr") or args.get("ea") or args.get("func_addr")
+        type_text = _first_present(args, "type", "ty", "signature", "decl")
+        if addr and type_text:
+            edit = {"addr": _parse_mutation_address(addr, index=index), "type": str(type_text)}
+            _copy_passthrough(args, edit, ("kind", "name", "signature", "ty", "variable"))
+            return canonical, {"edits": [edit]}
+
+    elif canonical == "declare_type":
+        if "decls" in args and args["decls"] not in (None, "", []):
+            return canonical, args
+        decl = _first_present(args, "decl", "declaration", "type")
+        if decl:
+            return canonical, {"decls": decl}
 
     return canonical, args
+
+
+def _operation_payload_empty(kind: str, arguments: dict[str, Any]) -> bool:
+    _tool_name, argument_name, _scope = _OPERATION_TARGETS[kind]
+    if kind == "rename":
+        for key in _RENAME_BATCH_KEYS:
+            items = arguments.get(key)
+            if isinstance(items, list) and items:
+                return False
+            if isinstance(items, dict) and items:
+                return False
+        return True
+    if kind in {"comment", "append_comment"}:
+        items = arguments.get("items")
+        return not items
+    if kind == "set_type":
+        return not arguments.get("edits")
+    if kind == "declare_type":
+        decls = arguments.get("decls")
+        return decls in (None, "", [])
+    if argument_name == "path":
+        return not str(arguments.get("path") or "").strip()
+    if argument_name == "item":
+        return not arguments
+    payload = arguments.get(argument_name)
+    if payload is None:
+        return not arguments
+    if isinstance(payload, list):
+        return len(payload) == 0
+    if isinstance(payload, dict):
+        return len(payload) == 0
+    if isinstance(payload, str):
+        return not payload.strip()
+    return False
+
+
+def _merge_mutation_fields(value: dict[str, Any]) -> dict[str, Any]:
+    raw_arguments = dict(value.get("arguments") or {})
+    for key, val in value.items():
+        if key not in _MUTATION_META_KEYS and key not in raw_arguments:
+            raw_arguments[key] = val
+    return raw_arguments
 
 
 def _parse_operations(values: list[dict[str, Any]]) -> list[MutationOperation]:
@@ -1025,13 +1183,19 @@ def _parse_operations(values: list[dict[str, Any]]) -> list[MutationOperation]:
                 ErrorCode.INVALID_OPERATION,
                 f"Mutation operation {index} arguments must be an object",
             )
-        kind, arguments = _reshape_mutation_arguments(raw_kind, dict(raw_arguments))
+        merged = _merge_mutation_fields(value)
+        kind, arguments = _reshape_mutation_arguments(raw_kind, merged, index=index)
         target = _OPERATION_TARGETS.get(kind)
         if target is None:
             allowed = ", ".join(sorted(_OPERATION_TARGETS))
             raise VNextError(
                 ErrorCode.INVALID_OPERATION,
                 f"Unsupported mutation kind: {raw_kind}. Allowed: {allowed}",
+            )
+        if _operation_payload_empty(kind, arguments):
+            raise VNextError(
+                ErrorCode.INVALID_OPERATION,
+                f"Mutation operation {index} {kind} is missing required fields",
             )
         operations.append(MutationOperation(kind, arguments, target[2]))
     return operations
@@ -1285,10 +1449,17 @@ def _debug_trace_export(path: str, description: str) -> dict[str, Any]:
 def mutation_preview(
     operations: Annotated[
         list[dict[str, Any]],
-        "Discriminated mutation operations. kind is one of: rename, comment, "
-        "append_comment, bookmark, declare_type, set_type, patch_bytes, write_integer, "
-        "patch_asm, define_function, define_code, undefine, set_operand_type, make_data, "
-        "declare_stack, delete_stack, save_database. Aliases set_name/rename_func map to rename.",
+        "Discriminated mutation operations. Each item needs kind plus either nested "
+        "arguments or flat sibling fields (kind, addr, name). Examples: "
+        "{kind, addr, name} or {kind, arguments: {addr, name}} for rename; "
+        "{kind, addr, comment} for comment (text aliases comment); "
+        "{kind, decl} for declare_type; {kind, addr, type} for set_type. "
+        "Batch form: {kind: rename, arguments: {func: [{addr, name}]}} or "
+        "{kind: comment, arguments: {items: [{addr, comment}]}}. "
+        "kind is one of: rename, comment, append_comment, bookmark, declare_type, "
+        "set_type, patch_bytes, write_integer, patch_asm, define_function, define_code, "
+        "undefine, set_operand_type, make_data, declare_stack, delete_stack, save_database. "
+        "Aliases set_name/rename_func map to rename.",
     ],
 ) -> dict[str, Any]:
     """Validate and stage a mutation batch without changing the database."""

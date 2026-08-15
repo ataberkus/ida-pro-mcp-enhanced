@@ -39,6 +39,16 @@ def test_utils_parse_address_and_detection():
         assert False, "expected parse_address to fail"
     except IDAError as e:
         assert "Failed to parse address" in str(e)
+    try:
+        parse_address("")
+        assert False, "expected empty address to fail"
+    except IDAError as e:
+        assert "empty address" in str(e)
+    try:
+        parse_address(None)  # type: ignore[arg-type]
+        assert False, "expected None address to fail"
+    except IDAError as e:
+        assert "empty address" in str(e)
 
 
 @test(binary="crackme03.elf")

@@ -185,6 +185,13 @@ def test_patch_asm_invalid_instruction_reports_error():
 
 
 @test()
+def test_rename_empty_batch_fails_closed():
+    """rename({}) must not succeed as a silent no-op."""
+    result = rename({})
+    assert_error(result, contains="empty")
+
+
+@test()
 def test_rename_function_roundtrip():
     """rename can rename a function and restore the original name."""
     fn_addr = get_any_function()

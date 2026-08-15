@@ -97,11 +97,15 @@ def set_comments(items: list[CommentOp] | CommentOp):
     """Set comments at addresses (both disassembly and decompiler views)"""
     if isinstance(items, dict):
         items = [items]
+    if not items:
+        return [{"error": "Comment batch is empty; provide addr + comment"}]
 
     results = []
     for item in items:
         addr_str = item.get("addr", "")
-        comment = item.get("comment", "")
+        comment = item.get("comment")
+        if comment is None:
+            comment = item.get("text", "")
 
         try:
             ea = parse_address(addr_str)
@@ -180,11 +184,15 @@ def append_comments(items: list[CommentAppendOp] | CommentAppendOp):
     """Append comments at addresses, deduping exact text by default."""
     if isinstance(items, dict):
         items = [items]
+    if not items:
+        return [{"error": "Comment batch is empty; provide addr + comment"}]
 
     results = []
     for item in items:
         addr_str = item.get("addr", "")
-        comment = item.get("comment", "")
+        comment = item.get("comment")
+        if comment is None:
+            comment = item.get("text", "")
         scope = str(item.get("scope", "auto") or "auto").lower()
         dedupe = bool(item.get("dedupe", True))
 
@@ -295,6 +303,13 @@ def rename(batch: RenameBatch | dict) -> dict:
     if not isinstance(batch, dict):
         return {"error": "batch must be a dict"}
 
+    has_items = any(
+        key in batch and batch.get(key) not in (None, [], {})
+        for key in ("func", "data", "global", "globals", "local", "stack")
+    )
+    if not has_items:
+        return {"error": "Rename batch is empty; provide func, data, local, or stack items"}
+
     stop_on_error = bool(batch.get("stop_on_error", False))
     dry_run = bool(batch.get("dry_run", False))
     allow_overwrite = bool(batch.get("allow_overwrite", False))
@@ -335,9 +350,9 @@ def rename(batch: RenameBatch | dict) -> dict:
         if dry_run:
             return True, None
 
-        flags = idaapi.SN_CHECK
-        if allow_overwrite:
-            flags = idaapi.SN_CHECK | int(getattr(idaapi, "SN_FORCE", 0))
+        # SN_FORCE replaces a user name at this EA. Cross-EA name conflicts are
+        # rejected above unless allow_overwrite is set.
+        flags = idaapi.SN_CHECK | int(getattr(idaapi, "SN_FORCE", 0))
         ok = idaapi.set_name(ea, new_name, flags)
         if not ok:
             return False, "Rename failed"
