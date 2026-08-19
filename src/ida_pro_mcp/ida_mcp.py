@@ -26,6 +26,8 @@ def unload_package(package_name: str):
 
 CONFIG_ACTION_ID = "mcp:configure"
 CONFIG_ACTION_LABEL = "MCP Configuration"
+ANALYZE_ACTION_ID = "mcp:analyze_function"
+ANALYZE_ACTION_LABEL = "Analyze current function"
 
 
 class MCPConfigForm(idaapi.Form):
@@ -77,6 +79,27 @@ class MCPConfigHandler(idaapi.action_handler_t):
         return idaapi.AST_ENABLE_ALWAYS
 
 
+class MCPAnalyzeFunctionHandler(idaapi.action_handler_t):
+    def activate(self, ctx):
+        ea = getattr(ctx, "cur_ea", None) or idaapi.get_screen_ea()
+        try:
+            from ida_mcp.ui_function_review import show_function_review
+        except Exception as exc:
+            print(f"[MCP] Function review unavailable: {exc}")
+            return 0
+        show_function_review(int(ea))
+        return 1
+
+    def update(self, ctx):
+        widget = getattr(ctx, "widget", None)
+        if widget is None:
+            return idaapi.AST_ENABLE_ALWAYS
+        widget_type = ida_kernwin.get_widget_type(widget)
+        if widget_type in (ida_kernwin.BWN_PSEUDOCODE, ida_kernwin.BWN_DISASM):
+            return ida_kernwin.AST_ENABLE_FOR_WIDGET
+        return ida_kernwin.AST_DISABLE_FOR_WIDGET
+
+
 class MCPUIHooks(ida_kernwin.UI_Hooks):
     """Defers menu attachment until the UI is fully ready."""
 
@@ -84,7 +107,22 @@ class MCPUIHooks(ida_kernwin.UI_Hooks):
         ida_kernwin.attach_action_to_menu(
             "Edit/Plugins/", CONFIG_ACTION_ID, idaapi.SETMENU_APP
         )
+        ida_kernwin.attach_action_to_menu(
+            "Edit/Plugins/", ANALYZE_ACTION_ID, idaapi.SETMENU_APP
+        )
         self.unhook()
+
+
+class MCPHexRaysPopupHooks(ida_kernwin.UI_Hooks):
+    """Adds MCP Analyze to Hex-Rays and disassembly context menus."""
+
+    def finish_populating_widget_popup(self, widget, popup_handle, *args):
+        widget_type = ida_kernwin.get_widget_type(widget)
+        if widget_type in (ida_kernwin.BWN_PSEUDOCODE, ida_kernwin.BWN_DISASM):
+            ida_kernwin.attach_action_to_popup(
+                widget, popup_handle, ANALYZE_ACTION_ID, "MCP/"
+            )
+        return 0
 
 
 class MCPAutoStartHooks(ida_kernwin.UI_Hooks):
@@ -135,9 +173,21 @@ class MCP(idaapi.plugin_t):
                 MCPConfigHandler(self),
             )
         )
+        ida_kernwin.register_action(
+            ida_kernwin.action_desc_t(
+                ANALYZE_ACTION_ID,
+                ANALYZE_ACTION_LABEL,
+                MCPAnalyzeFunctionHandler(),
+                "Ctrl-Shift-M",
+                "Analyze the current function with MCP tools and optionally rename it",
+            )
+        )
         # Defer menu attachment until the UI is fully initialized
         self._ui_hooks = MCPUIHooks()
         self._ui_hooks.hook()
+        self._popup_hooks = MCPHexRaysPopupHooks()
+        self._popup_hooks.hook()
+        print("[MCP] Hex-Rays: right-click a function → MCP / Analyze current function")
 
         return idaapi.PLUGIN_KEEP
 
@@ -217,7 +267,10 @@ class MCP(idaapi.plugin_t):
             self._autostart.unhook()
         if hasattr(self, "_ui_hooks"):
             self._ui_hooks.unhook()
+        if hasattr(self, "_popup_hooks"):
+            self._popup_hooks.unhook()
         ida_kernwin.unregister_action(CONFIG_ACTION_ID)
+        ida_kernwin.unregister_action(ANALYZE_ACTION_ID)
         if self.mcp:
             self.mcp.stop()
         self._unregister_instance()

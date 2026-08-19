@@ -8,4 +8,5 @@ def test_installer_declares_embedded_ida_vnext_bundle():
     source = Path(installer.IDA_VNEXT_PKG)
     assert source.is_dir()
     assert (source / "contracts.py").is_file()
+    assert (source / "function_review.py").is_file()
     assert Path(installer.IDA_VNEXT_INIT).is_file()
