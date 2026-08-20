@@ -217,6 +217,33 @@ def test_transaction_commit_detects_stale_revision_and_keeps_checkpoint():
     assert rollback.value.code is ErrorCode.REOPEN_REQUIRED
 
 
+def test_transaction_commit_without_checkpoint_uses_undo():
+    revisions = RevisionTracker()
+    manager = TransactionManager(revisions, ttl_seconds=30)
+    operation = MutationOperation("rename", {"items": []}, SafetyScope.ANNOTATE)
+    preview = manager.preview(
+        "db",
+        [operation],
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        preview_operation=lambda op: {"kind": op.kind},
+    )
+    receipt = manager.commit(
+        preview.transaction_id,
+        database="db",
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        checkpoint=lambda _tx: None,
+        apply_operation=lambda _op: None,
+        undo=lambda: True,
+    )
+    assert receipt.checkpoint is None
+    assert receipt.undo_available is True
+    rollback = manager.rollback(
+        preview.transaction_id,
+        rollback_undo=lambda: True,
+    )
+    assert rollback.status == "rolled_back"
+
+
 def test_investigation_exports_are_deterministic():
     manager = InvestigationManager()
     record = manager.create("Find unsafe input flow", database="db", seeds=["main"])

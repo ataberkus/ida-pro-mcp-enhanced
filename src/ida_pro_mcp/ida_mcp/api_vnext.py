@@ -1236,6 +1236,16 @@ def _checkpoint_path(transaction_id: str) -> str:
     return str(path)
 
 
+def _commit_checkpoint(transaction_id: str) -> str | None:
+    try:
+        from .http import recovery_checkpoints_enabled
+    except Exception:
+        return None
+    if not recovery_checkpoints_enabled():
+        return None
+    return _checkpoint_path(transaction_id)
+
+
 def _apply_operation(operation: MutationOperation) -> Any:
     tool_name, argument_name, _scope = _OPERATION_TARGETS[operation.kind]
     arguments = operation.arguments
@@ -1484,13 +1494,13 @@ def mutation_preview(
 
 @tool
 def mutation_commit(transaction_id: Annotated[str, "Preview transaction identifier"]) -> dict[str, Any]:
-    """Commit an unchanged preview after creating a recovery checkpoint."""
+    """Commit an unchanged preview; write a recovery checkpoint only when that dashboard option is enabled."""
 
     receipt = _TRANSACTIONS.commit(
         transaction_id,
         database=_database_id(),
         enabled_scopes=get_active_scopes(),
-        checkpoint=_checkpoint_path,
+        checkpoint=_commit_checkpoint,
         apply_operation=_apply_operation,
         undo=_perform_undo,
     )

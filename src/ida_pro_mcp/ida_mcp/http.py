@@ -121,6 +121,7 @@ def _configure_scopes(
 
 
 DEFAULT_CORS_POLICY = "local"
+DEFAULT_RECOVERY_CHECKPOINTS = False
 # The enhanced checkout opts into IDB annotation and modification by default.
 # Filesystem, debugger, and Python scopes remain explicit opt-ins.
 def get_cors_policy(port: int) -> str:
@@ -138,6 +139,9 @@ def get_cors_policy(port: int) -> str:
 
 ORIGINAL_TOOLS = handle_enabled_tools(MCP_SERVER.tools, "enabled_tools")
 _current_cors_policy = config_json_get("cors_policy", DEFAULT_CORS_POLICY)
+_recovery_checkpoints_enabled = bool(
+    config_json_get("recovery_checkpoints", DEFAULT_RECOVERY_CHECKPOINTS)
+)
 
 
 def _apply_cors_policy(policy: str):
@@ -150,6 +154,16 @@ def _apply_cors_policy(policy: str):
             MCP_SERVER.cors_allowed_origins = MCP_SERVER.cors_localhost
         case "direct":
             MCP_SERVER.cors_allowed_origins = None
+
+
+def recovery_checkpoints_enabled() -> bool:
+    """Return whether mutation commits write recovery checkpoints."""
+    return _recovery_checkpoints_enabled
+
+
+def _apply_recovery_checkpoints(enabled: bool) -> None:
+    global _recovery_checkpoints_enabled
+    _recovery_checkpoints_enabled = enabled
 
 
 _apply_cors_policy(_current_cors_policy)
@@ -436,6 +450,19 @@ button.profile:hover {
             body += f'<label><input type="radio" name="cors_policy" value="{html.escape(value)}" {checked}><span class="tooltip" title="{html.escape(tooltip)}">{html.escape(label)}</span></label>'
         body += "<br><input type='submit' value='Save'>"
 
+        recovery_checked = " checked" if _recovery_checkpoints_enabled else ""
+        body += "<h2>Recovery checkpoints</h2>"
+        body += (
+            '<p style="font-size: 0.9rem; margin: 0.5rem 0;">'
+            "When enabled, mutation_commit copies the IDB to a recovery file "
+            "before applying edits. Off by default."
+            "</p>"
+        )
+        body += (
+            "<label><input type='checkbox' name='recovery_checkpoints' "
+            f"value='1'{recovery_checked}>Enable recovery checkpoints on mutation commit</label>"
+        )
+
         quick_select = """<p style="font-size: 0.9rem; margin: 0.5rem 0;">
   Select:
   <a href="#" onclick="setTools('all'); return false;">All</a> ·
@@ -511,6 +538,10 @@ button.profile:hover {
         cors_policy = postvars.get("cors_policy", [DEFAULT_CORS_POLICY])[0]
         config_json_set("cors_policy", cors_policy)
         self.update_cors_policy(cors_policy)
+
+        enabled = "recovery_checkpoints" in postvars
+        config_json_set("recovery_checkpoints", enabled)
+        _apply_recovery_checkpoints(enabled)
 
         # Update the server's tools
         quick_profile = postvars.get("quick_profile", [None])[0]
