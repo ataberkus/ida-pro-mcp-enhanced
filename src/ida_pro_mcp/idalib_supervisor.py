@@ -27,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Annotated, Any, TypedDict
-from urllib.parse import quote, unquote
+from urllib.parse import unquote
 
 from ida_pro_mcp.vnext.auth import (
     AuthPolicy,
@@ -230,6 +230,7 @@ class IdalibSupervisor:
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
         self._lock = RLock()
+        self._pending_worker_requests: dict[tuple[str | None, Any], WorkerSession] = {}
 
     # ------------------------------------------------------------------
     # Worker process lifecycle
@@ -465,7 +466,7 @@ class IdalibSupervisor:
             raw = response.read().decode("utf-8")
             if response.status >= 400:
                 raise RuntimeError(f"HTTP {response.status} {response.reason}: {raw}")
-            return json.loads(raw)
+            return json.loads(raw) if raw else {}
         finally:
             conn.close()
 
@@ -495,6 +496,51 @@ class IdalibSupervisor:
             message = content[0].get("text", "Unknown worker tool error") if content else "Unknown worker tool error"
             raise RuntimeError(message)
         return result.get("structuredContent")
+
+    def _track_worker_request(
+        self,
+        request_scope: str | None,
+        request_id: Any,
+        worker: WorkerSession,
+    ) -> None:
+        if request_id is None:
+            return
+        with self._lock:
+            self._pending_worker_requests[(request_scope, request_id)] = worker
+
+    def _untrack_worker_request(
+        self,
+        request_scope: str | None,
+        request_id: Any,
+        worker: WorkerSession,
+    ) -> None:
+        if request_id is None:
+            return
+        key = (request_scope, request_id)
+        with self._lock:
+            if self._pending_worker_requests.get(key) is worker:
+                self._pending_worker_requests.pop(key, None)
+
+    def cancel_worker_request(
+        self,
+        request_scope: str | None,
+        request_id: Any,
+        reason: str = "",
+    ) -> bool:
+        with self._lock:
+            worker = self._pending_worker_requests.get((request_scope, request_id))
+        if worker is None:
+            return False
+        self._worker_rpc(
+            worker,
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": request_id, "reason": reason},
+            },
+            timeout=WORKER_RPC_HEALTH_TIMEOUT_SEC,
+        )
+        return True
 
     @staticmethod
     def _envelope_data(value: Any) -> Any:
@@ -997,6 +1043,7 @@ class IdalibSupervisor:
             owned=True,
             pid=worker.process.pid if worker.process is not None else None,
             last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
+            auth_token=worker.auth_token,
         )
         with self._lock:
             existing = self.path_to_session.get(self._path_key(resolved))
@@ -1090,6 +1137,7 @@ class IdalibSupervisor:
             owned=True,
             pid=worker.process.pid if worker.process is not None else None,
             last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
+            auth_token=worker.auth_token,
         )
         with self._lock:
             current = self.sessions.get(session.session_id)
@@ -1442,10 +1490,14 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
 
     forwarded = copy.deepcopy(request_obj)
     forwarded.setdefault("params", {})["arguments"] = arguments
+    request_scope = sup.mcp.get_current_transport_session_id()
+    sup._track_worker_request(request_scope, request_id, session)
     try:
         return sup._worker_rpc(session, forwarded)
     except Exception as e:
         return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
+    finally:
+        sup._untrack_worker_request(request_scope, request_id, session)
 
 
 def _handle_resources_list(request_obj: dict[str, Any]) -> dict[str, Any]:
@@ -1476,10 +1528,9 @@ def _handle_resources_read(request_obj: dict[str, Any]) -> dict[str, Any] | None
     if match:
         try:
             session = sup.resolve_session(unquote(match.group(1)))
-            worker_database = quote(session.input_path or "active", safe="")
             forwarded = copy.deepcopy(request_obj)
             forwarded["params"]["uri"] = (
-                f"ida://sessions/{worker_database}{match.group(2) or ''}"
+                f"ida://sessions/active{match.group(2) or ''}"
             )
             return sup._worker_rpc(session, forwarded)
         except Exception as exc:
@@ -1502,6 +1553,19 @@ def dispatch_supervisor(request: dict | str | bytes | bytearray) -> dict | None:
         request_obj = request
 
     method = request_obj.get("method", "")
+    if method == "notifications/cancelled":
+        params = request_obj.get("params") or {}
+        request_id = params.get("requestId")
+        if request_id is not None:
+            try:
+                _require_supervisor().cancel_worker_request(
+                    mcp.get_current_transport_session_id(),
+                    request_id,
+                    str(params.get("reason", "")),
+                )
+            except Exception:
+                logger.debug("Failed to forward worker cancellation", exc_info=True)
+        return _original_dispatch(request)
     if method in {"initialize", "ping"} or method.startswith("notifications/"):
         return _original_dispatch(request)
     if method == "tools/list":

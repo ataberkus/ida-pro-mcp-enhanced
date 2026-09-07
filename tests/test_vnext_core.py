@@ -244,6 +244,103 @@ def test_transaction_commit_without_checkpoint_uses_undo():
     assert rollback.status == "rolled_back"
 
 
+def test_rollback_rejects_non_latest_and_repeated_transactions():
+    revisions = RevisionTracker()
+    manager = TransactionManager(revisions, ttl_seconds=30)
+    operation = MutationOperation("rename", {"items": []}, SafetyScope.ANNOTATE)
+
+    first = manager.preview(
+        "db",
+        [operation],
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        preview_operation=lambda op: {"kind": op.kind},
+    )
+    manager.commit(
+        first.transaction_id,
+        database="db",
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        checkpoint=lambda _tx: None,
+        apply_operation=lambda _op: None,
+        undo=lambda: True,
+    )
+    second = manager.preview(
+        "db",
+        [operation],
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        preview_operation=lambda op: {"kind": op.kind},
+    )
+    manager.commit(
+        second.transaction_id,
+        database="db",
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        checkpoint=lambda _tx: None,
+        apply_operation=lambda _op: None,
+        undo=lambda: True,
+    )
+
+    with pytest.raises(VNextError) as stale:
+        manager.rollback(first.transaction_id, rollback_undo=lambda: True)
+    assert stale.value.code is ErrorCode.STALE_REVISION
+
+    receipt = manager.rollback(second.transaction_id, rollback_undo=lambda: True)
+    assert receipt.status == "rolled_back"
+    with pytest.raises(VNextError) as repeated:
+        manager.rollback(second.transaction_id, rollback_undo=lambda: True)
+    assert repeated.value.code is ErrorCode.INVALID_OPERATION
+
+
+def test_partial_commit_failure_records_recovery_outcome():
+    revisions = RevisionTracker()
+    manager = TransactionManager(revisions, ttl_seconds=30)
+    operations = [
+        MutationOperation("rename", {"index": index}, SafetyScope.ANNOTATE)
+        for index in range(2)
+    ]
+    preview = manager.preview(
+        "db",
+        operations,
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        preview_operation=lambda op: {"kind": op.kind},
+    )
+    applied = []
+    recovered = []
+
+    def apply(operation):
+        if applied:
+            raise RuntimeError("second operation failed")
+        applied.append(operation)
+
+    with pytest.raises(VNextError) as caught:
+        manager.commit(
+            preview.transaction_id,
+            database="db",
+            enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+            checkpoint=lambda _tx: "checkpoint.i64",
+            apply_operation=apply,
+            undo=lambda: recovered.append(True) or True,
+        )
+
+    transaction = caught.value.details["transaction"]
+    assert transaction["status"] == "failed_rolled_back"
+    assert transaction["applied_operations"] == 1
+    assert transaction["checkpoint"] == "checkpoint.i64"
+    assert transaction["error"]["message"] == "second operation failed"
+    assert recovered == [True]
+    assert manager.status(preview.transaction_id) == transaction
+
+
+def test_investigation_job_link_does_not_overwrite_terminal_state():
+    manager = InvestigationManager()
+    record = manager.create("race", database="db")
+    manager.set_state(record.investigation_id, "completed", result="ready")
+
+    linked = manager.set_job(record.investigation_id, "job-1")
+
+    assert linked.state == "completed"
+    assert linked.job_id == "job-1"
+    assert linked.metadata["result"] == "ready"
+
+
 def test_investigation_exports_are_deterministic():
     manager = InvestigationManager()
     record = manager.create("Find unsafe input flow", database="db", seeds=["main"])

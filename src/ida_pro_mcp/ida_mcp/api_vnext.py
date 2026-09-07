@@ -35,7 +35,7 @@ from ida_pro_mcp.vnext.contracts import (
     VNextError,
 )
 from ida_pro_mcp.vnext.investigations import InvestigationManager
-from ida_pro_mcp.vnext.jobs import JobContext, JobManager
+from ida_pro_mcp.vnext.jobs import CancelledError, JobContext, JobManager
 from ida_pro_mcp.vnext.transactions import RevisionTracker, TransactionManager
 
 from .rpc import (
@@ -421,25 +421,37 @@ def _ida_capabilities_impl() -> CapabilityManifest:
 _ida_capabilities_sync = _ida_synchronized(_ida_capabilities_impl)
 
 
-def _encode_cursor(offset: int) -> str:
-    raw = json.dumps({"offset": max(0, offset)}, separators=(",", ":")).encode("utf-8")
+def _encode_cursor_value(value: dict[str, Any]) -> str:
+    raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_cursor_value(cursor: str) -> dict[str, Any]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise TypeError("cursor payload must be an object")
+        return value
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid pagination cursor") from exc
+
+
+def _encode_cursor(offset: int) -> str:
+    return _encode_cursor_value({"offset": max(0, offset)})
 
 
 def _decode_cursor(cursor: str | None) -> int:
     if not cursor:
         return 0
     try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        value = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-        offset = int(value["offset"])
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        return max(0, int(_decode_cursor_value(cursor)["offset"]))
+    except (KeyError, TypeError, ValueError) as exc:
         raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid pagination cursor") from exc
-    return max(0, offset)
 
 
 def _search_next_cursor(result: Any) -> str | None:
-    """Convert a legacy search cursor into the canonical opaque cursor."""
+    """Convert a legacy offset cursor into the canonical opaque cursor."""
     if isinstance(result, list):
         for item in result:
             cursor = _search_next_cursor(item)
@@ -448,15 +460,141 @@ def _search_next_cursor(result: Any) -> str | None:
         return None
     if not isinstance(result, dict):
         return None
+    value = result.get("next_offset")
     legacy_cursor = result.get("cursor")
-    if not isinstance(legacy_cursor, dict) or "next" not in legacy_cursor:
+    if value is None and isinstance(legacy_cursor, dict):
+        value = legacy_cursor.get("next")
+    if value is None:
         return None
-    value = legacy_cursor["next"]
     try:
         offset = int(value, 0) if isinstance(value, str) else int(value)
     except (TypeError, ValueError):
         return None
     return _encode_cursor(offset)
+
+
+def _result_truncated(result: Any) -> bool:
+    if isinstance(result, list):
+        return any(_result_truncated(item) for item in result)
+    if not isinstance(result, dict):
+        return False
+    if result.get("truncated") is True or result.get("next_offset") is not None:
+        return True
+    cursor = result.get("cursor")
+    if isinstance(cursor, dict) and cursor.get("next") is not None:
+        return True
+    return any(
+        _result_truncated(value)
+        for key, value in result.items()
+        if key not in {"cursor", "next_offset"}
+    )
+
+
+def _instruction_cursor_states(
+    cursor: str | None,
+    target_count: int,
+) -> list[dict[str, Any] | None]:
+    if not cursor:
+        return [{"offset": 0} for _ in range(target_count)]
+    value = _decode_cursor_value(cursor)
+    if "instruction" not in value:
+        try:
+            offset = max(0, int(value["offset"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid pagination cursor") from exc
+        return [{"offset": offset} for _ in range(target_count)]
+    states = value["instruction"]
+    if not isinstance(states, list) or len(states) != target_count:
+        raise VNextError(ErrorCode.INVALID_OPERATION, "Instruction cursor does not match targets")
+    if any(state is not None and not isinstance(state, dict) for state in states):
+        raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid instruction cursor state")
+    return states
+
+
+def _instruction_next_cursor(
+    result: Any,
+    pending: list[tuple[int, str, dict[str, Any]]],
+    target_count: int,
+) -> str | None:
+    if not isinstance(result, list):
+        return None
+    states: list[dict[str, Any] | None] = [None] * target_count
+    for (target_index, _target, prior), item in zip(pending, result):
+        if not isinstance(item, dict):
+            continue
+        legacy_cursor = item.get("cursor")
+        if item.get("truncated") and item.get("next_start"):
+            states[target_index] = {"offset": 0, "start": str(item["next_start"])}
+        elif isinstance(legacy_cursor, dict) and legacy_cursor.get("next") is not None:
+            state = {"offset": max(0, int(legacy_cursor["next"]))}
+            if prior.get("start"):
+                state["start"] = prior["start"]
+            states[target_index] = state
+    active = [state for state in states if state is not None]
+    if not active:
+        return None
+    if (
+        len(active) == target_count
+        and all(not state.get("start") for state in active)
+        and len({int(state["offset"]) for state in active}) == 1
+    ):
+        return _encode_cursor(int(active[0]["offset"]))
+    return _encode_cursor_value({"instruction": states})
+
+
+def _batch_cursor_states(
+    cursor: str | None,
+    target_count: int,
+    key: str,
+) -> list[dict[str, int] | None]:
+    if not cursor:
+        return [{"offset": 0} for _ in range(target_count)]
+    value = _decode_cursor_value(cursor)
+    if key not in value:
+        try:
+            offset = max(0, int(value["offset"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid pagination cursor") from exc
+        return [{"offset": offset} for _ in range(target_count)]
+    states = value[key]
+    if not isinstance(states, list) or len(states) != target_count:
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"{key.title()} cursor does not match targets")
+    normalized: list[dict[str, int] | None] = []
+    for state in states:
+        if state is None:
+            normalized.append(None)
+            continue
+        if not isinstance(state, dict):
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid {key} cursor state")
+        try:
+            normalized.append({"offset": max(0, int(state["offset"]))})
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid {key} cursor state") from exc
+    return normalized
+
+
+def _batch_next_cursor(
+    result: Any,
+    pending: list[tuple[int, str, dict[str, int]]],
+    target_count: int,
+    key: str,
+) -> str | None:
+    if not isinstance(result, list):
+        return None
+    states: list[dict[str, int] | None] = [None] * target_count
+    for (target_index, _target, _prior), item in zip(pending, result):
+        encoded = _search_next_cursor(item)
+        if encoded is not None:
+            states[target_index] = {"offset": _decode_cursor(encoded)}
+    active = [state for state in states if state is not None]
+    if not active:
+        return None
+    if (
+        len(active) == target_count
+        and len({state["offset"] for state in active}) == 1
+    ):
+        return _encode_cursor(active[0]["offset"])
+    return _encode_cursor_value({key: states})
 
 
 @tool
@@ -475,70 +613,76 @@ def search(
 ) -> dict[str, Any]:
     """Search text, regular expressions, bytes, constants, or instructions."""
 
-    offset = _decode_cursor(cursor)
     normalized = kind.lower()
     legacy_tool = normalized
-    if normalized == "text":
-        if len(targets) != 1:
-            raise VNextError(ErrorCode.INVALID_OPERATION, "Text search accepts one pattern")
-        result = _legacy_call(
-            "search_text",
-            {
-                "pattern": targets[0],
-                "limit": limit,
-                "start": hex(offset) if cursor else "",
-                "end": "",
-                "regex": False,
-                "case_sensitive": False,
-                "include": "all",
-                "code_only": False,
-            },
-        )
-        legacy_tool = "search_text"
-    elif normalized == "regex":
-        if len(targets) != 1:
-            raise VNextError(ErrorCode.INVALID_OPERATION, "Regex search accepts one pattern")
-        result = _legacy_call("find_regex", {"pattern": targets[0], "limit": limit, "offset": offset})
-        legacy_tool = "find_regex"
-    elif normalized == "bytes":
-        result = _legacy_call("find_bytes", {"patterns": targets, "limit": limit, "offset": offset})
-        legacy_tool = "find_bytes"
-    elif normalized == "constant":
-        result = _legacy_call(
-            "find",
-            {
-                "type": "immediate",
-                "targets": targets,
-                "limit": limit,
-                "offset": offset,
-            },
-        )
-        legacy_tool = "find"
-    elif normalized == "instruction":
-        result = _legacy_call(
-            "insn_query",
-            {
-                "queries": [
-                    {
-                        "mnem": target,
-                        "offset": offset,
-                        "count": limit,
-                        "max_scan_insns": 200000,
-                        "allow_broad": True,
-                        "include_disasm": True,
-                    }
-                    for target in targets
-                ]
-            },
-        )
+    if normalized == "instruction":
+        states = _instruction_cursor_states(cursor, len(targets))
+        pending = [
+            (index, target, state)
+            for index, (target, state) in enumerate(zip(targets, states))
+            if state is not None
+        ]
+        queries = []
+        for _index, target, state in pending:
+            query = {
+                "mnem": target,
+                "offset": max(0, int(state.get("offset", 0))),
+                "count": limit,
+                "max_scan_insns": 200000,
+                "allow_broad": True,
+                "include_disasm": True,
+            }
+            if state.get("start"):
+                query["start"] = state["start"]
+            queries.append(query)
+        result = _legacy_call("insn_query", {"queries": queries}) if queries else []
+        next_cursor = _instruction_next_cursor(result, pending, len(targets))
         legacy_tool = "insn_query"
     else:
-        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported search kind: {kind}")
-    next_cursor = _search_next_cursor(result)
+        offset = _decode_cursor(cursor)
+        if normalized == "text":
+            if len(targets) != 1:
+                raise VNextError(ErrorCode.INVALID_OPERATION, "Text search accepts one pattern")
+            result = _legacy_call(
+                "search_text",
+                {
+                    "pattern": targets[0],
+                    "limit": limit,
+                    "start": hex(offset) if cursor else "",
+                    "end": "",
+                    "regex": False,
+                    "case_sensitive": False,
+                    "include": "all",
+                    "code_only": False,
+                },
+            )
+            legacy_tool = "search_text"
+        elif normalized == "regex":
+            if len(targets) != 1:
+                raise VNextError(ErrorCode.INVALID_OPERATION, "Regex search accepts one pattern")
+            result = _legacy_call("find_regex", {"pattern": targets[0], "limit": limit, "offset": offset})
+            legacy_tool = "find_regex"
+        elif normalized == "bytes":
+            result = _legacy_call("find_bytes", {"patterns": targets, "limit": limit, "offset": offset})
+            legacy_tool = "find_bytes"
+        elif normalized == "constant":
+            result = _legacy_call(
+                "find",
+                {
+                    "type": "immediate",
+                    "targets": targets,
+                    "limit": limit,
+                    "offset": offset,
+                },
+            )
+            legacy_tool = "find"
+        else:
+            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported search kind: {kind}")
+        next_cursor = _search_next_cursor(result)
     return ToolEnvelope(
         result,
         provenance={"legacy_tool": legacy_tool},
-        truncated=next_cursor is not None,
+        truncated=next_cursor is not None or _result_truncated(result),
         next_cursor=next_cursor,
     ).to_dict()
 
@@ -688,28 +832,63 @@ def graph_query(
     targets: Annotated[list[str], "Root functions or addresses"],
     max_depth: Annotated[int, "Maximum traversal depth"] = 3,
     limit: Annotated[int, "Maximum nodes or blocks"] = 1000,
+    cursor: Annotated[str | None, "Opaque continuation cursor"] = None,
 ) -> dict[str, Any]:
     """Query xrefs, call graphs, or control-flow graphs."""
 
-    if kind == "xrefs":
-        result = _legacy_call("xrefs_to", {"addrs": targets, "limit": limit})
-    elif kind == "xrefs_from":
-        result = _legacy_call(
-            "xref_query",
-            {"queries": [{"query": target, "direction": "from", "count": limit} for target in targets]},
-        )
-    elif kind == "xrefs_both":
-        result = _legacy_call(
-            "xref_query",
-            {"queries": [{"query": target, "direction": "both", "count": limit} for target in targets]},
-        )
+    if kind in {"xrefs", "xrefs_from", "xrefs_both", "cfg"}:
+        states = _batch_cursor_states(cursor, len(targets), "graph")
+        pending = [
+            (index, target, state)
+            for index, (target, state) in enumerate(zip(targets, states))
+            if state is not None
+        ]
+        if kind == "cfg":
+            result = []
+            for _index, target, state in pending:
+                page = _legacy_call(
+                    "basic_blocks",
+                    {
+                        "addrs": [target],
+                        "max_blocks": limit,
+                        "offset": state["offset"],
+                    },
+                )
+                result.extend(page if isinstance(page, list) else [page])
+        else:
+            direction = {
+                "xrefs": "to",
+                "xrefs_from": "from",
+                "xrefs_both": "both",
+            }[kind]
+            result = _legacy_call(
+                "xref_query",
+                {
+                    "queries": [
+                        {
+                            "query": target,
+                            "direction": direction,
+                            "offset": state["offset"],
+                            "count": limit,
+                        }
+                        for _index, target, state in pending
+                    ]
+                },
+            )
+        next_cursor = _batch_next_cursor(result, pending, len(targets), "graph")
     elif kind == "calls":
+        if cursor:
+            raise VNextError(ErrorCode.INVALID_OPERATION, "Call graphs do not support cursor continuation")
         result = _legacy_call("callgraph", {"roots": targets, "max_depth": max_depth, "max_nodes": limit, "max_edges": limit * 2, "max_edges_per_func": 100})
-    elif kind == "cfg":
-        result = _legacy_call("basic_blocks", {"addrs": targets, "max_blocks": limit, "offset": 0})
+        next_cursor = None
     else:
         raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported graph kind: {kind}")
-    return ToolEnvelope(result, provenance={"kind": kind}).to_dict()
+    return ToolEnvelope(
+        result,
+        provenance={"kind": kind},
+        truncated=next_cursor is not None or _result_truncated(result),
+        next_cursor=next_cursor,
+    ).to_dict()
 
 
 @tool
@@ -908,6 +1087,9 @@ def investigation_start(
                 context.progress(0.1 + 0.8 * ((index + 1) / max(1, len(seeds))), f"analyzed {seed}")
             manager.set_state(record.investigation_id, "completed", triage=triage, analyses=analyses)
             return manager.get(record.investigation_id).to_dict()
+        except CancelledError:
+            manager.set_state(record.investigation_id, "cancelled")
+            raise
         except Exception:
             manager.set_state(record.investigation_id, "failed")
             raise
@@ -1204,22 +1386,25 @@ def _parse_operations(values: list[dict[str, Any]]) -> list[MutationOperation]:
 
 
 def _legacy_result_failed(result: Any) -> str | None:
-    if isinstance(result, dict):
-        if result.get("ok") is False:
-            return str(result.get("error") or "operation failed")
-        if result.get("error") and result.get("ok") is not True:
-            return str(result["error"])
-        return None
-    if isinstance(result, list):
-        errors = []
-        for item in result:
-            if not isinstance(item, dict):
-                continue
-            if item.get("ok") is False or (item.get("error") and item.get("ok") is not True):
-                errors.append(str(item.get("error") or item))
-        if errors:
-            return "; ".join(errors)
-    return None
+    errors: list[str] = []
+
+    def collect(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            if value.get("ok") is False:
+                errors.append(f"{path}: {value.get('error') or 'operation failed'}")
+                return
+            if value.get("error") and value.get("ok") is not True:
+                errors.append(f"{path}: {value['error']}")
+                return
+            for key, nested in value.items():
+                if key not in {"summary", "error"}:
+                    collect(nested, f"{path}.{key}")
+        elif isinstance(value, list):
+            for index, nested in enumerate(value):
+                collect(nested, f"{path}[{index}]")
+
+    collect(result, "$")
+    return "; ".join(errors) if errors else None
 
 
 def _checkpoint_path(transaction_id: str) -> str:

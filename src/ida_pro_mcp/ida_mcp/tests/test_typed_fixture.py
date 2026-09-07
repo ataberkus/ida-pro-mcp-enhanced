@@ -100,7 +100,7 @@ def test_typed_fixture_find_variants():
 @test(binary="typed_fixture.elf")
 def test_typed_fixture_basic_blocks_export_and_callgraph():
     """typed fixture exercises CFG/export/callgraph paths with deterministic content."""
-    blocks = basic_blocks(USE_WRAPPER)
+    blocks = basic_blocks("use_wrapper")
     assert blocks[0]["total_blocks"] >= 5
 
     exported = export_funcs(USE_WRAPPER, format="prototypes")
@@ -110,18 +110,29 @@ def test_typed_fixture_basic_blocks_export_and_callgraph():
     graph = callgraph(USE_WRAPPER, max_depth=1)
     names = {node["name"] for node in graph[0]["nodes"]}
     assert {"use_wrapper", "sum_point"}.issubset(names)
+    node_addresses = {node["addr"] for node in graph[0]["nodes"]}
+    assert all(
+        edge["from"] in node_addresses and edge["to"] in node_addresses
+        for edge in graph[0]["edges"]
+    )
+    assert all(edge["from"] != edge["to"] for edge in graph[0]["edges"])
 
 
 @test(binary="typed_fixture.elf")
 def test_typed_fixture_memory_and_globals():
     """typed fixture exposes deterministic string/global/integer values."""
-    s = get_string(G_MESSAGE)
+    s = get_string("g_message")
     assert s[0]["value"] == "typed fixture says hi"
+
+    raw = get_bytes({"addr": "g_numbers", "size": 4})[0]
+    assert_ok(raw, "data")
+    assert len(raw["data"].split()) == 4
 
     gv = get_global_value("g_point")
     assert_ok(gv[0], "value")
 
-    val = get_int({"addr": G_NUMBERS, "ty": "u32"})[0]
+    val = get_int({"addr": "g_numbers", "ty": "u32"})[0]
+    assert_ok(val, "value")
     assert isinstance(val["value"], int)
 
 

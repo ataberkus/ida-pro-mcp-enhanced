@@ -1,6 +1,5 @@
 import json
 import os
-import time
 
 
 def test_sanitize_prefix_basic(discovery):
@@ -52,8 +51,8 @@ def test_assign_prefixes_two_prefixed(discovery):
 
 
 def test_assign_prefixes_collision_disambiguates(discovery):
-    a = discovery.InstanceInfo("aaa111", 1, "127.0.0.1", 13337, "s", "i", "same.exe", "t")
-    b = discovery.InstanceInfo("bbb222", 2, "127.0.0.1", 13338, "s", "i", "same.exe", "t")
+    a = discovery.InstanceInfo("abcdef-one", 1, "127.0.0.1", 13337, "s", "i", "same.exe", "t")
+    b = discovery.InstanceInfo("abcdef-two", 2, "127.0.0.1", 13338, "s", "i", "same.exe", "t")
     mapping = discovery.assign_prefixes([a, b])
-    assert mapping["aaa111"] != mapping["bbb222"]
-    assert mapping["aaa111"].startswith("same_exe_")
+    assert mapping["abcdef-one"] != mapping["abcdef-two"]
+    assert mapping["abcdef-one"].startswith("same_exe_")

@@ -264,6 +264,8 @@ class MutationReceipt:
     undo_available: bool
     status: str = "committed"
     warnings: list[str] = field(default_factory=list)
+    applied_operations: int = 0
+    error: dict[str, Any] | None = None
     schema_version: str = API_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:

@@ -96,49 +96,96 @@ class TransactionManager:
         apply_operation: Callable[[MutationOperation], Any],
         undo: Callable[[], bool] | None = None,
     ) -> MutationReceipt:
-        preview = self._get_live_preview(transaction_id)
-        if preview.database != database:
-            raise VNextError(ErrorCode.INVALID_DATABASE, "Transaction belongs to another database")
-        current_revision = self.revisions.current(database)
-        if current_revision != preview.revision:
-            raise VNextError(
-                ErrorCode.STALE_REVISION,
-                "Database changed after mutation preview",
-                details={"expected": preview.revision, "actual": current_revision},
-            )
-        enabled = {SafetyScope(scope) for scope in enabled_scopes}
-        required = {SafetyScope(scope) for scope in preview.required_scopes}
-        if missing := required - enabled:
-            raise VNextError(
-                ErrorCode.PROFILE_DENIED,
-                "Mutation commit lost required safety scopes",
-                details={"missing": sorted(scope.value for scope in missing)},
-            )
-
-        checkpoint_path = checkpoint(transaction_id)
-        undo_available = undo is not None
-        try:
-            for operation in preview.operations:
-                apply_operation(operation)
-        except Exception:
-            if undo is not None:
-                undo()
-            raise
-
-        revision_after = self.revisions.bump(database)
-        receipt = MutationReceipt(
-            transaction_id=transaction_id,
-            database=database,
-            revision_before=preview.revision,
-            revision_after=revision_after,
-            committed_at=_utc_now().isoformat(),
-            checkpoint=checkpoint_path,
-            undo_available=undo_available,
-        )
         with self._lock:
+            preview = self._get_live_preview(transaction_id)
+            if preview.database != database:
+                raise VNextError(ErrorCode.INVALID_DATABASE, "Transaction belongs to another database")
+            current_revision = self.revisions.current(database)
+            if current_revision != preview.revision:
+                raise VNextError(
+                    ErrorCode.STALE_REVISION,
+                    "Database changed after mutation preview",
+                    details={"expected": preview.revision, "actual": current_revision},
+                )
+            enabled = {SafetyScope(scope) for scope in enabled_scopes}
+            required = {SafetyScope(scope) for scope in preview.required_scopes}
+            if missing := required - enabled:
+                raise VNextError(
+                    ErrorCode.PROFILE_DENIED,
+                    "Mutation commit lost required safety scopes",
+                    details={"missing": sorted(scope.value for scope in missing)},
+                )
+
+            checkpoint_path = checkpoint(transaction_id)
+            applied_operations = 0
+            try:
+                for operation in preview.operations:
+                    apply_operation(operation)
+                    applied_operations += 1
+            except Exception as exc:
+                restored = False
+                recovery_error: str | None = None
+                if applied_operations and undo is not None:
+                    try:
+                        restored = bool(undo())
+                    except Exception as undo_exc:
+                        recovery_error = str(undo_exc)
+                revision_after = (
+                    self.revisions.bump(database)
+                    if applied_operations
+                    else self.revisions.current(database)
+                )
+                if isinstance(exc, VNextError):
+                    error = exc.to_dict()
+                    code = exc.code
+                    message = str(exc)
+                    details = dict(exc.details)
+                else:
+                    error = {"code": ErrorCode.INVALID_OPERATION.value, "message": str(exc)}
+                    code = ErrorCode.INVALID_OPERATION
+                    message = str(exc)
+                    details = {}
+                receipt = MutationReceipt(
+                    transaction_id=transaction_id,
+                    database=database,
+                    revision_before=preview.revision,
+                    revision_after=revision_after,
+                    committed_at=_utc_now().isoformat(),
+                    checkpoint=checkpoint_path,
+                    undo_available=False,
+                    status="failed_rolled_back" if restored else "failed",
+                    warnings=(
+                        ["Applied operations were rolled back after commit failure"]
+                        if restored
+                        else (
+                            ["Commit failed after applying one or more operations"]
+                            if applied_operations
+                            else ["Commit failed before applying any operation"]
+                        )
+                    )
+                    + ([f"Automatic recovery failed: {recovery_error}"] if recovery_error else []),
+                    applied_operations=applied_operations,
+                    error=error,
+                )
+                self._receipts[transaction_id] = receipt
+                self._previews.pop(transaction_id, None)
+                details["transaction"] = receipt.to_dict()
+                raise VNextError(code, message, details=details) from exc
+
+            revision_after = self.revisions.bump(database)
+            receipt = MutationReceipt(
+                transaction_id=transaction_id,
+                database=database,
+                revision_before=preview.revision,
+                revision_after=revision_after,
+                committed_at=_utc_now().isoformat(),
+                checkpoint=checkpoint_path,
+                undo_available=undo is not None,
+                applied_operations=applied_operations,
+            )
             self._receipts[transaction_id] = receipt
             self._previews.pop(transaction_id, None)
-        return receipt
+            return receipt
 
     def status(self, transaction_id: str) -> dict[str, Any]:
         with self._lock:
@@ -162,20 +209,37 @@ class TransactionManager:
     ) -> MutationReceipt:
         with self._lock:
             receipt = self._receipts.get(transaction_id)
-        if receipt is None:
-            raise VNextError(ErrorCode.TRANSACTION_NOT_FOUND, f"No committed transaction: {transaction_id}")
-        restored = rollback_undo() if rollback_undo is not None else False
-        if not restored and receipt.checkpoint and restore_checkpoint is not None:
-            restored = restore_checkpoint(receipt.checkpoint)
-        if not restored:
-            raise VNextError(
-                ErrorCode.REOPEN_REQUIRED,
-                "Live rollback is unavailable; reopen the recovery checkpoint",
-                details={"checkpoint": receipt.checkpoint},
-            )
-        receipt.status = "rolled_back"
-        receipt.revision_after = self.revisions.bump(receipt.database)
-        return receipt
+            if receipt is None:
+                raise VNextError(ErrorCode.TRANSACTION_NOT_FOUND, f"No committed transaction: {transaction_id}")
+            if receipt.status != "committed":
+                raise VNextError(
+                    ErrorCode.INVALID_OPERATION,
+                    f"Transaction cannot be rolled back from state: {receipt.status}",
+                    details={"status": receipt.status},
+                )
+            current_revision = self.revisions.current(receipt.database)
+            if current_revision != receipt.revision_after:
+                raise VNextError(
+                    ErrorCode.STALE_REVISION,
+                    "A newer database mutation prevents transaction rollback",
+                    details={
+                        "expected": receipt.revision_after,
+                        "actual": current_revision,
+                    },
+                )
+            restored = rollback_undo() if rollback_undo is not None else False
+            if not restored and receipt.checkpoint and restore_checkpoint is not None:
+                restored = restore_checkpoint(receipt.checkpoint)
+            if not restored:
+                raise VNextError(
+                    ErrorCode.REOPEN_REQUIRED,
+                    "Live rollback is unavailable; reopen the recovery checkpoint",
+                    details={"checkpoint": receipt.checkpoint},
+                )
+            receipt.status = "rolled_back"
+            receipt.revision_after = self.revisions.bump(receipt.database)
+            receipt.undo_available = False
+            return receipt
 
     def _get_live_preview(self, transaction_id: str) -> MutationPreview:
         with self._lock:

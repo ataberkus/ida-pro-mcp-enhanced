@@ -88,7 +88,7 @@ def assign_prefixes(instances: list[InstanceInfo]) -> dict[str, str]:
             prefixes[ids[0]] = f"{base}__"
         else:
             for iid in ids:
-                prefixes[iid] = f"{base}_{iid[:4]}__"
+                prefixes[iid] = f"{base}_{sanitize_prefix(iid)}__"
     return prefixes
 
 

@@ -60,7 +60,8 @@ class InvestigationManager:
         with self._lock:
             record = self.get(investigation_id)
             record.job_id = job_id
-            record.state = "running"
+            if record.state not in {"completed", "failed", "cancelled", "interrupted"}:
+                record.state = "running"
             record.updated_at = _utc_now()
             self._persist_locked()
         self._notify(record)

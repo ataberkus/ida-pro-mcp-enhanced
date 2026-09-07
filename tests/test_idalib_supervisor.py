@@ -44,6 +44,7 @@ class _FakeSupervisor(supmod.IdalibSupervisor):
             host="127.0.0.1",
             port=1,
             process=_FakeProcess(),
+            auth_token="ephemeral-secret",
         )
 
     def _worker_rpc(self, worker, payload, *, timeout=None):
@@ -625,6 +626,7 @@ def test_open_session_forwards_warmup_flags_and_captures_result(tmp_path):
     assert args["run_auto_analysis"] is False
     assert session.last_warmup is not None
     assert session.last_warmup["ok"] is True
+    assert session.auth_token == "ephemeral-secret"
 
 
 def test_open_session_forwards_idle_ttl_sec(tmp_path):
@@ -687,6 +689,56 @@ def test_open_session_reuses_schema_worker(tmp_path):
     assert session.session_id == "sample"
     assert sup.opened[0][1]["preferred_session_id"] == "sample"
 
+
+
+def test_session_resource_forwards_worker_local_active_uri(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    sup.open_session(str(sample), session_id="sample")
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = sup
+    try:
+        response = supmod._handle_resources_read(
+            {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "resources/read",
+                "params": {"uri": "ida://sessions/sample/metadata"},
+            }
+        )
+    finally:
+        supmod.supervisor = old_supervisor
+
+    assert response["result"] == {"ok": True}
+    assert sup.forwarded[-1]["params"]["uri"] == "ida://sessions/active/metadata"
+
+
+def test_protocol_cancellation_routes_to_tracked_worker(monkeypatch):
+    sup = _FakeSupervisor()
+    worker = sup._spawn_worker()
+    sup._track_worker_request("transport-1", 41, worker)
+    old_supervisor = supmod.supervisor
+    supmod.supervisor = sup
+    monkeypatch.setattr(
+        supmod.mcp,
+        "get_current_transport_session_id",
+        lambda: "transport-1",
+    )
+    try:
+        result = supmod.dispatch_supervisor(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 41, "reason": "test"},
+            }
+        )
+    finally:
+        supmod.supervisor = old_supervisor
+
+    assert result is None
+    assert sup.forwarded[-1]["method"] == "notifications/cancelled"
+    assert sup.forwarded[-1]["params"]["requestId"] == 41
 
 def test_resolve_session_only_accepts_session_id(tmp_path):
     sample = tmp_path / "sample.bin"

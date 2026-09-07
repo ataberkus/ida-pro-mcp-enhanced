@@ -179,7 +179,10 @@ def test_instruction_search_maps_to_broad_insn_query(monkeypatch):
 
     def fake_legacy_call(name, arguments=None):
         calls.append((name, arguments))
-        return [{"cursor": {"next": 17}, "matches": []}]
+        return [
+            {"cursor": {"next": 17}, "matches": []},
+            {"cursor": {"next": 17}, "matches": []},
+        ]
 
     monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
     incoming = api_vnext._encode_cursor(7)
@@ -205,6 +208,67 @@ def test_instruction_search_maps_to_broad_insn_query(monkeypatch):
     ]
     assert result["provenance"]["legacy_tool"] == "insn_query"
     assert result["next_cursor"] == api_vnext._encode_cursor(17)
+
+
+def test_instruction_search_resumes_after_scan_budget(monkeypatch):
+    _rpc, api_vnext = _load_vnext_api()
+    calls = []
+
+    def fake_legacy_call(name, arguments=None):
+        calls.append((name, arguments))
+        if len(calls) == 1:
+            return [
+                {
+                    "cursor": {"done": True},
+                    "matches": [],
+                    "truncated": True,
+                    "next_start": "0x401100",
+                }
+            ]
+        return [{"cursor": {"done": True}, "matches": [], "truncated": False}]
+
+    monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
+    first = api_vnext.search("instruction", ["mov"], 10)
+    second = api_vnext.search("instruction", ["mov"], 10, first["next_cursor"])
+
+    assert first["truncated"] is True
+    assert calls[1][1]["queries"][0]["start"] == "0x401100"
+    assert calls[1][1]["queries"][0]["offset"] == 0
+    assert second["truncated"] is False
+    assert second["next_cursor"] is None
+
+
+def test_graph_query_tracks_target_specific_pagination(monkeypatch):
+    _rpc, api_vnext = _load_vnext_api()
+    calls = []
+
+    def fake_legacy_call(name, arguments=None):
+        calls.append((name, arguments))
+        if len(calls) == 1:
+            return [
+                {"items": [], "next_offset": 4, "truncated": True},
+                {"items": [], "next_offset": None, "truncated": False},
+            ]
+        return [{"items": [], "next_offset": None, "truncated": False}]
+
+    monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
+    first = api_vnext.graph_query("xrefs_from", ["main", "helper"], limit=4)
+    second = api_vnext.graph_query(
+        "xrefs_from",
+        ["main", "helper"],
+        limit=4,
+        cursor=first["next_cursor"],
+    )
+
+    assert first["truncated"] is True
+    assert calls[0][1]["queries"] == [
+        {"query": "main", "direction": "from", "offset": 0, "count": 4},
+        {"query": "helper", "direction": "from", "offset": 0, "count": 4},
+    ]
+    assert calls[1][1]["queries"] == [
+        {"query": "main", "direction": "from", "offset": 4, "count": 4}
+    ]
+    assert second["truncated"] is False
 
 
 def test_mutation_aliases_reshape_set_name_and_rename_func():
@@ -345,6 +409,50 @@ def test_apply_operation_uses_reshaped_flat_rename(monkeypatch):
         ("rename", {"batch": {"func": [{"addr": "0x401000", "name": "Foo"}]}})
     ]
 
+
+
+def test_legacy_mutation_failure_detects_nested_batch_errors():
+    _rpc, api_vnext = _load_vnext_api()
+    result = {
+        "summary": {"total": 2, "ok": 1, "failed": 1},
+        "func": [
+            {"ok": True, "addr": "0x401000"},
+            {"ok": False, "addr": "0x401100", "error": "duplicate name"},
+        ],
+    }
+
+    assert api_vnext._legacy_result_failed(result) == "$.func[1]: duplicate name"
+
+
+def test_investigation_cancellation_remains_cancelled(monkeypatch):
+    _rpc, api_vnext = _load_vnext_api()
+    triage_started = threading.Event()
+    release_triage = threading.Event()
+    monkeypatch.setattr(api_vnext, "_load_idb_state", lambda _key: {})
+    monkeypatch.setattr(api_vnext, "_save_idb_state", lambda _key, _state: None)
+    monkeypatch.setattr(api_vnext, "_database_id", lambda: "db")
+    api_vnext._JOBS = None
+    api_vnext._INVESTIGATIONS = None
+
+    def fake_analysis(mode, targets, options):
+        if mode == "triage":
+            triage_started.set()
+            assert release_triage.wait(2)
+        return {"mode": mode}
+
+    monkeypatch.setattr(api_vnext, "_analysis_sync", fake_analysis)
+    investigation = api_vnext.investigation_start("cancel me", seeds=["main"])
+    assert triage_started.wait(2)
+    assert api_vnext.job_cancel(investigation["job_id"])["cancel_requested"] is True
+    release_triage.set()
+
+    for _ in range(200):
+        state = api_vnext.investigation_get(investigation["investigation_id"])["state"]
+        if state == "cancelled":
+            break
+        threading.Event().wait(0.01)
+    assert state == "cancelled"
+    api_vnext._jobs().shutdown()
 
 def test_bridge_legacy_backends_are_defined_in_source():
     root = pathlib.Path(__file__).resolve().parents[1] / "src" / "ida_pro_mcp" / "ida_mcp"

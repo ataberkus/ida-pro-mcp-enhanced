@@ -51,9 +51,14 @@ def test_get_bytes_reads_valid_region():
 @test()
 def test_get_bytes_invalid():
     """get_bytes reports an error for an unmapped address."""
-    result = get_bytes({"addr": get_unmapped_address(), "size": 16})
-    assert_is_list(result, min_length=1)
-    if result[0].get("data") is None:
+    unmapped = get_unmapped_address()
+    results = [
+        get_bytes({"addr": unmapped, "size": 16}),
+        get_int({"addr": unmapped, "ty": "u32"}),
+        get_string(unmapped),
+    ]
+    for result in results:
+        assert_is_list(result, min_length=1)
         assert_error(result[0])
 
 

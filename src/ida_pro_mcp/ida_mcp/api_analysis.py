@@ -15,6 +15,7 @@ import ida_idaapi
 import ida_xref
 import ida_ua
 import ida_name
+import ida_idp
 from .rpc import tool
 from .sync import (
     idasync,
@@ -1414,7 +1415,17 @@ def basic_blocks(
     results = []
     for fn_addr in addrs:
         try:
-            ea = parse_address(fn_addr)
+            ea, resolve_error = _resolve_function_start(fn_addr)
+            if ea is None:
+                results.append(
+                    {
+                        "addr": fn_addr,
+                        "error": f"Function not found: {resolve_error}" if resolve_error else "Function not found",
+                        "blocks": [],
+                        "cursor": {"done": True},
+                    }
+                )
+                continue
             func = ida_funcs.get_func(ea)
             if not func:
                 results.append(
@@ -2111,9 +2122,10 @@ def callgraph(
                 )
                 continue
 
-            nodes = {}
-            edges = []
-            visited = set()
+            nodes: dict[str, dict] = {}
+            edges: list[dict] = []
+            edge_keys: set[tuple[int, int]] = set()
+            expanded: set[int] = set()
             truncated = False
             per_func_capped = False
             limit_reason = None
@@ -2123,33 +2135,41 @@ def callgraph(
                 truncated = True
                 limit_reason = reason
 
-            def traverse(addr, depth):
-                nonlocal per_func_capped
-                if truncated:
-                    return
-                if depth > max_depth or addr in visited:
-                    return
+            def add_node(addr: int, depth: int) -> bool:
+                key = hex(addr)
+                if key in nodes:
+                    return True
                 if len(nodes) >= max_nodes:
                     hit_limit("nodes")
-                    return
-                visited.add(addr)
+                    return False
+                f = ida_funcs.get_func(addr)
+                if not f:
+                    return False
+                nodes[key] = {
+                    "addr": key,
+                    "name": ida_funcs.get_func_name(f.start_ea),
+                    "depth": depth,
+                }
+                return True
 
+            def traverse(addr: int, depth: int) -> None:
+                nonlocal per_func_capped
+                if addr in expanded or not add_node(addr, depth):
+                    return
+                expanded.add(addr)
+                if depth >= max_depth:
+                    return
                 f = ida_funcs.get_func(addr)
                 if not f:
                     return
 
-                func_name = ida_funcs.get_func_name(f.start_ea)
-                nodes[hex(addr)] = {
-                    "addr": hex(addr),
-                    "name": func_name,
-                    "depth": depth,
-                }
-
-                # Get callees
                 edges_added = 0
                 for item_ea in idautils.FuncItems(f.start_ea):
                     if truncated:
                         break
+                    insn = ida_ua.insn_t()
+                    if not ida_ua.decode_insn(insn, item_ea) or not ida_idp.is_call_insn(insn):
+                        continue
                     for xref in idautils.CodeRefsFrom(item_ea, 0):
                         if truncated:
                             break
@@ -2157,19 +2177,27 @@ def callgraph(
                             per_func_capped = True
                             break
                         callee_func = ida_funcs.get_func(xref)
-                        if callee_func:
-                            if len(edges) >= max_edges:
-                                hit_limit("edges")
-                                break
-                            edges.append(
-                                {
-                                    "from": hex(addr),
-                                    "to": hex(callee_func.start_ea),
-                                    "type": "call",
-                                }
-                            )
-                            edges_added += 1
-                            traverse(callee_func.start_ea, depth + 1)
+                        if not callee_func:
+                            continue
+                        callee = callee_func.start_ea
+                        edge_key = (addr, callee)
+                        if edge_key in edge_keys:
+                            continue
+                        if len(edges) >= max_edges:
+                            hit_limit("edges")
+                            break
+                        if not add_node(callee, depth + 1):
+                            break
+                        edge_keys.add(edge_key)
+                        edges.append(
+                            {
+                                "from": hex(addr),
+                                "to": hex(callee),
+                                "type": "call",
+                            }
+                        )
+                        edges_added += 1
+                        traverse(callee, depth + 1)
                     if edges_added >= max_edges_per_func:
                         break
 

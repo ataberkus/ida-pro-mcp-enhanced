@@ -1,4 +1,5 @@
 import argparse
+import importlib.util as _ilu
 import http.client
 import json
 import os
@@ -7,6 +8,7 @@ import traceback
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
+from threading import RLock
 from urllib.parse import urlparse
 
 try:
@@ -51,7 +53,6 @@ def _installer():
 
 # Load IDA-free helper modules by file path (the ida_mcp package __init__ imports
 # idaapi, which is unavailable outside IDA, so we must not import the package).
-import importlib.util as _ilu
 
 
 def _load_helper(mod_name: str, filename: str):
@@ -91,6 +92,10 @@ dispatch_original = mcp.registry.dispatch
 # Discovery-driven routing table. Rebuilt whenever the live instance set changes.
 _tool_table: "_discovery.ToolTable | None" = None
 _tool_table_signature: tuple | None = None
+_tool_fetch_failures: set[str] = set()
+_tool_table_lock = RLock()
+_pending_routes: dict[int | str | float, tuple[str, int]] = {}
+_pending_routes_lock = RLock()
 
 
 def _post_to_ida(payload: bytes, host: str, port: int) -> dict:
@@ -136,29 +141,73 @@ def _emit_tools_list_changed() -> None:
         pass
 
 
-def _refresh_tool_table():
-    """Rebuild the routing table from the live instance set when it changes."""
-    global _tool_table, _tool_table_signature
-    instances = _discovery.read_registry_dir(_registry.registry_dir())
-    prefixes = _discovery.assign_prefixes(instances)
-    targets = [
-        _discovery.InstanceTarget(id=i.id, host=i.host, port=i.port, prefix=prefixes[i.id])
-        for i in instances
-    ]
-    signature = tuple(sorted((t.id, t.port, t.prefix) for t in targets))
-    if _tool_table is None or signature != _tool_table_signature:
+def _refresh_tool_table(*, force: bool = False):
+    """Refresh discovery and retry failed or explicitly requested tool fetches."""
+    global _tool_table, _tool_table_signature, _tool_fetch_failures
+    with _tool_table_lock:
+        instances = _discovery.read_registry_dir(_registry.registry_dir())
+        prefixes = _discovery.assign_prefixes(instances)
+        targets = [
+            _discovery.InstanceTarget(id=i.id, host=i.host, port=i.port, prefix=prefixes[i.id])
+            for i in instances
+        ]
+        signature = tuple(sorted((t.id, t.port, t.prefix) for t in targets))
+        if (
+            _tool_table is not None
+            and signature == _tool_table_signature
+            and not force
+            and not _tool_fetch_failures
+        ):
+            return _tool_table
+
         tools_by_id = {}
-        for t in targets:
+        failures: set[str] = set()
+        for target in targets:
             try:
-                tools_by_id[t.id] = _fetch_tools_for(t.host, t.port)
+                tools_by_id[target.id] = _fetch_tools_for(target.host, target.port)
             except Exception:
-                tools_by_id[t.id] = []
-        _tool_table = _discovery.build_tool_table(targets, tools_by_id)
-        changed = _tool_table_signature is not None
+                tools_by_id[target.id] = []
+                failures.add(target.id)
+        refreshed = _discovery.build_tool_table(targets, tools_by_id)
+        changed = (
+            _tool_table is not None
+            and (
+                signature != _tool_table_signature
+                or refreshed.schemas != _tool_table.schemas
+            )
+        )
+        _tool_table = refreshed
         _tool_table_signature = signature
+        _tool_fetch_failures = failures
         if changed:
             _emit_tools_list_changed()
-    return _tool_table
+        return _tool_table
+
+
+def _proxy_failure_response(
+    request_id: int | str | float | None,
+    exc: Exception,
+) -> JsonRpcResponse | None:
+    if request_id is None:
+        return None
+    shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
+    return JsonRpcResponse(
+        {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": (
+                    "Failed to complete request to IDA Pro. "
+                    f"Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n"
+                    "The request was not retried automatically. "
+                    "If this was a mutating operation, verify IDA state before retrying.\n"
+                    f"{traceback.format_exc()}"
+                ),
+                "data": str(exc),
+            },
+            "id": request_id,
+        }
+    )
 
 
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
@@ -179,14 +228,27 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         return dispatch_original(request)
     if method == "initialize":
         return dispatch_original(request)
-    if method.startswith("notifications/") and method != "notifications/cancelled":
+    if method == "notifications/cancelled":
+        params = request_obj.get("params") or {}
+        request_id = params.get("requestId")
+        with _pending_routes_lock:
+            target = _pending_routes.get(request_id)
+        if target is None:
+            return dispatch_original(request)
+        try:
+            payload = json.dumps(request_obj).encode("utf-8")
+            _post_to_ida(payload, target[0], target[1])
+        except Exception:
+            pass
+        return None
+    if method.startswith("notifications/"):
         return dispatch_original(request)
 
     # Answer tools/list locally from the discovery-driven routing table.
     if method == "tools/list":
         request_id = request_obj.get("id")
         try:
-            result = {"tools": _refresh_tool_table().list_tools()}
+            result = {"tools": _refresh_tool_table(force=True).list_tools()}
         except Exception as e:
             result = {"tools": [], "error": str(e)}
         return JsonRpcResponse(
@@ -229,7 +291,18 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
             )
         params["name"] = inner  # strip prefix before proxying
         payload = json.dumps({**request_obj, "params": params}).encode("utf-8")
-        return _post_to_ida(payload, host, port)
+        if request_id is not None:
+            with _pending_routes_lock:
+                _pending_routes[request_id] = (host, port)
+        try:
+            return _post_to_ida(payload, host, port)
+        except Exception as exc:
+            return _proxy_failure_response(request_id, exc)
+        finally:
+            if request_id is not None:
+                with _pending_routes_lock:
+                    if _pending_routes.get(request_id) == (host, port):
+                        _pending_routes.pop(request_id, None)
 
     payload: bytes | str | dict = request
     if isinstance(payload, dict):
@@ -240,29 +313,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
     try:
         return _post_to_ida(payload, IDA_HOST, IDA_PORT)
     except Exception as e:
-        full_info = traceback.format_exc()
-        request_id = request_obj.get("id")
-        if request_id is None:
-            return None  # Notification, no response needed
-
-        shortcut = "Ctrl+Option+M" if sys.platform == "darwin" else "Ctrl+Alt+M"
-        return JsonRpcResponse(
-            {
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32000,
-                    "message": (
-                        "Failed to complete request to IDA Pro. "
-                        f"Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n"
-                        "The request was not retried automatically. "
-                        "If this was a mutating operation, verify IDA state before retrying.\n"
-                        f"{full_info}"
-                    ),
-                    "data": str(e),
-                },
-                "id": request_id,
-            }
-        )
+        return _proxy_failure_response(request_obj.get("id"), e)
 
 
 mcp.registry.dispatch = dispatch_proxy

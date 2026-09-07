@@ -11,6 +11,7 @@ import ida_bytes
 import idaapi
 
 from .rpc import tool, unsafe
+from . import compat
 from .sync import idasync
 from .utils import (
     IntRead,
@@ -20,6 +21,33 @@ from .utils import (
     normalize_list_input,
     parse_address,
 )
+
+
+def _resolve_read_address(addr: str | int) -> int:
+    try:
+        return parse_address(addr)
+    except Exception as exc:
+        ea = idaapi.get_name_ea(idaapi.BADADDR, str(addr))
+        if ea == idaapi.BADADDR:
+            raise ValueError(f"Failed to resolve address or name: {addr}") from exc
+        return ea
+
+
+def _read_mapped_bytes(addr: str | int, size: int) -> bytes:
+    if size <= 0:
+        raise ValueError("Read size must be positive")
+    ea = _resolve_read_address(addr)
+    end_ea = ea + size
+    cursor = ea
+    while cursor < end_ea:
+        segment = compat.get_segment_info(cursor)
+        if segment is None:
+            raise ValueError(f"Address range is not mapped: {addr}")
+        cursor = min(end_ea, segment.end_ea)
+    data = ida_bytes.get_bytes(ea, size)
+    if data is None or len(data) != size:
+        raise ValueError(f"Failed to read {size} bytes at {addr}")
+    return data
 
 
 # ============================================================================
@@ -40,9 +68,9 @@ def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[dict]:
         size = item.get("size", 0)
 
         try:
-            ea = parse_address(addr)
-            data = " ".join(f"{x:#02x}" for x in ida_bytes.get_bytes(ea, size))
-            results.append({"addr": addr, "data": data})
+            data = _read_mapped_bytes(addr, int(size))
+            rendered = " ".join(f"{x:#02x}" for x in data)
+            results.append({"addr": addr, "data": rendered})
         except Exception as e:
             results.append({"addr": addr, "data": None, "error": str(e)})
 
@@ -109,11 +137,8 @@ def get_int(
 
         try:
             bits, signed, byte_order, normalized = _parse_int_class(ty)
-            ea = parse_address(addr)
             size = bits // 8
-            data = ida_bytes.get_bytes(ea, size)
-            if not data or len(data) != size:
-                raise ValueError(f"Failed to read {size} bytes at {addr}")
+            data = _read_mapped_bytes(addr, size)
 
             value = int.from_bytes(data, byte_order, signed=signed)
             results.append(
@@ -128,15 +153,17 @@ def get_int(
 @tool
 @idasync
 def get_string(
-    addrs: Annotated[list[str] | str, "Addresses to read strings from"],
+    addrs: Annotated[list[str] | str, "Addresses or names to read strings from"],
 ) -> list[dict]:
-    """Read strings from memory addresses"""
+    """Read strings from memory addresses or symbol names."""
     addrs = normalize_list_input(addrs)
     results = []
 
     for addr in addrs:
         try:
-            ea = parse_address(addr)
+            ea = _resolve_read_address(addr)
+            if compat.get_segment_info(ea) is None:
+                raise ValueError(f"Address is not mapped: {addr}")
             raw = idaapi.get_strlit_contents(ea, -1, 0)
             if not raw:
                 results.append(
