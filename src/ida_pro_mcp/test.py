@@ -16,10 +16,6 @@ import sys
 import argparse
 from pathlib import Path
 
-# idapro must go first to initialize idalib
-import idapro
-import ida_auto
-
 
 def main() -> int:
     """Entry point for ida-mcp-test command."""
@@ -83,6 +79,15 @@ With coverage:
         "round-trip and validate responses against outputSchema",
     )
     args = parser.parse_args()
+
+    try:
+        # idapro must go first to initialize idalib
+        import idapro
+        import ida_auto
+    except ImportError:
+        raise SystemExit(
+            "ida-mcp-test requires IDA idalib (idapro); run inside IDA Python or with idalib on PYTHONPATH"
+        )
 
     # Check binary exists and is a file
     if not args.binary.is_file():

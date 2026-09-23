@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from conftest import _load_module, IDA_MCP_DIR  # noqa: E402
 
-_registry = _load_module("ida_mcp_registry_probe", IDA_MCP_DIR / "registry.py")
+_discovery = _load_module("ida_mcp_discovery_probe", IDA_MCP_DIR / "discovery.py")
 
 
 def post(port: int, payload: dict) -> dict:
@@ -46,7 +46,7 @@ def call(port: int, name: str, args: dict) -> str:
 
 
 def main() -> None:
-    registry_dir = _registry.registry_dir()
+    registry_dir = _discovery.get_instances_dir()
     if not os.path.isdir(registry_dir):
         print(f"No registry dir at {registry_dir} — is any IDA instance running?")
         return

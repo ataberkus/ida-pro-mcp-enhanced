@@ -104,3 +104,21 @@ def test_set_idle_ttl_ignores_negative_load_time():
     lc = WorkerLifecycle(idle_ttl_sec=10.0)
     lc.set_idle_ttl(600.0, load_time_sec=-5.0)
     assert lc.idle_ttl_sec == 600.0
+
+
+def test_restart_after_stop_fires_new_callback():
+    first: list[str] = []
+    second: list[str] = []
+    done = threading.Event()
+
+    lc = WorkerLifecycle(idle_ttl_sec=60.0, poll_interval_sec=0.02)
+    lc.start(on_shutdown=lambda reason: first.append(reason))
+    lc.stop()
+    assert first == []
+    lc.idle_ttl_sec = 0.05
+    lc.start(on_shutdown=lambda reason: (second.append(reason), done.set()))
+    try:
+        assert done.wait(timeout=2.0), "restarted watchdog did not fire"
+        assert second and "no requests" in second[0]
+    finally:
+        lc.stop()

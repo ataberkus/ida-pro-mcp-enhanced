@@ -95,6 +95,7 @@ class TransactionManager:
         checkpoint: Callable[[str], str | None],
         apply_operation: Callable[[MutationOperation], Any],
         undo: Callable[[], bool] | None = None,
+        begin: Callable[[], bool] | None = None,
     ) -> MutationReceipt:
         with self._lock:
             preview = self._get_live_preview(transaction_id)
@@ -117,6 +118,11 @@ class TransactionManager:
                 )
 
             checkpoint_path = checkpoint(transaction_id)
+            if begin is not None:
+                try:
+                    begin()
+                except Exception:
+                    pass
             applied_operations = 0
             try:
                 for operation in preview.operations:
@@ -231,6 +237,12 @@ class TransactionManager:
             if not restored and receipt.checkpoint and restore_checkpoint is not None:
                 restored = restore_checkpoint(receipt.checkpoint)
             if not restored:
+                if receipt.checkpoint is None:
+                    raise VNextError(
+                        ErrorCode.REOPEN_REQUIRED,
+                        "Live rollback is unavailable and no recovery checkpoint was written (recovery checkpoints are disabled)",
+                        details={"checkpoint": None},
+                    )
                 raise VNextError(
                     ErrorCode.REOPEN_REQUIRED,
                     "Live rollback is unavailable; reopen the recovery checkpoint",

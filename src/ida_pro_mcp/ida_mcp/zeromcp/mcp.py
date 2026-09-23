@@ -429,6 +429,9 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         return result
 
     def _handle_sse_get(self):
+        if len(self.mcp_server._sse_connections) >= self.mcp_server.sse_max_connections:
+            self.send_error(503, "Too many SSE connections")
+            return
         # Create SSE connection wrapper
         conn = _McpSseConnection(self.wfile)
         self.mcp_server._sse_connections[conn.session_id] = conn
@@ -554,11 +557,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if not self.mcp_server.has_http_session(mcp_session_id):
-                logger.info(
-                    "[MCP] Re-registering HTTP session %s after reconnect",
-                    mcp_session_id,
-                )
-                self.mcp_server.register_http_session(mcp_session_id)
+                self.send_error(400, "Unknown Mcp-Session-Id. Call initialize first.")
+                return
 
         # Parse extensions from query params and store in thread-local
         extensions = self._parse_extensions(self.path)
@@ -626,10 +626,12 @@ class McpServer:
         self.resource_event_coalesce_sec = 0.1
         self.http_session_ttl_sec = 24 * 60 * 60
         self.http_session_max_count = 4096
+        self.sse_max_connections = 64
+        self.stdio_max_workers = 32
         self._protocol_version = threading.local()
         self._transport_session_id = threading.local()
-        self._enabled_extensions = threading.local()  # set[str] per request
-        self._extensions_registry = extensions if extensions is not None else {}  # group -> set of tool names
+        self._enabled_extensions = threading.local()
+        self._extensions_registry = extensions if extensions is not None else {}
         self.require_streamable_http_session = False
         self.http_authenticator: Callable[[str | None], None] | None = None
         self.tool_visibility_filter: Callable[[str], bool] | None = None
@@ -667,14 +669,17 @@ class McpServer:
     def prompt(self, func: Callable) -> Callable:
         return self.prompts.method(func)
 
-    def serve(self, host: str, port: int, *, background = True, request_handler = McpHttpRequestHandler):
+    def serve(self, host: str, port: int, *, background = True, threaded: bool | None = None, request_handler = McpHttpRequestHandler) -> int | None:
         if self._running:
             logger.info("[MCP] Server is already running")
-            return
-
+            if self._http_server is not None:
+                return self._http_server.server_address[1]
+            return None
+        if threaded is None:
+            threaded = background
         # Create server with deferred binding
         assert issubclass(request_handler, McpHttpRequestHandler)
-        self._http_server = (ThreadingHTTPServer if background else HTTPServer)(
+        self._http_server = (ThreadingHTTPServer if threaded else HTTPServer)(
             (host, port),
             request_handler,
             bind_and_activate=False
@@ -693,10 +698,8 @@ class McpServer:
             )
         else:
             self._http_server.allow_reuse_address = True
-
         # Set the MCPServer instance on the handler class
         setattr(self._http_server, "mcp_server", self)
-
         try:
             # Bind and activate in main thread - errors propagate synchronously
             self._http_server.server_bind()
@@ -706,14 +709,12 @@ class McpServer:
             self._http_server.server_close()
             self._http_server = None
             raise
-
+        bound_port: int = self._http_server.server_address[1]
         # Only start thread after successful bind
         self._running = True
-
         logger.info("[MCP] Server started")
-        logger.info("  Streamable HTTP: http://%s:%s/mcp", host, port)
-        logger.info("  SSE: http://%s:%s/sse", host, port)
-
+        logger.info("  Streamable HTTP: http://%s:%s/mcp", host, bound_port)
+        logger.info("  SSE: http://%s:%s/sse", host, bound_port)
         def serve_forever():
             try:
                 self._http_server.serve_forever() # type: ignore
@@ -721,12 +722,12 @@ class McpServer:
                 logger.exception("[MCP] Server error")
             finally:
                 self._running = False
-
         if background:
             self._server_thread = threading.Thread(target=serve_forever, daemon=True)
             self._server_thread.start()
         else:
             serve_forever()
+        return bound_port
 
     def stop(self):
         if not self._running:
@@ -759,6 +760,25 @@ class McpServer:
         write_lock = threading.Lock()
         workers: set[threading.Thread] = set()
         workers_lock = threading.Lock()
+        slots = threading.BoundedSemaphore(self.stdio_max_workers)
+
+        def _busy_response(request: bytes) -> None:
+            request_id = None
+            try:
+                parsed = json.loads(request)
+                if isinstance(parsed, dict):
+                    request_id = parsed.get("id")
+            except Exception:
+                pass
+            if request_id is None:
+                return
+            payload = json.dumps({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": "Server busy"}}).encode("utf-8") + b"\n"
+            try:
+                with write_lock:
+                    stdout.write(payload)
+                    stdout.flush()
+            except (BrokenPipeError, OSError):
+                pass
 
         def dispatch_request(request: bytes) -> None:
             response = None
@@ -781,7 +801,6 @@ class McpServer:
                     "error": {"code": -32603, "message": f"Internal Error: {exc}"},
                     "id": request_id,
                 }
-
             try:
                 if response is not None:
                     payload = json.dumps(response).encode("utf-8") + b"\n"
@@ -793,6 +812,7 @@ class McpServer:
             finally:
                 with workers_lock:
                     workers.discard(threading.current_thread())
+                slots.release()
 
         try:
             while True:
@@ -801,6 +821,9 @@ class McpServer:
                     break
                 request = request.strip()
                 if not request:
+                    continue
+                if not slots.acquire(blocking=False):
+                    _busy_response(request)
                     continue
                 worker = threading.Thread(target=dispatch_request, args=(request,), daemon=True)
                 with workers_lock:

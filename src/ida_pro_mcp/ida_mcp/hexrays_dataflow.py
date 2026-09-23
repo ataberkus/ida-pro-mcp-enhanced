@@ -12,7 +12,7 @@ from typing import Any
 from ida_pro_mcp.vnext.analysis import bounded_subgraph
 from ida_pro_mcp.vnext.contracts import AnalysisEngine, AnalysisGraph, ErrorCode, VNextError
 
-from .sync import IDAError, idasync
+from .sync import IDAError, idasync, tool_timeout
 from .utils import parse_address
 
 
@@ -32,16 +32,12 @@ def _has_common(left: Any, right: Any) -> bool:
 
 def _resolve_trace_address(addr: str | int) -> int:
     """Resolve a numeric address or IDA function/name to an effective address."""
+    from .utils import resolve_address_or_name
 
     try:
-        return parse_address(addr)
-    except IDAError:
-        import idaapi
-
-        ea = idaapi.get_name_ea(idaapi.BADADDR, str(addr))
-        if ea == idaapi.BADADDR:
-            raise VNextError(ErrorCode.INVALID_OPERATION, f"Address/name not found: {addr!r}")
-        return int(ea)
+        return resolve_address_or_name(addr)
+    except IDAError as exc:
+        raise VNextError(ErrorCode.INVALID_OPERATION, str(exc))
 
 
 def _predecessors(block: Any) -> list[int]:
@@ -77,6 +73,7 @@ def _term_mba(mba: Any) -> None:
 
 
 @idasync
+@tool_timeout(120.0)
 def trace_microcode(
     addr: str,
     *,
@@ -90,6 +87,8 @@ def trace_microcode(
         raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid data-flow direction: {direction}")
     if max_nodes < 1:
         raise VNextError(ErrorCode.LIMIT_EXCEEDED, "max_nodes must be positive")
+    if max_nodes > 10_000:
+        max_nodes = 10_000
 
     try:
         import ida_funcs

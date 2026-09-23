@@ -5,7 +5,6 @@ name the session they want to operate on explicitly via `activate_session`;
 there is no implicit "current session" or transport-context binding.
 """
 
-import uuid
 import threading
 import logging
 from pathlib import Path
@@ -19,6 +18,9 @@ import ida_auto
 from .ida_mcp.api_core import invalidate_strings_cache
 
 logger = logging.getLogger(__name__)
+
+# Defined once in the IDA-free supervisor so both runtimes share the grammar.
+from ida_pro_mcp.idalib_supervisor import normalize_session_id
 
 
 @dataclass
@@ -78,9 +80,8 @@ class IDASessionManager:
                     session.last_accessed = datetime.now()
                     return sid
 
-            if session_id is None:
-                session_id = str(uuid.uuid4())[:8]
-            elif session_id in self._sessions:
+            session_id = normalize_session_id(session_id)
+            if session_id in self._sessions:
                 raise ValueError(f"Session already exists: {session_id}")
 
             logger.info(f"Opening database: {input_path} (session: {session_id})")

@@ -128,7 +128,7 @@ class JsonRpcRegistry:
     def __init__(self):
         self.methods: dict[str, Callable] = {}
         self._cache: dict[Callable, tuple[inspect.Signature, dict, list[str]]] = {}
-        self.redact_exceptions = False
+        self.redact_exceptions = True
 
     def method(self, func: Callable, name: str | None = None) -> Callable:
         self.methods[name or func.__name__] = func # type: ignore
@@ -202,6 +202,7 @@ class JsonRpcRegistry:
                 logger.debug("[MCP] << %s (%.1fms) EXCEPTION: %s", method, elapsed_ms, e)
             if is_notification:
                 return None
+            logger.exception("[MCP] unhandled exception in %s", method)
             error = self.map_exception(e)
             return self._error(request_id, error["code"], error["message"], error.get("data"))
         finally:
@@ -211,7 +212,7 @@ class JsonRpcRegistry:
         if self.redact_exceptions:
             return {
                 "code": -32603,
-                "message": f"Internal Error: {str(e)}",
+                "message": f"Internal Error: {type(e).__name__}: {str(e)[:500]}",
             }
         return {
             "code": -32603,

@@ -168,19 +168,6 @@ class JobManager:
         self._notify(snapshot)
         return True
 
-    def mark_running_interrupted(self) -> int:
-        count = 0
-        with self._lock:
-            for record in self._records.values():
-                if record.state in {JobState.QUEUED, JobState.RUNNING}:
-                    record.state = JobState.INTERRUPTED
-                    record.message = "worker restarted"
-                    record.updated_at = _utc_now()
-                    count += 1
-            if count:
-                self._persist_locked()
-        return count
-
     def shutdown(self, *, wait: bool = True) -> None:
         self._executor.shutdown(wait=wait, cancel_futures=True)
 

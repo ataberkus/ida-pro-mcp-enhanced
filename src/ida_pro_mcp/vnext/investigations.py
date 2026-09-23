@@ -156,32 +156,42 @@ class InvestigationManager:
 
     def _restore(self, state: dict[str, Any]) -> None:
         for investigation_id, value in state.items():
-            findings = []
-            for raw in value.get("findings", []):
-                findings.append(
-                    Finding(
-                        finding_id=raw["finding_id"],
-                        title=raw["title"],
-                        description=raw["description"],
-                        severity=raw.get("severity", "info"),
-                        confidence=float(raw.get("confidence", 0.5)),
-                        evidence=[Evidence(**item) for item in raw.get("evidence", [])],
-                        tags=list(raw.get("tags", [])),
-                    )
+            try:
+                findings = []
+                for raw in value.get("findings", []):
+                    try:
+                        findings.append(
+                            Finding(
+                                finding_id=raw["finding_id"],
+                                title=raw["title"],
+                                description=raw["description"],
+                                severity=raw.get("severity", "info"),
+                                confidence=float(raw.get("confidence", 0.5)),
+                                evidence=[
+                                    Evidence(**item)
+                                    for item in raw.get("evidence", [])
+                                    if isinstance(item, dict)
+                                ],
+                                tags=list(raw.get("tags", [])),
+                            )
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                self._records[investigation_id] = InvestigationRecord(
+                    investigation_id=investigation_id,
+                    objective=value["objective"],
+                    database=value.get("database"),
+                    state=value.get("state", "interrupted"),
+                    created_at=value["created_at"],
+                    updated_at=value["updated_at"],
+                    job_id=value.get("job_id"),
+                    seeds=list(value.get("seeds", [])),
+                    findings=findings,
+                    metadata=dict(value.get("metadata", {})),
+                    schema_version=value.get("schema_version", "unknown"),
                 )
-            self._records[investigation_id] = InvestigationRecord(
-                investigation_id=investigation_id,
-                objective=value["objective"],
-                database=value.get("database"),
-                state=value.get("state", "interrupted"),
-                created_at=value["created_at"],
-                updated_at=value["updated_at"],
-                job_id=value.get("job_id"),
-                seeds=list(value.get("seeds", [])),
-                findings=findings,
-                metadata=dict(value.get("metadata", {})),
-                schema_version=value.get("schema_version", "unknown"),
-            )
+            except (KeyError, TypeError, ValueError):
+                continue
 
 
 def _to_markdown(record: InvestigationRecord) -> str:

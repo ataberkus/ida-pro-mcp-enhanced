@@ -295,9 +295,15 @@ def make_bytes_searcher(
         if t in ("??", "?"):
             pat.append(0)
             msk.append(0)
-        else:
-            pat.append(int(t, 16))
-            msk.append(0xFF)
+            continue
+        body = t[2:] if t[:2] in ("0x", "0X") else t
+        if len(body) not in (1, 2) or any(ch not in "0123456789abcdefABCDEF" for ch in body):
+            return None, f"Invalid byte token: {t!r}"
+        value = int(body, 16)
+        if value < 0 or value > 0xFF:
+            return None, f"Invalid byte token: {t!r}"
+        pat.append(value)
+        msk.append(0xFF)
 
     data = bytes(pat)
     mask = bytes(msk)

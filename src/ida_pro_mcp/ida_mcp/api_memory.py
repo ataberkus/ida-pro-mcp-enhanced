@@ -12,7 +12,7 @@ import idaapi
 
 from .rpc import tool, unsafe
 from . import compat
-from .sync import idasync
+from .sync import IDAError, idasync
 from .utils import (
     IntRead,
     IntWrite,
@@ -24,13 +24,26 @@ from .utils import (
 
 
 def _resolve_read_address(addr: str | int) -> int:
+    from .utils import resolve_address_or_name
+
     try:
-        return parse_address(addr)
-    except Exception as exc:
-        ea = idaapi.get_name_ea(idaapi.BADADDR, str(addr))
-        if ea == idaapi.BADADDR:
-            raise ValueError(f"Failed to resolve address or name: {addr}") from exc
-        return ea
+        return resolve_address_or_name(addr)
+    except IDAError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+MAX_READ_BYTES = 65536
+MAX_PATCH_BYTES = 65536
+
+
+def _require_mapped_range(ea: int, size: int, label: str) -> None:
+    cursor = ea
+    end_ea = ea + size
+    while cursor < end_ea:
+        segment = compat.get_segment_info(cursor)
+        if segment is None:
+            raise ValueError(f"Address range is not mapped: {label}")
+        cursor = min(end_ea, segment.end_ea)
 
 
 def _read_mapped_bytes(addr: str | int, size: int) -> bytes:
@@ -68,6 +81,8 @@ def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[dict]:
         size = item.get("size", 0)
 
         try:
+            if int(size) > MAX_READ_BYTES:
+                raise ValueError(f"Read size {int(size)} exceeds limit {MAX_READ_BYTES}")
             data = _read_mapped_bytes(addr, int(size))
             rendered = " ".join(f"{x:#02x}" for x in data)
             results.append({"addr": addr, "data": rendered})
@@ -178,6 +193,9 @@ def get_string(
     return results
 
 
+MAX_GLOBAL_VALUE_BYTES = 4096
+
+
 def get_global_variable_value_internal(ea: int) -> str:
     import ida_typeinf
     import ida_nalt
@@ -195,10 +213,16 @@ def get_global_variable_value_internal(ea: int) -> str:
     else:
         size = tif.get_size()
 
+    if size > MAX_GLOBAL_VALUE_BYTES:
+        return f"<too large: {size} bytes>"
+
     if size == 0 and tif.is_array() and tif.get_array_element().is_decl_char():
         raw = idaapi.get_strlit_contents(ea, -1, 0)
         if not raw:
             return '""'
+        if len(raw) > MAX_GLOBAL_VALUE_BYTES:
+            raw = raw[:MAX_GLOBAL_VALUE_BYTES]
+            return f'"{raw.decode("utf-8", errors="replace").strip()}..."'
         return_string = raw.decode("utf-8", errors="replace").strip()
         return f'"{return_string}"'
     elif size == 1:
@@ -221,27 +245,16 @@ def get_global_value(
     ],
 ) -> list[dict]:
     """Read global variable values by address or symbol name."""
-    from .utils import looks_like_address
+    from .utils import resolve_address_or_name
 
     queries = normalize_list_input(queries)
     results = []
 
     for query in queries:
         try:
-            ea = idaapi.BADADDR
-
-            # Try as address first if it looks like one
-            if looks_like_address(query):
-                try:
-                    ea = parse_address(query)
-                except Exception:
-                    ea = idaapi.BADADDR
-
-            # Fall back to name lookup
-            if ea == idaapi.BADADDR:
-                ea = idaapi.get_name_ea(idaapi.BADADDR, query)
-
-            if ea == idaapi.BADADDR:
+            try:
+                ea = resolve_address_or_name(query)
+            except IDAError:
                 results.append({"query": query, "value": None, "error": "Not found"})
                 continue
 
@@ -273,8 +286,9 @@ def patch(patches: list[MemoryPatch] | MemoryPatch) -> list[dict]:
             ea = parse_address(patch["addr"])
             data = bytes.fromhex(patch["data"])
 
-            if not ida_bytes.is_mapped(ea):
-                raise ValueError(f"Address not mapped: {patch['addr']}")
+            if len(data) > MAX_PATCH_BYTES:
+                raise ValueError(f"Patch size {len(data)} exceeds limit {MAX_PATCH_BYTES}")
+            _require_mapped_range(ea, len(data), hex(ea))
 
             ida_bytes.patch_bytes(ea, data)
             results.append(
@@ -316,8 +330,7 @@ def put_int(
                 raise ValueError(f"Value {value_text} does not fit in {normalized}")
 
             ea = parse_address(addr)
-            if not ida_bytes.is_mapped(ea):
-                raise ValueError(f"Address not mapped: {addr}")
+            _require_mapped_range(ea, size, hex(ea))
             ida_bytes.patch_bytes(ea, data)
             results.append(
                 {

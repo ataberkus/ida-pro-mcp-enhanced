@@ -221,15 +221,17 @@ def build_mutation_operations(
     addr: str,
     current_name: str = "",
     new_name: str = "",
-    comment: str = "",
+    comment: str | None = "",
     current_comment: str = "",
     local_renames: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build canonical mutation_preview operations for the review dialog."""
+    from .contracts import ErrorCode, VNextError
+
     operations: list[dict[str, Any]] = []
     target = str(addr or "").strip()
     if not target:
-        return operations
+        raise VNextError(ErrorCode.INVALID_OPERATION, "Mutation address cannot be empty")
 
     rename_args: dict[str, Any] = {}
     cleaned_new = str(new_name or "").strip()
@@ -249,9 +251,8 @@ def build_mutation_operations(
     if rename_args:
         operations.append({"kind": "rename", **rename_args})
 
-    cleaned_comment = str(comment or "").strip()
-    if cleaned_comment and cleaned_comment != str(current_comment or "").strip():
-        operations.append({"kind": "comment", "addr": target, "comment": cleaned_comment})
+    if comment is not None and str(comment).strip() != str(current_comment or "").strip():
+        operations.append({"kind": "comment", "addr": target, "comment": str(comment)})
     return operations
 
 

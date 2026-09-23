@@ -1,8 +1,10 @@
 from typing import Annotated
 import ast
+import contextlib
 import io
 import os
 import sys
+import threading
 import idaapi
 import idc
 import ida_bytes
@@ -96,6 +98,16 @@ def _make_exec_globals() -> dict:
     }
 
 
+_PY_EXEC_LOCK = threading.Lock()
+_PY_VALUE_MAX_CHARS = 20000
+
+
+def _capped_text(s: str) -> str:
+    if len(s) > _PY_VALUE_MAX_CHARS:
+        return s[:_PY_VALUE_MAX_CHARS] + f"...<truncated {len(s) - _PY_VALUE_MAX_CHARS} chars>"
+    return s
+
+
 @tool
 @idasync
 @unsafe
@@ -103,16 +115,27 @@ def py_eval(
     code: Annotated[str, "Python code"],
 ) -> dict:
     """Execute Python in IDA context and return result/stdout/stderr."""
-    # Capture stdout/stderr
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
 
     try:
-        sys.stdout = stdout_capture
-        sys.stderr = stderr_capture
+        with _PY_EXEC_LOCK, contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+            return _py_eval_locked(code, stdout_capture, stderr_capture)
+    except Exception as exc:
+        import traceback
 
+        return {
+            "result": "",
+            "stdout": _capped_text(stdout_capture.getvalue()),
+            "stderr": _capped_text(traceback.format_exc()),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _py_eval_locked(code: str, stdout_capture: io.StringIO, stderr_capture: io.StringIO) -> dict:
+    import traceback
+
+    try:
         exec_globals = _make_exec_globals()
         result_value = None
         exec_locals = {}
@@ -169,23 +192,18 @@ def py_eval(
         stderr_text = stderr_capture.getvalue()
 
         return {
-            "result": result_value or "",
-            "stdout": stdout_text,
-            "stderr": stderr_text,
+            "result": _capped_text(result_value or ""),
+            "stdout": _capped_text(stdout_text),
+            "stderr": _capped_text(stderr_text),
         }
 
     except Exception as exc:
-        import traceback
-
         return {
             "result": "",
-            "stdout": stdout_capture.getvalue(),
-            "stderr": traceback.format_exc(),
+            "stdout": _capped_text(stdout_capture.getvalue()),
+            "stderr": _capped_text(traceback.format_exc()),
             "error": f"{type(exc).__name__}: {exc}",
         }
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
 
 
 @tool
@@ -206,13 +224,23 @@ def py_exec_file(
 
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
 
     try:
-        sys.stdout = stdout_capture
-        sys.stderr = stderr_capture
+        with _PY_EXEC_LOCK, contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+            return _py_exec_file_locked(file_path, stdout_capture, stderr_capture)
+    except Exception as exc:
+        import traceback
 
+        return {
+            "result": "",
+            "stdout": _capped_text(stdout_capture.getvalue()),
+            "stderr": _capped_text(traceback.format_exc()),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _py_exec_file_locked(file_path: str, stdout_capture: io.StringIO, stderr_capture: io.StringIO) -> dict:
+    try:
         exec_globals = _make_exec_globals()
         exec_globals["__file__"] = file_path
         exec_globals["__name__"] = "__main__"
@@ -231,9 +259,9 @@ def py_exec_file(
             result_value = str(exec_globals["result"])
 
         return {
-            "result": result_value,
-            "stdout": stdout_text,
-            "stderr": stderr_text,
+            "result": _capped_text(result_value),
+            "stdout": _capped_text(stdout_text),
+            "stderr": _capped_text(stderr_text),
         }
 
     except Exception as exc:
@@ -241,10 +269,7 @@ def py_exec_file(
 
         return {
             "result": "",
-            "stdout": stdout_capture.getvalue(),
-            "stderr": traceback.format_exc(),
+            "stdout": _capped_text(stdout_capture.getvalue()),
+            "stderr": _capped_text(traceback.format_exc()),
             "error": f"{type(exc).__name__}: {exc}",
         }
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr

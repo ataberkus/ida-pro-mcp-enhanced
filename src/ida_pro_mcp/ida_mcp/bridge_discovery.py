@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 from dataclasses import dataclass, field
 
 
@@ -14,10 +15,23 @@ class InstanceInfo:
     pid: int
     host: str
     port: int
-    session_id: str
     idb_path: str
     input_file: str
     started_at: str
+    backend: str = "gui"
+
+
+def from_discovery(info: dict) -> InstanceInfo:
+    return InstanceInfo(
+        id=f"port{info['port']}",
+        pid=int(info["pid"]),
+        host=info["host"],
+        port=int(info["port"]),
+        idb_path=str(info.get("idb_path", "")),
+        input_file=str(info.get("input_file") or info.get("binary", "")),
+        started_at=str(info.get("started_at", "")),
+        backend=str(info.get("backend", "gui")),
+    )
 
 
 def sanitize_prefix(name: str) -> str:
@@ -48,28 +62,40 @@ def _pid_alive(pid: int) -> bool:
 
 
 def read_registry_dir(registry_dir: str, probe: bool = True) -> list[InstanceInfo]:
-    """Read registry JSON files, dropping entries whose PID is dead.
-
-    probe=True additionally checks the port answers; kept injectable for tests.
-    """
+    """Read instance_*.json files, dropping stale entries."""
     out: list[InstanceInfo] = []
     if not os.path.isdir(registry_dir):
         return out
     for fname in os.listdir(registry_dir):
-        if not fname.endswith(".json"):
+        if not fname.startswith("instance_") or not fname.endswith(".json"):
             continue
+        fpath = os.path.join(registry_dir, fname)
         try:
-            with open(os.path.join(registry_dir, fname), "r", encoding="utf-8") as f:
+            with open(fpath, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            inst = InstanceInfo(
-                id=d["id"], pid=int(d["pid"]), host=d["host"], port=int(d["port"]),
-                session_id=d.get("session_id", ""), idb_path=d.get("idb_path", ""),
-                input_file=d.get("input_file", ""), started_at=d.get("started_at", ""),
-            )
-        except (OSError, ValueError, KeyError):
+            inst = from_discovery(d)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            try:
+                os.unlink(fpath)
+            except OSError:
+                pass
             continue
         if not _pid_alive(inst.pid):
+            try:
+                os.unlink(fpath)
+            except OSError:
+                pass
             continue
+        if probe:
+            try:
+                with socket.create_connection((inst.host, inst.port), timeout=1.0):
+                    pass
+            except OSError:
+                try:
+                    os.unlink(fpath)
+                except OSError:
+                    pass
+                continue
         out.append(inst)
     return out
 

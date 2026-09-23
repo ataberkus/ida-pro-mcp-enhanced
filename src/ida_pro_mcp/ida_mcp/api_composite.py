@@ -38,15 +38,9 @@ _BORING_CONSTANTS = frozenset({0, 1, -1, 0xFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFFFFF
 
 def _resolve_addr(addr: str) -> int:
     """Resolve address or name to ea. Raises IDAError on failure."""
-    import idaapi
+    from .utils import resolve_address_or_name
 
-    try:
-        return parse_address(addr)
-    except IDAError:
-        ea = idaapi.get_name_ea(idaapi.BADADDR, addr)
-        if ea == idaapi.BADADDR:
-            raise IDAError(f"Address/name not found: {addr!r}")
-        return ea
+    return resolve_address_or_name(addr)
 
 
 def _basic_block_info(ea: int) -> dict:
@@ -382,14 +376,10 @@ def diff_before_after(
     action: Annotated[str, "Action: 'rename_func', 'set_type', 'set_comment'"],
     action_args: Annotated[dict, "Arguments for the action"],
 ) -> dict:
-    """Rename a function, set its type, or add a comment, and immediately see the
-    before/after decompilation side by side. Use this instead of calling rename
-    then decompile separately when you want to verify that a rename or type change
-    actually improved readability. Actions: 'rename_func' (action_args: {name: str}),
-    'set_type' (action_args: {type: str}), 'set_comment' (action_args: {comment: str}).
-    Returns {before, after, action_applied, changes_detected}. Especially useful
-    during batch renaming to confirm each change had the intended effect."""
+    """Preview a single change: applies it, captures the result, then restores the original state. The database is left unchanged."""
 
+    import ida_nalt
+    import ida_name
     import idaapi
     import ida_typeinf
 
@@ -405,8 +395,12 @@ def diff_before_after(
     if func is None:
         return {"error": f"No function at {hex(ea)}"}
 
-    # --- Before ---
+    # --- Before state ---
     before = decompile_function_safe(ea)
+    old_name = idaapi.get_name(ea) or ""
+    old_cmt = idaapi.get_cmt(ea, False) or ""
+    old_tif = ida_typeinf.tinfo_t()
+    had_type = bool(ida_nalt.get_tinfo(old_tif, ea))
 
     # --- Apply action ---
     applied: str
@@ -452,12 +446,30 @@ def diff_before_after(
     # --- After ---
     after = decompile_function_safe(ea)
 
-    return {
+    # --- Restore original state ---
+    restore_error = None
+    try:
+        ida_name.set_name(ea, old_name or "", ida_name.SN_CHECK | ida_name.SN_FORCE)
+        idaapi.set_cmt(ea, old_cmt or "", False)
+        if had_type:
+            ida_typeinf.apply_tinfo(ea, old_tif, ida_typeinf.TINFO_DEFINITE)
+        else:
+            ida_nalt.del_tinfo(ea)
+    except Exception as exc:
+        restore_error = str(exc)
+
+    reread = decompile_function_safe(ea)
+    restored = restore_error is None and reread == before
+    result: dict = {
         "before": before,
         "after": after,
         "action_applied": applied,
         "changes_detected": before != after,
+        "restored": restored,
     }
+    if not restored:
+        result["restore_error"] = restore_error or "state differs after restore"
+    return result
 
 
 # ---------------------------------------------------------------------------

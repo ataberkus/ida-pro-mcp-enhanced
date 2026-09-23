@@ -141,14 +141,13 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
         "append_comments",
         "rename",
         "declare_type",
-        "enum_upsert",
         "set_type",
         "type_apply_batch",
         "declare_stack",
         "delete_stack",
     }:
         registry.set_scope(name, SafetyScope.ANNOTATE, replacement="mutation_preview")
-
+    registry.set_scope("enum_upsert", SafetyScope.ANNOTATE)
     for name in {
         "patch",
         "put_int",
@@ -156,12 +155,12 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
         "define_func",
         "define_code",
         "undefine",
-        "force_recompile",
         "set_op_type",
         "make_data",
-        "diff_before_after",
     }:
         registry.set_scope(name, SafetyScope.MODIFY, replacement="mutation_preview")
+    registry.set_scope("force_recompile", SafetyScope.MODIFY)
+    registry.set_scope("diff_before_after", SafetyScope.MODIFY)
 
     registry.register(ToolPolicy(name="mutation_preview", canonical=True))
     registry.register(
@@ -186,7 +185,9 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
     )
 
     registry.set_scope("idb_save", SafetyScope.FILESYSTEM)
-    registry.set_scope("investigation_export", SafetyScope.FILESYSTEM)
+    registry.register(ToolPolicy(name="investigation_start", scopes=frozenset({SafetyScope.READ}), read_only=False, destructive=False, idempotent=False, canonical=True))
+    registry.register(ToolPolicy(name="job_cancel", scopes=frozenset({SafetyScope.READ}), read_only=False, destructive=False, idempotent=False, canonical=True))
+    registry.register(ToolPolicy(name="investigation_export", scopes=frozenset({SafetyScope.READ}), read_only=True, destructive=False, idempotent=True, canonical=True))
     registry.set_scope("investigation_add_finding", SafetyScope.ANNOTATE)
     registry.set_scope("py_eval", SafetyScope.PYTHON, open_world=True, replacement="python_execute")
     registry.set_scope("py_exec_file", SafetyScope.PYTHON, SafetyScope.FILESYSTEM, open_world=True, replacement="python_execute")

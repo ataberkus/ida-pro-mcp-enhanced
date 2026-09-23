@@ -7,7 +7,7 @@ Guidance for working in this repository.
 IDA Pro MCP Server: exposes IDA Pro / idalib functionality to MCP clients.
 
 Main pieces:
-- `src/ida_pro_mcp/server.py`: MCP server entrypoint
+- `src/ida_pro_mcp/bridge_server.py`: MCP server entrypoint (stdio bridge with discovery/routing)
 - `src/ida_pro_mcp/idalib_server.py`: headless idalib server
 - `src/ida_pro_mcp/ida_mcp/`: IDA/plugin-side APIs
 
@@ -80,7 +80,7 @@ uv run ida-pro-mcp --unsafe
 
 ### MCP inspector
 ```bash
-uv run mcp dev src/ida_pro_mcp/server.py
+uv run mcp dev src/ida_pro_mcp/bridge_server.py
 ```
 
 ### Install / uninstall

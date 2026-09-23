@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any, Generic, TypeVar
 
 API_SCHEMA_VERSION = "2026-08-01"
-_ADDRESS_KEYS = {"addr", "address", "ea", "start_ea", "end_ea", "from", "to", "target_ea", "call_ea"}
+_ADDRESS_KEYS = {"addr", "address", "ea", "start_ea", "end_ea", "target_ea", "call_ea"}
 
 
 def normalize_public_addresses(value: Any, *, key: str | None = None) -> Any:

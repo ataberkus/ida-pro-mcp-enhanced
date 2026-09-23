@@ -17,6 +17,7 @@ from .utils import (
     paginate,
     pattern_filter,
     parse_address,
+    clamp_int,
     get_type_by_name,
     parse_decls_ctypes,
     my_modifier_t,
@@ -300,12 +301,35 @@ def read_struct(queries: list[StructRead] | StructRead) -> list[dict]:
             members = []
             for member in udt_data:
                 offset = member.begin() // 8
-                member_type = member.type._print()
-                member_name = member.name
-                member_size = member.type.get_size()
+                member_addr = addr + offset
+                try:
+                    member_type = member.type._print()
+                    member_name = member.name
+                    member_size = member.type.get_size()
+                except Exception:
+                    members.append(
+                        {
+                            "offset": f"0x{offset:08X}",
+                            "type": "<unknown>",
+                            "name": getattr(member, "name", ""),
+                            "size": 0,
+                            "value": "<failed to read>",
+                        }
+                    )
+                    continue
+                if compat.get_segment_info(member_addr) is None:
+                    members.append(
+                        {
+                            "offset": f"0x{offset:08X}",
+                            "type": member_type,
+                            "name": member_name,
+                            "size": member_size,
+                            "value": "<unmapped>",
+                        }
+                    )
+                    continue
 
                 # Read memory value at member address
-                member_addr = addr + offset
                 try:
                     if member.type.is_ptr():
                         is_64bit = compat.inf_is_64bit()
@@ -517,8 +541,8 @@ def type_query(
             )
             continue
 
-        offset = int(query.get("offset", 0) or 0)
-        count = int(query.get("count", 100) or 100)
+        offset = clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
+        count = clamp_int(query.get("count", 100), 100, 0, 5000)
         sort_by = str(query.get("sort_by", "name") or "name")
         descending = bool(query.get("descending", False))
         include_decl = bool(query.get("include_decl", True))
@@ -715,10 +739,11 @@ def type_inspect(
 
 
 def _parse_addr_type_shorthand(s: str) -> dict:
-    # Support "addr:typename" shorthand.
-    if ":" in s:
+    # Support "addr:typename" shorthand, but never split C++ "A::B" names.
+    if ":" in s and "::" not in s:
         addr, ty = s.split(":", 1)
-        return {"addr": addr.strip(), "ty": ty.strip()}
+        if addr.strip() and ty.strip():
+            return {"addr": addr.strip(), "ty": ty.strip()}
     return {"ty": s.strip()}
 
 

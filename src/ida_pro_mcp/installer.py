@@ -1,11 +1,13 @@
 import glob
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 import tomllib
 import tomli_w
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 try:
@@ -31,9 +33,8 @@ except ImportError:
 
 MCP_SERVER_NAME = "ida-pro-mcp"
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-# stdio clients must use the discovery/routing bridge so multiple live IDA
-# processes can be addressed.  The direct ``server.py`` proxy remains useful
-# for explicit single-instance HTTP connections.
+# stdio clients use the discovery/routing bridge so multiple live IDA
+# processes can be addressed.
 SERVER_SCRIPT = os.path.join(SCRIPT_DIR, "bridge_server.py")
 IDA_PLUGIN_PKG = os.path.join(SCRIPT_DIR, "ida_mcp")
 IDA_PLUGIN_LOADER = os.path.join(SCRIPT_DIR, "ida_mcp.py")
@@ -135,7 +136,9 @@ def infer_http_transport_type(transport_url: str) -> str:
     return "sse" if urlparse(transport_url).path.rstrip("/") == "/sse" else "http"
 
 
-def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
+def generate_mcp_config(*, client_name: str, transport: str = "stdio", host: str | None = None, port: int | None = None):
+    host = host or IDA_HOST
+    port = port or IDA_PORT
     if transport == "stdio":
         # No --ida-rpc: server auto-discovers running IDA instances
         if client_name == "Opencode":
@@ -160,9 +163,9 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
         return mcp_config
 
     if transport == "streamable-http":
-        transport = f"http://{IDA_HOST}:{IDA_PORT}/mcp"
+        transport = f"http://{host}:{port}/mcp"
     elif transport == "sse":
-        transport = f"http://{IDA_HOST}:{IDA_PORT}/sse"
+        transport = f"http://{host}:{port}/sse"
 
     transport_url = normalize_transport_url(transport)
     if client_name == "Opencode":
@@ -176,14 +179,26 @@ def generate_mcp_config(*, client_name: str, transport: str = "stdio"):
     return {"type": "http", "url": force_mcp_path(transport_url)}
 
 
-def print_mcp_config():
+def _ida_rpc_host_port(args) -> tuple[str | None, int | None]:
+    """Parse --ida-rpc into (host, port); None pair when absent or invalid."""
+    raw = getattr(args, "ida_rpc", None) if args is not None else None
+    if not raw:
+        return None, None
+    try:
+        parsed = urlparse(str(raw))
+    except ValueError:
+        return None, None
+    return parsed.hostname, parsed.port
+
+
+def print_mcp_config(host: str | None = None, port: int | None = None):
     print("[STDIO MCP CONFIGURATION]")
     print(
         json.dumps(
             {
                 "mcpServers": {
                     MCP_SERVER_NAME: generate_mcp_config(
-                        client_name="Generic", transport="stdio"
+                        client_name="Generic", transport="stdio", host=host, port=port
                     )
                 }
             },
@@ -197,7 +212,7 @@ def print_mcp_config():
                 "mcpServers": {
                     MCP_SERVER_NAME: generate_mcp_config(
                         client_name="Generic",
-                        transport=f"http://{IDA_HOST}:{IDA_PORT}/mcp",
+                        transport=f"http://{host or IDA_HOST}:{port or IDA_PORT}/mcp",
                     )
                 }
             },
@@ -211,7 +226,7 @@ def print_mcp_config():
                 "mcpServers": {
                     MCP_SERVER_NAME: generate_mcp_config(
                         client_name="Generic",
-                        transport=f"http://{IDA_HOST}:{IDA_PORT}/sse",
+                        transport=f"http://{host or IDA_HOST}:{port or IDA_PORT}/sse",
                     )
                 }
             },
@@ -231,6 +246,63 @@ def _get_scope_config_spec(
     return get_global_configs(), GLOBAL_SPECIAL_JSON_STRUCTURES
 
 
+_BACKED_UP_CONFIGS: set[str] = set()
+
+
+def _backup_config_file(config_path: str) -> str | None:
+    """Copy config_path to config_path.bak once per path per process."""
+    if config_path in _BACKED_UP_CONFIGS:
+        return config_path + ".bak"
+    try:
+        shutil.copy2(config_path, config_path + ".bak")
+    except OSError:
+        return None
+    _BACKED_UP_CONFIGS.add(config_path)
+    print(f"Backup: {config_path}.bak")
+    return config_path + ".bak"
+
+
+def _strip_jsonc(text: str) -> str:
+    """Drop // and /* */ comments (honoring string escapes) plus trailing commas."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    state = "normal"
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if state == "normal":
+            if ch == '"':
+                state = "string"
+                out.append(ch)
+            elif ch == "/" and nxt == "/":
+                state = "line"
+                i += 1
+            elif ch == "/" and nxt == "*":
+                state = "block"
+                i += 1
+            else:
+                out.append(ch)
+        elif state == "string":
+            out.append(ch)
+            if ch == "\\":
+                if i + 1 < n:
+                    out.append(text[i + 1])
+                    i += 1
+            elif ch == '"':
+                state = "normal"
+        elif state == "line":
+            if ch == "\n":
+                state = "normal"
+                out.append(ch)
+        else:  # block
+            if ch == "*" and nxt == "/":
+                state = "normal"
+                i += 1
+        i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
 def _read_config_file(config_path: str, *, is_toml: bool) -> dict | None:
     try:
         if is_toml:
@@ -239,12 +311,16 @@ def _read_config_file(config_path: str, *, is_toml: bool) -> dict | None:
                 return tomllib.loads(data.decode("utf-8")) if data else {}
         with open(config_path, "r", encoding="utf-8") as f:
             data = f.read().strip()
-            return json.loads(data) if data else {}
+            return json.loads(_strip_jsonc(data)) if data else {}
     except (json.JSONDecodeError, tomllib.TOMLDecodeError, OSError):
         return None
 
 
 def _write_config_file(config_path: str, config: dict, *, is_toml: bool) -> None:
+    if os.path.exists(config_path):
+        _backup_config_file(config_path)
+        if is_toml:
+            print(f"Note: comments/formatting in {config_path} are not preserved; backup at {config_path}.bak")
     config_dir = os.path.dirname(config_path)
     suffix = ".toml" if is_toml else ".json"
     fd, temp_path = tempfile.mkstemp(
@@ -258,9 +334,17 @@ def _write_config_file(config_path: str, config: dict, *, is_toml: bool) -> None
                 f.write(tomli_w.dumps(config).encode("utf-8"))
             else:
                 json.dump(config, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
         os.replace(temp_path, config_path)
     except Exception:
-        os.unlink(temp_path)
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
         raise
 
 
@@ -369,6 +453,8 @@ def install_mcp_servers(
     quiet: bool = False,
     only: list[str] | None = None,
     project: bool = False,
+    host: str | None = None,
+    port: int | None = None,
 ):
     configs, special_json_structures = _get_scope_config_spec(project=project)
     if not configs:
@@ -431,6 +517,8 @@ def install_mcp_servers(
             mcp_servers[MCP_SERVER_NAME] = generate_mcp_config(
                 client_name=name,
                 transport=transport,
+                host=host,
+                port=port,
             )
 
         _write_config_file(config_path, config, is_toml=is_toml)
@@ -445,12 +533,16 @@ def install_mcp_servers(
         print(
             "No MCP servers installed. For unsupported MCP clients, use the following config:\n"
         )
-        print_mcp_config()
+        print_mcp_config(host, port)
 
 
 def _get_ida_user_dir() -> str:
     if sys.platform == "win32":
-        return os.path.join(os.environ["APPDATA"], "Hex-Rays", "IDA Pro")
+        return os.path.join(
+            os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming"),
+            "Hex-Rays",
+            "IDA Pro",
+        )
     return os.path.join(os.path.expanduser("~"), ".idapro")
 
 
@@ -555,13 +647,15 @@ def install_ida_plugin(
 
 
 def _resolve_transport(value: str) -> str:
-    v = value.strip().lower()
-    if v == "stdio":
+    v = value.strip()
+    if v.lower() == "stdio":
         return "stdio"
-    if v == "sse":
+    if v.lower() == "sse":
         return "sse"
-    if v in ("http", "streamable-http", "streamable"):
+    if v.lower() in ("http", "streamable-http", "streamable"):
         return "streamable-http"
+    if "://" in v:
+        return v
     return "streamable-http"
 
 
@@ -620,6 +714,8 @@ def _apply_client_install(
     transport: str,
     uninstall: bool,
     client_targets: list[str],
+    host: str | None = None,
+    port: int | None = None,
 ) -> None:
     if client_targets:
         install_mcp_servers(
@@ -627,6 +723,8 @@ def _apply_client_install(
             uninstall=uninstall,
             only=client_targets,
             project=(scope == "project"),
+            host=host,
+            port=port,
         )
 
 
@@ -640,6 +738,7 @@ def _parse_client_targets(targets_str: str) -> list[str]:
 
 def _interactive_install(*, uninstall: bool, args):
     action = "uninstall" if uninstall else "install"
+    host, port = _ida_rpc_host_port(args)
     transport = _get_install_transport(uninstall=uninstall, args=args, interactive=True)
     if transport is None:
         print("Cancelled.")
@@ -665,6 +764,8 @@ def _interactive_install(*, uninstall: bool, args):
         transport=transport,
         uninstall=uninstall,
         client_targets=selected,
+        host=host,
+        port=port,
     )
 
 
@@ -672,6 +773,7 @@ def run_install_command(*, uninstall: bool, targets_str: str, args) -> None:
     install_ida_plugin(uninstall=uninstall, allow_ida_free=args.allow_ida_free)
 
     if targets_str:
+        host, port = _ida_rpc_host_port(args)
         _apply_client_install(
             scope=_get_install_scope(args, interactive=False),
             transport=_get_install_transport(
@@ -679,6 +781,8 @@ def run_install_command(*, uninstall: bool, targets_str: str, args) -> None:
             ),
             uninstall=uninstall,
             client_targets=_parse_client_targets(targets_str),
+            host=host,
+            port=port,
         )
         return
 

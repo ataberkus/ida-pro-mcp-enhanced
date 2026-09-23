@@ -104,6 +104,12 @@ def test(*, binary: str = "", skip: bool = False) -> Callable:
             category = category[5:]
 
         # Register the test
+        if func.__name__ in TESTS:
+            existing = TESTS[func.__name__]
+            raise ValueError(
+                f"Duplicate test name {func.__name__!r}: "
+                f"existing module {existing.module!r}, new module {category!r}"
+            )
         TESTS[func.__name__] = TestInfo(
             func=func,
             binary=binary,

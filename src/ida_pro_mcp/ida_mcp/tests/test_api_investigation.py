@@ -58,15 +58,16 @@ def test_investigation_confidence_thresholds():
 @test()
 def test_investigation_function_scoring_goal_weights():
     """Goal profiles alter scoring without changing candidate shape."""
-    network_candidate = _sample_function(import_categories=["network", "process"])
+    dispatcher_candidate = _sample_function(callee_count=12, type="dispatcher")
+    plain_candidate = _sample_function(callee_count=0, type="leaf", size=16, xref_count=0, name="named_func")
     crackme_candidate = _sample_function(type="leaf", constants=[0x1337, 0x401000])
 
-    malware_score, malware_reasons = _score_function_candidate(network_candidate, "malware")
-    general_score, _ = _score_function_candidate(network_candidate, "general")
+    malware_score, malware_reasons = _score_function_candidate(dispatcher_candidate, "malware")
+    general_score, _ = _score_function_candidate(plain_candidate, "general")
     crackme_score, crackme_reasons = _score_function_candidate(crackme_candidate, "crackme")
 
     assert malware_score > general_score
-    assert any("network" in reason for reason in malware_reasons)
+    assert any("fan-out" in reason or "dispatcher" in reason for reason in malware_reasons)
     assert crackme_score >= 10
     assert any("constants" in reason for reason in crackme_reasons)
 
@@ -108,7 +109,7 @@ def test_investigation_builds_artifact_clusters():
 @test()
 def test_investigation_make_function_lead_shape():
     """Function leads expose rationale, evidence, confidence, and next calls."""
-    candidate = _sample_function(import_categories=["network"])
+    candidate = _sample_function(callee_count=12)
     score, reasons = _score_function_candidate(candidate, "malware")
     lead = _make_function_lead(candidate, score, reasons, "malware", rank=1)
 

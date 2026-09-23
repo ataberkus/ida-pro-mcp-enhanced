@@ -209,6 +209,28 @@ class MCP(idaapi.plugin_t):
         except Exception as e:
             print(f"[MCP] Cache init failed: {e}")
 
+        from ida_mcp import trace as _trace
+
+        _trace.configure_idb()
+
+        import os as _os
+        from ida_pro_mcp.vnext.auth import AuthPolicy, default_token_path, load_token_file
+        from ida_pro_mcp.vnext.contracts import VNextError
+        _token = _os.environ.get("IDA_MCP_AUTH_TOKEN")
+        try:
+            _default_path = default_token_path()
+            if _token is None and _default_path.exists():
+                _token = load_token_file(_default_path)
+        except (OSError, UnicodeDecodeError, VNextError):
+            _token = None
+        _auth = AuthPolicy(self.host, _token)
+        try:
+            _auth.validate_configuration()
+        except VNextError as _exc:
+            print(f"[MCP] {_exc}")
+            return
+        if _auth.token_required or _token:
+            MCP_SERVER.http_authenticator = _auth.authorize_header
         port = self.port
         max_port = port + 100
         while port < max_port:
@@ -234,18 +256,12 @@ class MCP(idaapi.plugin_t):
             import os
             import ida_nalt
             import ida_loader
-            from ida_mcp.registry import write_instance
-
+            from ida_mcp.discovery import register_instance
             idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB) or ""
             input_file = ida_nalt.get_root_filename() or ""
-            self._instance = write_instance(
-                pid=os.getpid(),
-                host=self.host,
-                port=port,
-                idb_path=idb_path,
-                input_file=input_file,
-            )
-            print(f"[MCP] Registered instance {self._instance['id']} ({input_file})")
+            register_instance(host=self.host, port=port, pid=os.getpid(), binary=input_file, idb_path=idb_path, input_file=input_file, backend="gui")
+            self._instance = {"port": port}
+            print(f"[MCP] Registered instance port{port} ({input_file})")
         except Exception as e:
             print(f"[MCP] Instance registration failed: {e}")
             self._instance = None
@@ -255,9 +271,8 @@ class MCP(idaapi.plugin_t):
         if not inst:
             return
         try:
-            from ida_mcp.registry import remove_instance
-
-            remove_instance(inst["id"])
+            from ida_mcp.discovery import unregister_instance
+            unregister_instance(inst["port"])
         except Exception as e:
             print(f"[MCP] Instance unregistration failed: {e}")
         self._instance = None

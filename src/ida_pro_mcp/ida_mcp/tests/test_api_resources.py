@@ -122,8 +122,11 @@ def test_resource_struct_name_known_struct():
     target = None
     result = None
     for item in structs[:100]:
-        candidate = struct_name_resource(item["name"])
-        if candidate.get("error") is None and candidate.get("members"):
+        try:
+            candidate = struct_name_resource(item["name"])
+        except IDAError:
+            continue
+        if candidate.get("members"):
             target = item
             result = candidate
             break
@@ -143,9 +146,27 @@ def test_resource_struct_name_known_struct():
 
 @test()
 def test_resource_struct_name_not_found():
-    """struct_name_resource reports a missing structure deterministically."""
-    result = struct_name_resource("NonExistentStruct12345")
-    assert "Structure not found" in result["error"]
+    """struct_name_resource raises IDAError for a missing structure."""
+    try:
+        struct_name_resource("NonExistentStruct12345")
+        assert False, "expected IDAError"
+    except IDAError as e:
+        assert "Structure not found" in str(e)
+
+
+@test()
+def test_resource_import_export_not_found():
+    """import/export resources raise IDAError for missing names."""
+    try:
+        import_name_resource("NoSuchImport12345")
+        assert False, "expected IDAError"
+    except IDAError as e:
+        assert "Import not found" in str(e)
+    try:
+        export_name_resource("NoSuchExport12345")
+        assert False, "expected IDAError"
+    except IDAError as e:
+        assert "Export not found" in str(e)
 
 
 @test(binary="crackme03.elf")

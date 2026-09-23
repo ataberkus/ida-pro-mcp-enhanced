@@ -10,7 +10,6 @@ import ida_typeinf
 import ida_nalt
 import ida_bytes
 import ida_segment
-import ida_ida
 import ida_idaapi
 import ida_xref
 import ida_ua
@@ -26,6 +25,7 @@ from .sync import (
     log_tool_diagnostic,
 )
 from .utils import (
+    clamp_int,
     parse_address,
     normalize_list_input,
     normalize_dict_list,
@@ -185,7 +185,7 @@ def _resolve_immediate_insn_start(
     return None
 
 
-def _clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
+def clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
     try:
         i = int(value)
     except Exception:
@@ -215,17 +215,15 @@ def _parse_optional_int(value: object, field: str) -> int | None:
 
 
 def _resolve_function_start(query: object) -> tuple[int | None, str | None]:
+    from .utils import resolve_address_or_name
+
     q = str(query or "").strip()
     if not q:
         return None, "Function query is required"
 
-    ea = idaapi.BADADDR
     try:
-        ea = parse_address(q)
-    except Exception:
-        ea = idaapi.get_name_ea(idaapi.BADADDR, q)
-
-    if ea == idaapi.BADADDR:
+        ea = resolve_address_or_name(q)
+    except IDAError:
         return None, f"Failed to resolve function: {q}"
 
     func = ida_funcs.get_func(ea)
@@ -495,7 +493,9 @@ def disasm(
     """Disassemble function with offset/max_instructions pagination and optional total count."""
 
     # Enforce max limit
-    if max_instructions <= 0 or max_instructions > 50000:
+    if max_instructions <= 0:
+        max_instructions = 5000
+    elif max_instructions > 50000:
         max_instructions = 50000
     if offset < 0:
         offset = 0
@@ -663,12 +663,12 @@ def func_profile(
     for query in queries:
         q = str(query.get("query", "*") or "*").strip()
         filter_pattern = str(query.get("filter", "") or "")
-        offset = _clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
-        count = _clamp_int(query.get("count", 50), 50, 0, 1000)
+        offset = clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
+        count = clamp_int(query.get("count", 50), 50, 0, 1000)
         sort_by = str(query.get("sort_by", "addr") or "addr")
         descending = bool(query.get("descending", False))
         include_lists = bool(query.get("include_lists", False))
-        max_items = _clamp_int(query.get("max_items", 25), 25, 0, 1000)
+        max_items = clamp_int(query.get("max_items", 25), 25, 0, 1000)
         include_prototype = bool(query.get("include_prototype", False))
 
         # Resolve candidate function starts.
@@ -826,16 +826,16 @@ def analyze_batch(
             include_basic_blocks = bool(query.get("include_basic_blocks", True))
             include_proto = bool(query.get("include_proto", True))
 
-            max_disasm_insns = _clamp_int(
+            max_disasm_insns = clamp_int(
                 query.get("max_disasm_insns", 300), 300, 0, 50_000
             )
-            max_callers = _clamp_int(query.get("max_callers", 100), 100, 0, 5000)
-            max_callees = _clamp_int(query.get("max_callees", 100), 100, 0, 5000)
-            max_strings = _clamp_int(query.get("max_strings", 100), 100, 0, 5000)
-            max_constants = _clamp_int(
+            max_callers = clamp_int(query.get("max_callers", 100), 100, 0, 5000)
+            max_callees = clamp_int(query.get("max_callees", 100), 100, 0, 5000)
+            max_strings = clamp_int(query.get("max_strings", 100), 100, 0, 5000)
+            max_constants = clamp_int(
                 query.get("max_constants", 200), 200, 0, 10000
             )
-            max_blocks = _clamp_int(query.get("max_blocks", 500), 500, 0, 10000)
+            max_blocks = clamp_int(query.get("max_blocks", 500), 500, 0, 10000)
 
             analysis: dict = {
                 "size": hex(size_int),
@@ -1030,8 +1030,8 @@ def xref_query(
         q = str(query.get("query", "")).strip()
         direction = str(query.get("direction", "both") or "both").lower()
         xref_type = str(query.get("xref_type", "any") or "any").lower()
-        offset = _clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
-        count = _clamp_int(query.get("count", 200), 200, 0, 5000)
+        offset = clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
+        count = clamp_int(query.get("count", 200), 200, 0, 5000)
         include_fn = bool(query.get("include_fn", True))
         dedup = bool(query.get("dedup", True))
         sort_by = str(query.get("sort_by", "addr") or "addr")
@@ -1136,10 +1136,15 @@ def xref_query(
 
 @tool
 @idasync
-def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[dict]:
+def xrefs_to_field(
+    queries: list[StructFieldQuery] | StructFieldQuery,
+    limit: Annotated[int, "Max xrefs per query (default: 100, max: 1000)"] = 100,
+) -> list[dict]:
     """Get cross-references to structure fields"""
     if isinstance(queries, dict):
         queries = [queries]
+    if limit <= 0 or limit > 1000:
+        limit = 1000
 
     results = []
     til = ida_typeinf.get_idati()
@@ -1149,6 +1154,7 @@ def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[d
                 "struct": q.get("struct"),
                 "field": q.get("field"),
                 "xrefs": [],
+                "more": False,
                 "error": "Failed to retrieve type library",
             }
             for q in queries
@@ -1168,6 +1174,7 @@ def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[d
                         "struct": struct_name,
                         "field": field_name,
                         "xrefs": [],
+                        "more": False,
                         "error": f"Struct '{struct_name}' not found",
                     }
                 )
@@ -1180,6 +1187,7 @@ def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[d
                         "struct": struct_name,
                         "field": field_name,
                         "xrefs": [],
+                        "more": False,
                         "error": f"Field '{field_name}' not found in '{struct_name}'",
                     }
                 )
@@ -1192,6 +1200,7 @@ def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[d
                         "struct": struct_name,
                         "field": field_name,
                         "xrefs": [],
+                        "more": False,
                         "error": "Unable to get tid",
                     }
                 )
@@ -1200,20 +1209,25 @@ def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[d
             xrefs = []
             xref: ida_xref.xrefblk_t
             for xref in idautils.XrefsTo(tid):
-                xrefs += [
+                xrefs.append(
                     Xref(
                         addr=hex(xref.frm),
                         type="code" if xref.iscode else "data",
                         fn=get_function(xref.frm, raise_error=False),
                     )
-                ]
-            results.append({"struct": struct_name, "field": field_name, "xrefs": xrefs})
+                )
+                if len(xrefs) > limit:
+                    break
+            more = len(xrefs) > limit
+            xrefs = xrefs[:limit]
+            results.append({"struct": struct_name, "field": field_name, "xrefs": xrefs, "more": more})
         except Exception as e:
             results.append(
                 {
                     "struct": struct_name,
                     "field": field_name,
                     "xrefs": [],
+                    "more": False,
                     "error": str(e),
                 }
             )
@@ -1249,6 +1263,7 @@ def callees(
                     {"addr": fn_addr, "callees": None, "error": "No function found"}
                 )
                 continue
+            func_start = int(func.start_ea)
             func_end = func.end_ea
             callees_dict = {}
             more = False
@@ -1352,8 +1367,8 @@ def find_bytes(
                 continue
 
             # Search with early exit
-            ea = ida_ida.inf_get_min_ea()
-            max_ea = ida_ida.inf_get_max_ea()
+            ea = compat.inf_get_min_ea()
+            max_ea = compat.inf_get_max_ea()
             while ea != idaapi.BADADDR:
                 ea = searcher(ea, max_ea)
                 if ea == idaapi.BADADDR:
@@ -1530,8 +1545,8 @@ def find(
             skipped = 0
             more = False
             try:
-                ea = ida_ida.inf_get_min_ea()
-                max_ea = ida_ida.inf_get_max_ea()
+                ea = compat.inf_get_min_ea()
+                max_ea = compat.inf_get_max_ea()
                 mask = b"\xff" * len(pattern_bytes)
                 while ea != idaapi.BADADDR:
                     ea = _raw_bin_search(ea, max_ea, pattern_bytes, mask)
@@ -1609,8 +1624,9 @@ def find(
                                     skipped += 1
                                 else:
                                     matches.append(hex(insn_start))
-                                    if len(matches) >= limit:
+                                    if len(matches) > limit:
                                         more = True
+                                        matches = matches[:limit]
                                         break
 
                             ea += 1
@@ -1894,9 +1910,9 @@ def insn_query(
         if mnem == "*":
             mnem = ""
 
-        offset = _clamp_int(pattern.get("offset", 0), 0, 0, 2_000_000_000)
-        count = _clamp_int(pattern.get("count", 100), 100, 0, 5000)
-        max_scan_insns = _clamp_int(
+        offset = clamp_int(pattern.get("offset", 0), 0, 0, 2_000_000_000)
+        count = clamp_int(pattern.get("count", 100), 100, 0, 5000)
+        max_scan_insns = clamp_int(
             pattern.get("max_scan_insns", 200000), 200000, 1, 2_000_000
         )
         allow_broad = bool(pattern.get("allow_broad", False))
@@ -2074,7 +2090,7 @@ def callgraph(
     roots: Annotated[
         list[str] | str, "Root function addresses to start call graph traversal from"
     ],
-    max_depth: Annotated[int, "Maximum depth for call graph traversal"] = 5,
+    max_depth: Annotated[int, "Maximum depth for call graph traversal (default: 5, max: 20)"] = 5,
     max_nodes: Annotated[
         int, "Max nodes across the graph (default: 1000, max: 100000)"
     ] = 1000,
@@ -2089,6 +2105,8 @@ def callgraph(
     roots = normalize_list_input(roots)
     if max_depth < 0:
         max_depth = 0
+    if max_depth > 20:
+        max_depth = 20
     if max_nodes <= 0 or max_nodes > 100000:
         max_nodes = 100000
     if max_edges <= 0 or max_edges > 200000:

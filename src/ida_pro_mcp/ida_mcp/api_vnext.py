@@ -35,7 +35,8 @@ from ida_pro_mcp.vnext.contracts import (
     VNextError,
 )
 from ida_pro_mcp.vnext.investigations import InvestigationManager
-from ida_pro_mcp.vnext.jobs import CancelledError, JobContext, JobManager
+from ida_pro_mcp.vnext.jobs import CancelledError as JobCancelledError
+from ida_pro_mcp.vnext.jobs import JobContext, JobManager
 from ida_pro_mcp.vnext.transactions import RevisionTracker, TransactionManager
 
 from .rpc import (
@@ -45,9 +46,38 @@ from .rpc import (
     get_current_transport_session_id,
     get_workspace_policy,
     prompt,
+    resolve_tool_paths,
     resource,
     tool,
 )
+try:
+    from .sync import IDASyncError
+    from .sync import CancelledError as SyncCancelledError
+except ImportError:  # IDA-free contexts (tests) stub these modules
+    IDASyncError = None  # type: ignore[assignment,misc]
+    SyncCancelledError = None  # type: ignore[assignment,misc]
+try:
+    from .zeromcp.jsonrpc import RequestCancelledError
+except ImportError:
+    RequestCancelledError = None  # type: ignore[assignment,misc]
+try:
+    from .zeromcp.mcp import McpToolError
+except ImportError:
+    McpToolError = None  # type: ignore[assignment,misc]
+
+
+def _legacy_passthrough_errors() -> tuple:
+    return tuple(
+        cls
+        for cls in (
+            IDASyncError,
+            SyncCancelledError,
+            RequestCancelledError,
+            JobCancelledError,
+            McpToolError,
+        )
+        if isinstance(cls, type)
+    )
 
 _STATE_LOCK = RLock()
 _JOBS: JobManager | None = None
@@ -142,11 +172,13 @@ def _investigations() -> InvestigationManager:
         return _INVESTIGATIONS
 
 
-def _legacy_call(name: str, arguments: dict[str, Any] | None = None) -> Any:
+def _legacy_call(name: str, arguments: dict[str, Any] | None = None, *, check_paths: bool = True) -> Any:
     # The active profile removes legacy tools from the externally visible
     # registry, while vNext workflows still use selected legacy implementations
     # internally.  Dispatch against the preserved implementation registry so
     # profile filtering does not break canonical analysis jobs.
+    if check_paths:
+        resolve_tool_paths(name, arguments or {})
     implementation_methods = getattr(MCP_SERVER.tools, "_all_methods", None)
     if isinstance(implementation_methods, dict):
         implementation = implementation_methods.get(name)
@@ -156,7 +188,12 @@ def _legacy_call(name: str, arguments: dict[str, Any] | None = None) -> Any:
             return implementation(**(arguments or {}))
         except VNextError:
             raise
-        except (TypeError, ValueError, KeyError) as exc:
+        except Exception as exc:
+            if isinstance(exc, _legacy_passthrough_errors()):
+                raise
+            if isinstance(exc, (TypeError, ValueError, KeyError)):
+                raise VNextError(ErrorCode.INVALID_OPERATION, f"Legacy tool failed: {name}: {exc}") from exc
+            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool failed: {name}: {exc}") from exc
             raise VNextError(ErrorCode.INVALID_OPERATION, f"Legacy tool failed: {name}: {exc}") from exc
         except Exception as exc:
             raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool failed: {name}: {exc}") from exc
@@ -942,6 +979,7 @@ def taint_analyze(
 
     traces = [dataflow_trace(source, "forward", max_depth) for source in sources]
     effective_options = options or {}
+    include_traces = bool(effective_options.get("include_traces", False))
     max_paths = max(1, min(int(effective_options.get("max_paths", 100)), 1000))
     enabled_domains = set(effective_options.get("domains", ["register", "stack", "global", "memory"]))
     sink_set = {normalized_match_token(sink) for sink in sinks}
@@ -999,6 +1037,8 @@ def taint_analyze(
     semantic = engines == [AnalysisEngine.HEXRAYS_MICROCODE.value]
     if not semantic:
         warnings.append("At least one trace used reference-flow fallback")
+    if not include_traces:
+        warnings.append("Per-source traces omitted (pass options.include_traces=true to include them).")
     return {
         "engine": engines[0] if len(engines) == 1 else "mixed",
         "fidelity": "semantic_intraprocedural" if semantic else "reference_or_mixed",
@@ -1008,7 +1048,7 @@ def taint_analyze(
         "domains": sorted(enabled_domains),
         "hits": hits,
         "sanitizer_annotations": sanitizer_annotations,
-        "traces": traces,
+        "traces": traces if include_traces else [],
         "truncated": len(hits) >= max_paths,
         "unsupported_edges": [
             {"kind": "interprocedural_alias", "reason": "callee summaries are not yet available for every call"},
@@ -1019,16 +1059,21 @@ def taint_analyze(
 
 
 def _node_domains(nodes: list[dict[str, Any]]) -> set[str]:
+    import re
+
     domains: set[str] = set()
     rendered = " ".join(
         f"{node.get('definitions', '')} {node.get('uses', '')}".lower()
         for node in nodes
     )
-    if any(marker in rendered for marker in ("stk", "stack", "@sp", " sp")):
+    if re.search(r"\b(sp|stk|stack|stackvar)\b|@sp", rendered):
         domains.add("stack")
-    if any(marker in rendered for marker in ("mem", "[", "global")):
-        domains.update({"memory", "global"})
-    if rendered.strip():
+    text = rendered
+    if "[" in text or re.search(r"\bmem\b", text):
+        domains.add("memory")
+    if re.search(r"\b(global|got|plt)\b|\.data\b|\.bss\b", text):
+        domains.add("global")
+    if rendered.strip() and not domains:
         domains.add("register")
     return domains
 
@@ -1087,7 +1132,7 @@ def investigation_start(
                 context.progress(0.1 + 0.8 * ((index + 1) / max(1, len(seeds))), f"analyzed {seed}")
             manager.set_state(record.investigation_id, "completed", triage=triage, analyses=analyses)
             return manager.get(record.investigation_id).to_dict()
-        except CancelledError:
+        except JobCancelledError:
             manager.set_state(record.investigation_id, "cancelled")
             raise
         except Exception:
@@ -1178,7 +1223,16 @@ _MUTATION_KIND_ALIASES = {
 
 _RENAME_BATCH_KEYS = frozenset({"func", "data", "global", "globals", "local", "stack"})
 _RENAME_PASSTHROUGH_KEYS = ("allow_overwrite", "dry_run", "stop_on_error")
-_MUTATION_META_KEYS = frozenset({"kind", "arguments"})
+_MUTATION_META_KEYS = frozenset({"kind", "arguments", "scope"})
+
+_SCOPE_RANK = {
+    SafetyScope.READ: 0,
+    SafetyScope.ANNOTATE: 1,
+    SafetyScope.MODIFY: 2,
+    SafetyScope.FILESYSTEM: 3,
+    SafetyScope.DEBUG: 4,
+    SafetyScope.PYTHON: 5,
+}
 
 
 def _as_dict_list(value: Any) -> list[dict[str, Any]] | None:
@@ -1381,7 +1435,19 @@ def _parse_operations(values: list[dict[str, Any]]) -> list[MutationOperation]:
                 ErrorCode.INVALID_OPERATION,
                 f"Mutation operation {index} {kind} is missing required fields",
             )
-        operations.append(MutationOperation(kind, arguments, target[2]))
+        scope = target[2]
+        raw_scope = value.get("scope")
+        if raw_scope is not None:
+            try:
+                client_scope = SafetyScope(str(raw_scope).lower())
+            except ValueError:
+                raise VNextError(
+                    ErrorCode.INVALID_OPERATION,
+                    f"Mutation operation {index} has an unknown scope: {raw_scope!r}",
+                )
+            if _SCOPE_RANK[client_scope] > _SCOPE_RANK[scope]:
+                scope = client_scope
+        operations.append(MutationOperation(kind, arguments, scope))
     return operations
 
 
@@ -1412,7 +1478,7 @@ def _checkpoint_path(transaction_id: str) -> str:
     directory = cache_root / "ida-pro-mcp" / "checkpoints"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{transaction_id}.i64"
-    result = _legacy_call("idb_save", {"path": str(path)})
+    result = _legacy_call("idb_save", {"path": str(path)}, check_paths=False)
     failure = _legacy_result_failed(result)
     if failure:
         raise VNextError(ErrorCode.NOT_SUPPORTED, f"Failed to write recovery checkpoint: {failure}")
@@ -1511,6 +1577,28 @@ def _mutation_before_state(operation: MutationOperation) -> Any:
     except Exception:
         return None
     return None
+
+
+@_ida_synchronized
+def _create_undo_point() -> bool:
+    try:
+        import ida_undo
+
+        create = getattr(ida_undo, "create_undo_point", None)
+        if create is None:
+            return False
+        try:
+            return bool(create(b"ida-mcp", 7))
+        except TypeError:
+            pass
+        try:
+            return bool(create(b"ida-mcp"))
+        except TypeError:
+            pass
+        # IDA 9.4+: create_undo_point(action_name: str, label: str).
+        return bool(create("ida-mcp", "ida-mcp"))
+    except Exception:
+        return False
 
 
 @_ida_synchronized
@@ -1659,9 +1747,21 @@ def mutation_preview(
         "Aliases set_name/rename_func map to rename.",
     ],
 ) -> dict[str, Any]:
-    """Validate and stage a mutation batch without changing the database."""
+    """Validate and stage a mutation batch without changing the database.
+
+    Rename operations are validated with a legacy dry-run; other kinds are structural only.
+    """
 
     parsed = _parse_operations(operations)
+    for operation in parsed:
+        if operation.kind != "rename":
+            continue
+        result = _legacy_call("rename", {"batch": {**operation.arguments, "dry_run": True}})
+        detail = _legacy_result_failed(result)
+        if detail is None and isinstance(result, dict) and result.get("ok") is False:
+            detail = result.get("error") or "rename dry-run failed"
+        if detail is not None:
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"mutation_preview: rename dry-run failed: {detail}")
     preview = _TRANSACTIONS.preview(
         _database_id(),
         parsed,
@@ -1674,7 +1774,16 @@ def mutation_preview(
             "after": operation.arguments,
         },
     )
-    return preview.to_dict()
+    result = preview.to_dict()
+    try:
+        from .http import recovery_checkpoints_enabled
+    except Exception:
+        recovery_checkpoints_enabled = None  # type: ignore[assignment]
+    if recovery_checkpoints_enabled is not None and not recovery_checkpoints_enabled():
+        warnings = list(result.get("warnings") or [])
+        warnings.append("Recovery checkpoints are disabled; mutation_commit will not write a recovery IDB.")
+        result["warnings"] = warnings
+    return result
 
 
 @tool
@@ -1688,6 +1797,7 @@ def mutation_commit(transaction_id: Annotated[str, "Preview transaction identifi
         checkpoint=_commit_checkpoint,
         apply_operation=_apply_operation,
         undo=_perform_undo,
+        begin=_create_undo_point,
     )
     return receipt.to_dict()
 
@@ -1701,7 +1811,7 @@ def mutation_status(transaction_id: Annotated[str, "Transaction identifier"]) ->
 
 @tool
 def mutation_rollback(transaction_id: Annotated[str, "Committed transaction identifier"]) -> dict[str, Any]:
-    """Use native undo or return a checkpoint requiring database reopen."""
+    """Roll back the latest committed transaction using native undo; otherwise raise REOPEN_REQUIRED with the checkpoint path (null when checkpoints are disabled). Reopen is manual."""
 
     return _TRANSACTIONS.rollback(transaction_id, rollback_undo=_perform_undo).to_dict()
 

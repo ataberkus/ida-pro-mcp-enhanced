@@ -8,6 +8,8 @@ from ..framework import (
     assert_error,
     get_any_function,
     get_named_address,
+    get_unmapped_address,
+    get_data_address,
 )
 from ..api_modify import (
     append_comments,
@@ -17,6 +19,7 @@ from ..api_modify import (
     define_func,
     define_code,
     undefine,
+    make_data,
 )
 from ..api_memory import get_bytes, patch
 from ..api_core import lookup_funcs
@@ -38,7 +41,7 @@ def _require_any_function() -> str:
 
 
 def _plain_hex_bytes(text: str) -> str:
-    return text.replace("0x", "").replace(" ", "").lower()
+    return "".join(part.zfill(2) for part in text.replace("0x", "").split()).lower()
 
 
 @test()
@@ -237,6 +240,68 @@ def test_rename_data_roundtrip():
     assert idaapi.get_name_ea(idaapi.BADADDR, original_name) == int(addr, 16)
 
 
+@test(binary="crackme03.elf")
+def test_make_data_replaces_dword_with_qword():
+    """make_data replacing an existing dword with __int64 succeeds with size 8."""
+    import idaapi
+    import ida_bytes
+
+    addr = get_data_address()
+    if not addr:
+        skip_test("binary has no data segment")
+    ea = int(addr, 16)
+    original_bytes = idaapi.get_bytes(ea, 8)
+    if not original_bytes:
+        skip_test("data address unreadable")
+    try:
+        result = make_data({"addr": addr, "type": "__int64", "name": "__test_qword__"})
+        assert_is_list(result, min_length=1)
+        assert result[0].get("ok") is True, f"make_data failed: {result[0].get('error')}"
+        assert result[0].get("size") == 8
+    finally:
+        ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, 8)
+        ida_bytes.patch_bytes(ea, original_bytes)
+        try:
+            idaapi.set_name(ea, "", idaapi.SN_NOWARN)
+        except Exception:
+            pass
+
+
+@test()
+def test_set_comments_batch_keeps_both():
+    """A two-item set_comments batch keeps both comments."""
+    import idaapi
+    import idautils
+
+    eas = []
+    for ea in idautils.Functions():
+        eas.append(ea)
+        if len(eas) == 2:
+            break
+    if len(eas) < 2:
+        skip_test("binary has fewer than two functions")
+    fn_a, fn_b = hex(eas[0]), hex(eas[1])
+    originals = [idaapi.get_cmt(ea, False) or "" for ea in eas]
+    try:
+        result = set_comments(
+            [
+                {"addr": fn_a, "comment": "__BATCH_A__"},
+                {"addr": fn_b, "comment": "__BATCH_B__"},
+            ]
+        )
+        assert_is_list(result, min_length=2)
+        assert all(item.get("ok") is True for item in result)
+        assert idaapi.get_cmt(eas[0], False) == "__BATCH_A__"
+        assert idaapi.get_cmt(eas[1], False) == "__BATCH_B__"
+    finally:
+        set_comments(
+            [
+                {"addr": fn_a, "comment": originals[0]},
+                {"addr": fn_b, "comment": originals[1]},
+            ]
+        )
+
+
 @test()
 def test_rename_dry_run_summary():
     """rename supports dry_run and returns summary counters"""
@@ -247,6 +312,7 @@ def test_rename_dry_run_summary():
     assert result["summary"]["dry_run"] is True
     assert_is_list(result["func"], min_length=1)
     assert result["func"][0].get("dry_run") is True
+    assert result["func"][0].get("dir") is None
 
 
 @test()
@@ -255,7 +321,7 @@ def test_rename_stop_on_error():
     result = rename(
         {
             "func": [
-                {"addr": "0x0", "name": "__invalid__"},
+                {"addr": get_unmapped_address(), "name": "__invalid__"},
                 {"addr": _require_any_function(), "name": "__should_not_run__"},
             ],
             "stop_on_error": True,

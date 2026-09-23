@@ -1,5 +1,8 @@
 """In-IDA Hex-Rays function review dialog.
 
+Main-thread only: every function here is called from the IDA UI action handler
+and calls IDA APIs directly.
+
 Right-click a decompiled (or disassembled) function to run the same analysis
 as analysis_run(mode="function"), edit names/comments, copy an MCP agent
 prompt, and apply accepted edits through mutation_preview / mutation_commit.
@@ -83,6 +86,8 @@ def apply_function_review(
     """Stage and commit accepted review edits through the mutation path."""
     from .api_vnext import mutation_commit, mutation_preview
 
+    if not str(addr or "").strip():
+        return {"ok": False, "error": "Address is required"}
     operations = build_mutation_operations(
         addr=addr,
         current_name=current_name,

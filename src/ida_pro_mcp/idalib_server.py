@@ -65,6 +65,7 @@ IDB_MANAGEMENT_TOOLS = {
 
 
 _LIFECYCLE = WorkerLifecycle()
+_STOP_INITIATED = threading.Event()
 _REGISTERED_PORT: int | None = None
 _BOUND_HOST: str = ""
 _BOUND_PORT: int = 0
@@ -81,6 +82,7 @@ def _register_in_discovery(host: str, port: int, input_path: Path) -> None:
             binary=input_path.name,
             idb_path=str(input_path),
             backend="worker",
+            auth_token=os.environ.get("IDA_MCP_AUTH_TOKEN"),
         )
         _REGISTERED_PORT = port
         logger.info("Registered idalib worker in discovery (port %d)", port)
@@ -299,6 +301,9 @@ def main():
         )
 
     def _on_lifecycle_exit(reason: str) -> None:
+        if _STOP_INITIATED.is_set():
+            return
+        _STOP_INITIATED.set()
         logger.info("Worker lifecycle requesting shutdown: %s", reason)
         # MCP_SERVER.stop() must be called from outside the serve_forever
         # thread; our watchdog thread qualifies.
@@ -311,6 +316,9 @@ def main():
     _install_dispatch_hook()
 
     def cleanup_and_exit(signum, frame):
+        if _STOP_INITIATED.is_set():
+            return
+        _STOP_INITIATED.set()
         logger.info("Signal %s received; shutting down", signum)
         # MCP_SERVER.stop() blocks until serve_forever() returns, but this
         # handler runs on the main thread — the same thread that is parked
@@ -358,6 +366,7 @@ def main():
 
     from ida_pro_mcp.ida_mcp import trace
 
+    trace.configure_idb()
     trace.install_tracer()
     logger.info("Tracing tools/call to IDB netnode %s", trace.IDB_NETNODE_NAME)
 
@@ -365,6 +374,8 @@ def main():
         set_download_base_url(f"http://{args.host}:{args.port}")
 
     try:
+        # Single-threaded: sync.call_stack is process-global and each worker
+        # owns one active database, so concurrent worker requests are unsafe.
         MCP_SERVER.serve(
             host=args.host,
             port=args.port,

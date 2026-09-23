@@ -315,3 +315,26 @@ def test_name_resolution_across_tools():
 
     # Both should resolve to the same address
     assert r1[0]["addr"] == r2[0]["addr"]
+
+
+@test(binary="crackme03.elf")
+def test_find_bytes_second_segment_start():
+    """A pattern from the second segment's first bytes resolves to that segment start."""
+    import idaapi
+    import idautils
+
+    from .. import compat
+
+    eas = sorted(idautils.Segments())
+    if len(eas) < 2:
+        skip_test("binary has fewer than two segments")
+    seg = compat.get_segment_info(eas[1])
+    raw = idaapi.get_bytes(seg.start_ea, 32)
+    if not raw or len(raw) < 16:
+        skip_test("second segment has no readable bytes")
+    pattern = " ".join(f"{b:02X}" for b in raw[:16])
+    scan = find_bytes(pattern)
+    assert_is_list(scan, min_length=1)
+    assert scan[0]["matches"] == [hex(seg.start_ea)], (
+        f"expected exactly [{hex(seg.start_ea)}], got {scan[0]['matches']}"
+    )

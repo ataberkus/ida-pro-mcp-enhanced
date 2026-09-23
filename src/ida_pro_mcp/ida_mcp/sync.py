@@ -59,6 +59,9 @@ _DEFAULT_CONTENDED_SEARCH_PAGE_BUDGET_SEC = 0.25
 _MAX_CONTENDED_SEARCH_PAGE_BUDGET_SEC = 1.0
 _SYNC_QUEUE_TIMEOUT_ENV = "IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC"
 _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC = 10.0
+_RESULT_GRACE_SEC = 5.0
+_MAX_SYNC_QUEUE_TOTAL_WAIT_SEC = 60.0
+_MAX_SYNC_QUEUE_TOTAL_WAIT_ENV = "IDA_MCP_SYNC_QUEUE_MAX_WAIT_SEC"
 _SYNC_LOG_ENV = "IDA_MCP_SYNC_LOG"
 _ERROR_LOG_ENV = "IDA_MCP_ERROR_LOG"
 _sync_request_ids = itertools.count(1)
@@ -80,9 +83,25 @@ def _get_tool_timeout_seconds() -> float:
     if value == "":
         return _DEFAULT_TOOL_TIMEOUT_SEC
     try:
-        return float(value)
+        timeout = float(value)
     except ValueError:
         return _DEFAULT_TOOL_TIMEOUT_SEC
+    if timeout <= 0 or timeout != timeout or timeout == float("inf"):
+        return _DEFAULT_TOOL_TIMEOUT_SEC
+    return timeout
+
+
+def _get_max_sync_queue_total_wait_seconds() -> float:
+    value = os.getenv(_MAX_SYNC_QUEUE_TOTAL_WAIT_ENV, "").strip()
+    if value == "":
+        return _MAX_SYNC_QUEUE_TOTAL_WAIT_SEC
+    try:
+        total = float(value)
+    except ValueError:
+        return _MAX_SYNC_QUEUE_TOTAL_WAIT_SEC
+    if total <= 0 or total != total or total == float("inf"):
+        return _MAX_SYNC_QUEUE_TOTAL_WAIT_SEC
+    return total
 
 
 def get_search_page_budget_seconds(*, contended: bool = False) -> float:
@@ -183,6 +202,7 @@ _ERROR_STAGES = {
     "decompile_failed",
     "queue_start_timeout",
     "queue_submit_exception",
+    "result_timeout",
     "reentrant_rejected",
     "tool_exception",
     "tool_reported_error",
@@ -626,6 +646,8 @@ def _sync_wrapper(ff):
         # Wait for UI start. If another MCP tool is already running on the UI
         # thread (e.g. survey_binary for 20s+), keep extending the idle timer so
         # concurrent callers do not abandon and skip late callbacks.
+        max_total = _get_max_sync_queue_total_wait_seconds()
+        total_deadline = queued_at + max(queue_timeout, max_total)
         idle_deadline = time.monotonic() + queue_timeout
         while not started_event.is_set():
             remaining = idle_deadline - time.monotonic()
@@ -634,6 +656,8 @@ def _sync_wrapper(ff):
                     break
                 active_function = get_active_ui_request_function()
                 if active_function is not None:
+                    if time.monotonic() >= total_deadline:
+                        break
                     idle_deadline = time.monotonic() + queue_timeout
                     _sync_diag(
                         request_id,
@@ -664,11 +688,28 @@ def _sync_wrapper(ff):
                 raise IDASyncError(
                     f"IDA Qt UI queue did not start request {request_id} "
                     f"({ff.__name__}) within {waited:.2f}s idle "
-                    f"(limit {queue_timeout:.2f}s); "
+                    f"(limit {queue_timeout:.2f}s; total limit {max_total:.2f}s); "
                     f"diagnostics: {_SYNC_LOG_PATH}"
                 )
 
-    res = res_container.get()
+    timeout = _normalize_timeout(getattr(ff, "__ida_mcp_timeout_sec__", None))
+    result_timeout = (timeout if timeout and timeout > 0 else _DEFAULT_TOOL_TIMEOUT_SEC) + _RESULT_GRACE_SEC
+    try:
+        res = res_container.get(timeout=result_timeout)
+    except queue.Empty:
+        with state_lock:
+            state["abandoned"] = True
+        _sync_diag(
+            request_id,
+            "result_timeout",
+            function=ff.__name__,
+            waited=result_timeout,
+            tool_timeout=timeout,
+        )
+        raise IDASyncError(
+            f"IDA tool {ff.__name__} did not complete within {result_timeout:.2f}s "
+            f"(tool timeout {timeout:.2f}s); diagnostics: {_SYNC_LOG_PATH}"
+        )
     _sync_diag(
         request_id,
         "worker_received",
@@ -685,9 +726,12 @@ def _normalize_timeout(value: object) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        timeout = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+    if timeout <= 0 or timeout != timeout or timeout == float("inf"):
+        return None
+    return timeout
 
 
 def sync_wrapper(ff, timeout_override: float | None = None):
@@ -768,6 +812,12 @@ def idasync(f):
         timeout_override = _normalize_timeout(
             getattr(f, "__ida_mcp_timeout_sec__", None)
         )
+        if timeout_override is None:
+            timeout_override = _normalize_timeout(
+                getattr(wrapper, "__ida_mcp_timeout_sec__", None)
+            )
+        else:
+            setattr(wrapper, "__ida_mcp_timeout_sec__", timeout_override)
         return sync_wrapper(ff, timeout_override)
 
     return wrapper
@@ -776,18 +826,27 @@ def idasync(f):
 def tool_timeout(seconds: float):
     """Decorator to override per-tool timeout (seconds).
 
-    IMPORTANT: Must be applied BEFORE @idasync (i.e., listed AFTER it)
-    so the attribute exists when it captures the function in closure.
-
-    Correct order:
-        @tool
-        @idasync
-        @tool_timeout(90.0)  # innermost
-        def my_func(...):
+    Order no longer matters: the attribute is propagated through
+    __wrapped__ chains by both this decorator and idasync.
     """
 
+    try:
+        seconds_value = float(seconds)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError("tool_timeout requires seconds > 0")
+    if seconds_value <= 0 or seconds_value != seconds_value or seconds_value == float("inf"):
+        raise ValueError("tool_timeout requires seconds > 0")
+
     def decorator(func):
-        setattr(func, "__ida_mcp_timeout_sec__", seconds)
+        setattr(func, "__ida_mcp_timeout_sec__", seconds_value)
+        wrapped = func
+        seen = set()
+        while wrapped is not None and id(wrapped) not in seen:
+            seen.add(id(wrapped))
+            wrapped = getattr(wrapped, "__wrapped__", None)
+            if wrapped is None:
+                break
+            setattr(wrapped, "__ida_mcp_timeout_sec__", seconds_value)
         return func
 
     return decorator

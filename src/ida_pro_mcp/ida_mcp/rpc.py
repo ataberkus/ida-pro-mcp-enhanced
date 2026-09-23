@@ -90,15 +90,7 @@ def _enrich_tool_schema(name: str, schema: dict) -> dict:
     return schema
 
 
-def _guard_tool_call(name: str, arguments: dict) -> None:
-    try:
-        MCP_POLICY.authorize(name, get_active_scopes())
-    except VNextError as exc:
-        raise McpToolError(
-            str(exc),
-            code=exc.code.value,
-            details=exc.details,
-        ) from exc
+def resolve_tool_paths(name: str, arguments: dict) -> None:
     path_argument = {
         "idb_open": "input_path",
         "idb_save": "path",
@@ -109,13 +101,24 @@ def _guard_tool_call(name: str, arguments: dict) -> None:
     if name == "investigation_export" and arguments.get("path"):
         path_argument = "path"
     if path_argument and arguments.get(path_argument):
-        try:
-            get_workspace_policy().resolve(
-                arguments[path_argument],
-                must_exist=name in {"idb_open", "py_exec_file", "python_execute"},
-            )
-        except VNextError as exc:
-            raise McpToolError(str(exc), code=exc.code.value, details=exc.details) from exc
+        get_workspace_policy().resolve(
+            arguments[path_argument],
+            must_exist=name in {"idb_open", "py_exec_file", "python_execute"},
+        )
+
+
+def _guard_tool_call(name: str, arguments: dict) -> None:
+    try:
+        MCP_POLICY.authorize(name, get_active_scopes())
+        if name == "investigation_export" and arguments.get("path"):
+            MCP_POLICY.authorize("idb_save", get_active_scopes())
+        resolve_tool_paths(name, arguments)
+    except VNextError as exc:
+        raise McpToolError(
+            str(exc),
+            code=exc.code.value,
+            details=exc.details,
+        ) from exc
 
 
 MCP_SERVER.tool_visibility_filter = _tool_visible

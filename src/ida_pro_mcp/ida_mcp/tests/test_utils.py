@@ -6,7 +6,8 @@ from ..utils import (
     parse_address,
     normalize_list_input,
     normalize_dict_list,
-    looks_like_address,
+    clamp_int,
+    resolve_address_or_name,
     get_function,
     get_prototype,
     get_type_by_name,
@@ -31,9 +32,20 @@ def test_utils_parse_address_and_detection():
     """Address parsing helpers accept canonical inputs and reject malformed ones."""
     assert parse_address("0x123e") == 0x123E
     assert parse_address(0x123E) == 0x123E
-    assert looks_like_address("0x123e") is True
-    assert looks_like_address("123e") is True
-    assert looks_like_address("main") is False
+    assert resolve_address_or_name("main") == 0x123E
+    assert resolve_address_or_name("0x123e") == 0x123E
+    for bad, fragment in [
+        (True, "bool"),
+        (-1, "negative"),
+        (0x1_0000_0000_0000_0000, "out of range"),
+    ]:
+        try:
+            parse_address(bad)  # type: ignore[arg-type]
+            assert False, f"expected parse_address({bad!r}) to fail"
+        except IDAError as e:
+            assert fragment in str(e)
+    assert clamp_int("12", 0, 0, 10) == 10
+    assert clamp_int("bad", 7, 0, 10) == 7
     try:
         parse_address("xyz")
         assert False, "expected parse_address to fail"
@@ -59,6 +71,8 @@ def test_utils_normalize_helpers():
     assert normalize_dict_list({"x": 1}) == [{"x": 1}]
     assert normalize_dict_list("a,b", lambda s: {"v": s}) == [{"v": "a"}, {"v": "b"}]
     assert normalize_dict_list('[{"x":1}]') == [{"x": 1}]
+    assert normalize_dict_list('[{"x":1}, 2]') == [{"x": 1}]
+    assert normalize_dict_list(["a"]) == []
 
 
 @test(binary="crackme03.elf")

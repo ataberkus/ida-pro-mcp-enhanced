@@ -14,13 +14,14 @@ import idautils
 import idc
 
 from .rpc import resource
-from .sync import idasync
+from .sync import IDAError, idasync
 from .utils import (
     Metadata,
     Segment,
     StructureDefinition,
     StructureMember,
     get_image_size,
+    hash_input_file,
     parse_address,
 )
 from . import compat
@@ -35,25 +36,17 @@ from . import compat
 @idasync
 def idb_metadata_resource() -> Metadata:
     """Get IDB file metadata (path, arch, base address, size, hashes)"""
-    import hashlib
-
     path = idc.get_idb_path()
     module = ida_nalt.get_root_filename()
     base = hex(idaapi.get_imagebase())
     size = hex(get_image_size())
 
     input_path = ida_nalt.get_input_file_path()
-    try:
-        with open(input_path, "rb") as f:
-            data = f.read()
-        md5 = hashlib.md5(data).hexdigest()
-        sha256 = hashlib.sha256(data).hexdigest()
-        import zlib
-
-        crc32 = hex(zlib.crc32(data) & 0xFFFFFFFF)
-        filesize = hex(len(data))
-    except Exception:
-        md5 = sha256 = crc32 = filesize = "unavailable"
+    hashed = hash_input_file(input_path)
+    md5 = hashed["md5"]
+    sha256 = hashed["sha256"]
+    crc32 = hashed["crc32"]
+    filesize = hashed["filesize"] if hashed["filesize"] == "unavailable" else hex(hashed["filesize"])
 
     return Metadata(
         path=path,
@@ -195,14 +188,14 @@ def struct_name_resource(name: Annotated[str, "Structure name"]) -> dict:
     """Get structure definition with fields"""
     tif = ida_typeinf.tinfo_t()
     if not tif.get_named_type(None, name):
-        return {"error": f"Structure not found: {name}"}
+        raise IDAError(f"Structure not found: {name}")
 
     if not tif.is_udt():
-        return {"error": f"'{name}' is not a structure/union"}
+        raise IDAError(f"'{name}' is not a structure/union")
 
     udt_data = ida_typeinf.udt_type_data_t()
     if not tif.get_udt_details(udt_data):
-        return {"error": f"Failed to get struct details for '{name}'"}
+        raise IDAError(f"Failed to get struct details for '{name}'")
 
     members = []
     for member in udt_data:
@@ -212,6 +205,8 @@ def struct_name_resource(name: Annotated[str, "Structure name"]) -> dict:
                 offset=hex(member.offset // 8),
                 size=hex(member.size // 8),
                 type=str(member.type),
+                bit_offset=member.offset % 8,
+                bit_size=member.size % 8,
             )
         )
 
@@ -249,7 +244,7 @@ def import_name_resource(name: Annotated[str, "Import name"]) -> dict:
         if result:
             return result
 
-    return {"error": f"Import not found: {name}"}
+    raise IDAError(f"Import not found: {name}")
 
 
 @resource("ida://export/{name}")
@@ -269,7 +264,7 @@ def export_name_resource(name: Annotated[str, "Export name"]) -> dict:
                 "ordinal": ordinal,
             }
 
-    return {"error": f"Export not found: {name}"}
+    raise IDAError(f"Export not found: {name}")
 
 
 # ============================================================================
@@ -277,11 +272,16 @@ def export_name_resource(name: Annotated[str, "Export name"]) -> dict:
 # ============================================================================
 
 
+_RESOURCE_XREF_LIMIT = 500
+
+
 @resource("ida://xrefs/from/{addr}")
 @idasync
 def xrefs_from_resource(addr: Annotated[str, "Source address"]) -> list[dict]:
     """Get cross-references from address"""
-    ea = parse_address(addr)
+    from .utils import resolve_address_or_name
+
+    ea = resolve_address_or_name(addr)
     xrefs = []
     for xref in idautils.XrefsFrom(ea, 0):
         xrefs.append(
@@ -290,4 +290,6 @@ def xrefs_from_resource(addr: Annotated[str, "Source address"]) -> list[dict]:
                 "type": "code" if xref.iscode else "data",
             }
         )
+        if len(xrefs) >= _RESOURCE_XREF_LIMIT:
+            break
     return xrefs

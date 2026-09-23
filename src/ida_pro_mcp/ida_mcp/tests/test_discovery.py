@@ -1,8 +1,8 @@
 """Tests for the instance discovery module (discovery.py).
 
 Exercises registration/unregistration round-trips, the multi-stage staleness
-pipeline in discover_instances, and sort-order guarantees that server.py
-relies on for auto-selection.
+pipeline in discover_instances, and sort-order guarantees for discovery
+consumers.
 """
 
 import contextlib
@@ -154,17 +154,13 @@ def test_discover_returns_empty_when_dir_missing():
 
 
 # ---------------------------------------------------------------------------
-# Sort order — server.py picks instances[0], so order matters
+# Sort order — discovery consumers read instances in registration order
 # ---------------------------------------------------------------------------
 
 
 @test()
 def test_discover_sorts_by_started_at():
-    """discover_instances returns results sorted by started_at (oldest first).
-
-    server.py auto-selects instances[0], so this order determines which
-    instance gets auto-connected when multiple are running.
-    """
+    """discover_instances returns results sorted by started_at (oldest first)."""
     with _tmp_instances_dir() as tmp:
         for port, ts in [(55010, "2025-01-01T00:00:02+00:00"),
                          (55011, "2025-01-01T00:00:01+00:00")]:

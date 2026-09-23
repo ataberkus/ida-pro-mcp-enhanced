@@ -17,25 +17,28 @@ _SECRET_KEYS = {
     "password",
     "secret",
     "api_key",
-    "code",
-    "source",
 }
+
+_CODE_TOOLS = {"python_execute", "py_eval", "py_exec_file"}
+_CODE_KEYS = {"code", "source", "file_path", "path"}
 
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def redact(value: Any, *, key: str = "") -> Any:
+def redact(value: Any, *, key: str = "", tool: str = "") -> Any:
     lowered = key.lower()
+    if tool in _CODE_TOOLS and lowered in _CODE_KEYS:
+        return "<redacted>"
     if lowered in _SECRET_KEYS or any(marker in lowered for marker in ("token", "password", "secret", "authorization")):
         return "<redacted>"
     if isinstance(value, dict):
-        return {str(k): redact(v, key=str(k)) for k, v in value.items()}
+        return {str(k): redact(v, key=str(k), tool=tool) for k, v in value.items()}
     if isinstance(value, list):
-        return [redact(item) for item in value]
+        return [redact(item, tool=tool) for item in value]
     if isinstance(value, tuple):
-        return [redact(item) for item in value]
+        return [redact(item, tool=tool) for item in value]
     if isinstance(value, bytes):
         return {"sha256": hashlib.sha256(value).hexdigest(), "length": len(value)}
     if isinstance(value, str) and len(value) > 4096:
@@ -78,7 +81,7 @@ class AuditLog:
             database=database,
             tool=tool,
             safety_scopes=safety_scopes,
-            arguments=redact(arguments),
+            arguments=redact(arguments, tool=tool),
             outcome=outcome,
             error_code=error_code,
         )

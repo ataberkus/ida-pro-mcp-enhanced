@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 from itertools import islice
 from typing import Annotated
@@ -21,6 +20,7 @@ _MAX_STRING_ITER = 5_000
 
 # Max xrefs to materialize per string.
 _MAX_XREFS_PER_STRING = 200
+_MAX_XREFS_PER_FUNC = 200
 
 # Import category rules: keyword -> category name.
 # Order matters: first match wins.
@@ -52,13 +52,11 @@ def _build_metadata() -> dict:
     is_64 = compat.inf_is_64bit()
 
     input_path = ida_nalt.get_input_file_path()
-    try:
-        with open(input_path, "rb") as f:
-            data = f.read()
-        md5 = hashlib.md5(data).hexdigest()
-        sha256 = hashlib.sha256(data).hexdigest()
-    except Exception:
-        md5 = sha256 = "unavailable"
+    from .utils import hash_input_file
+
+    hashed = hash_input_file(input_path)
+    md5 = hashed["md5"]
+    sha256 = hashed["sha256"]
 
     return {
         "path": path,
@@ -176,7 +174,7 @@ def _classify_func(ea: int, func, name: str, callee_count: int) -> str:
     import idaapi
 
     flags = compat.get_func_flags(func)
-    size = func.end_ea - func.start_ea
+    size = compat.get_func_end_ea(func) - func.start_ea
     if flags & idaapi.FUNC_THUNK or size <= 8:
         return "thunk"
     if callee_count == 1 and size < 100:
@@ -205,8 +203,8 @@ def _build_interesting_functions(func_eas: list[int], truncated: bool) -> list[d
         if _is_library_func(ea, name, flags):
             continue
 
-        xref_count = len(list(idautils.XrefsTo(ea, 0)))
-        size = func.size()
+        xref_count = sum(1 for _ in islice(idautils.XrefsTo(ea, 0), _MAX_XREFS_PER_FUNC))
+        size = compat.get_func_end_ea(func) - func.start_ea
         candidates.append((xref_count, ea, name, size, flags))
 
     candidates.sort(key=lambda t: t[0], reverse=True)
@@ -338,11 +336,12 @@ def survey_binary(
     strings = _get_strings_cache()
     segments = _build_segments()
 
+    stats = _build_statistics(func_eas, len(strings), len(segments))
+    stats["total_functions"] = len(all_func_eas)
+    stats["functions_scored"] = len(func_eas)
     result: dict = {
         "metadata": _build_metadata(),
-        "statistics": _build_statistics(
-            all_func_eas, len(strings), len(segments)
-        ),
+        "statistics": stats,
         "segments": segments,
         "entrypoints": _build_entrypoints(),
     }

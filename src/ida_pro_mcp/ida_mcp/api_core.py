@@ -42,6 +42,8 @@ from .utils import (
     normalize_dict_list,
     normalize_list_input,
     parse_address,
+    resolve_address_or_name,
+    clamp_int,
     paginate,
     pattern_filter,
 )
@@ -423,13 +425,7 @@ def int_convert(
             continue
 
         if not size:
-            size = 0
-            n = abs(value)
-            while n:
-                size += 1
-                n >>= 1
-            size += 7
-            size //= 8
+            size = 0 if value == 0 else (value.bit_length() + 8) // 8
 
         try:
             bytes_data = value.to_bytes(size, "little", signed=True)
@@ -678,7 +674,7 @@ def entity_query(
         min_addr = query.get("min_addr")
         if min_addr not in (None, "") and query_error is None:
             try:
-                min_ea = parse_address(min_addr)
+                min_ea = resolve_address_or_name(min_addr)
                 rows = [row for row in rows if int(str(row["addr"]), 16) >= min_ea]
             except Exception:
                 query_error = f"Invalid min_addr: {min_addr!r}"
@@ -687,7 +683,7 @@ def entity_query(
         max_addr = query.get("max_addr")
         if max_addr not in (None, "") and query_error is None:
             try:
-                max_ea = parse_address(max_addr)
+                max_ea = resolve_address_or_name(max_addr)
                 rows = [row for row in rows if int(str(row["addr"]), 16) <= max_ea]
             except Exception:
                 query_error = f"Invalid max_addr: {max_addr!r}"
@@ -705,8 +701,8 @@ def entity_query(
         else:
             rows.sort(key=lambda row: str(row.get(sort_by, "")).lower(), reverse=descending)
 
-        offset = int(query.get("offset", 0) or 0)
-        count = int(query.get("count", 100) or 100)
+        offset = clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
+        count = clamp_int(query.get("count", 100), 100, 0, 5000)
         page = paginate(rows, offset, count)
         data = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
 
@@ -814,7 +810,10 @@ def find_regex(
         limit = 500
 
     matches = []
-    regex = re.compile(pattern, re.IGNORECASE)
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return {"n": 0, "matches": [], "cursor": {"done": True}, "error": f"invalid regex: {e}"}
     strings = _get_strings_cache()
 
     skipped = 0

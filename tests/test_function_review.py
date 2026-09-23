@@ -58,6 +58,16 @@ def test_parse_and_select_local_renames():
     assert selected == [{"old": "a1", "new": "argc"}]
 
 
+def test_mutation_operations_reject_empty_address():
+    import pytest
+
+    from ida_pro_mcp.vnext.contracts import ErrorCode, VNextError
+
+    with pytest.raises(VNextError) as exc_info:
+        build_mutation_operations(addr="")
+    assert exc_info.value.code is ErrorCode.INVALID_OPERATION
+
+
 def test_mutation_operations_skip_unchanged_fields():
     empty = build_mutation_operations(
         addr="0x123e",
@@ -68,6 +78,18 @@ def test_mutation_operations_skip_unchanged_fields():
         local_renames=[{"old": "v3", "new": "v3"}],
     )
     assert empty == []
+
+
+def test_mutation_operations_empty_comment_clears():
+    ops = build_mutation_operations(
+        addr="0x123e",
+        current_name="main",
+        new_name="main",
+        comment="",
+        current_comment="stale",
+        local_renames=[],
+    )
+    assert ops == [{"kind": "comment", "addr": "0x123e", "comment": ""}]
 
     ops = build_mutation_operations(
         addr="0x123e",

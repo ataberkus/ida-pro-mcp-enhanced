@@ -29,7 +29,7 @@ CRACKME_DSO_HANDLE = "0x4008"
 
 
 def _plain_hex_bytes(text: str) -> str:
-    return text.replace("0x", "").replace(" ", "").lower()
+    return "".join(part.zfill(2) for part in text.replace("0x", "").split()).lower()
 
 
 @test()
@@ -159,7 +159,44 @@ def test_patch_invalid_address():
     assert_is_list(result, min_length=1)
     entry = result[0]
     assert entry["addr"] == get_unmapped_address()
-    assert_error(entry, contains="Address not mapped")
+    assert_error(entry, contains="Address range is not mapped")
+
+
+@test()
+def test_patch_straddling_segment_end_is_rejected():
+    """A 16-byte patch starting 8 bytes before a segment end fails without writing."""
+    import idautils
+
+    from .. import compat
+
+    target = None
+    for seg_ea in idautils.Segments():
+        info = compat.get_segment_info(seg_ea)
+        if info is None or info.end_ea - info.start_ea < 16:
+            continue
+        # Need a real gap after this segment, otherwise the range is mapped.
+        if compat.get_segment_info(info.end_ea) is None:
+            target = info
+            break
+    if target is None:
+        skip_test("no segment with a trailing gap")
+    addr = target.end_ea - 8
+    before = get_bytes({"addr": hex(addr), "size": 8})[0]
+    assert_ok(before, "data")
+    result = patch({"addr": hex(addr), "data": "90 " * 16})[0]
+    assert_error(result, contains="Address range is not mapped")
+    after = get_bytes({"addr": hex(addr), "size": 8})[0]
+    assert after["data"] == before["data"]
+
+
+@test()
+def test_get_bytes_rejects_oversized_read():
+    """get_bytes with a huge size errors with the read limit."""
+    seg = get_first_segment()
+    if not seg:
+        skip_test("binary has no segments")
+    result = get_bytes({"addr": seg[0], "size": 10**9})[0]
+    assert_error(result, contains="65536")
 
 
 @test()
@@ -239,7 +276,7 @@ def test_put_int_invalid_address():
     """put_int rejects writes to unmapped addresses."""
     result = put_int({"addr": get_unmapped_address(), "ty": "u32", "value": "1"})[0]
     assert result["ok"] is False
-    assert_error(result, contains="Address not mapped")
+    assert_error(result, contains="Address range is not mapped")
 
 
 @test()

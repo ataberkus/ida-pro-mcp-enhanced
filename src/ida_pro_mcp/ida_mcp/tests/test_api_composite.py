@@ -447,38 +447,40 @@ def test_trace_data_flow_crackme_format_string():
 
 @test(binary="crackme03.elf")
 def test_diff_rename_func_round_trip():
-    """diff_before_after rename_func changes decompilation and reverts cleanly."""
+    """diff_before_after rename_func previews the change and leaves the DB unchanged."""
+    import idaapi
+
     tmp_name = "dba_test_renamed_pw"
-    try:
-        result = diff_before_after("check_pw", "rename_func", {"name": tmp_name})
-        assert "error" not in result, f"unexpected error: {result.get('error')}"
-        assert_has_keys(result, "before", "after", "action_applied", "changes_detected")
-        assert result["changes_detected"], "Rename should change decompilation output"
-        assert tmp_name in result["after"], (
-            f"Expected {tmp_name!r} in after decompilation, got: {result['after'][:200]!r}"
-        )
-        assert "check_pw" in result["before"], (
-            f"Expected 'check_pw' in before decompilation, got: {result['before'][:200]!r}"
-        )
-    finally:
-        diff_before_after(tmp_name, "rename_func", {"name": "check_pw"})
+    result = diff_before_after("check_pw", "rename_func", {"name": tmp_name})
+    assert "error" not in result, f"unexpected error: {result.get('error')}"
+    assert_has_keys(result, "before", "after", "action_applied", "changes_detected", "restored")
+    assert result["changes_detected"], "Rename should change decompilation output"
+    assert result["restored"] is True
+    assert tmp_name in result["after"], (
+        f"Expected {tmp_name!r} in after decompilation, got: {result['after'][:200]!r}"
+    )
+    assert "check_pw" in result["before"], (
+        f"Expected 'check_pw' in before decompilation, got: {result['before'][:200]!r}"
+    )
+    ea = idaapi.get_name_ea(idaapi.BADADDR, "check_pw")
+    assert ea != idaapi.BADADDR, "check_pw name must survive the preview"
+    assert idaapi.get_name_ea(idaapi.BADADDR, tmp_name) == idaapi.BADADDR
 
 
 @test(binary="crackme03.elf")
 def test_diff_set_comment():
-    """diff_before_after set_comment adds a comment to the decompilation."""
+    """diff_before_after set_comment previews the comment and restores the original."""
     import idaapi
 
     comment_text = "dba_tmp_comment_for_test"
-    try:
-        result = diff_before_after("check_pw", "set_comment", {"comment": comment_text})
-        assert "error" not in result, f"unexpected error: {result.get('error')}"
-        assert_has_keys(result, "before", "after", "action_applied")
-        assert comment_text in result["action_applied"]
-    finally:
-        ea = idaapi.get_name_ea(idaapi.BADADDR, "check_pw")
-        if ea != idaapi.BADADDR:
-            idaapi.set_cmt(ea, "", False)
+    ea = idaapi.get_name_ea(idaapi.BADADDR, "check_pw")
+    before_cmt = idaapi.get_cmt(ea, False) if ea != idaapi.BADADDR else ""
+    result = diff_before_after("check_pw", "set_comment", {"comment": comment_text})
+    assert "error" not in result, f"unexpected error: {result.get('error')}"
+    assert_has_keys(result, "before", "after", "action_applied", "restored")
+    assert comment_text in result["action_applied"]
+    assert result["restored"] is True
+    assert idaapi.get_cmt(ea, False) == before_cmt
 
 
 @test(binary="crackme03.elf")
@@ -489,7 +491,8 @@ def test_diff_set_type():
         {"type": "__int64 __fastcall check_pw(__int64 a1, __int64 a2, __int64 a3)"},
     )
     assert "error" not in result, f"unexpected error: {result.get('error')}"
-    assert_has_keys(result, "before", "after", "action_applied", "changes_detected")
+    assert_has_keys(result, "before", "after", "action_applied", "changes_detected", "restored")
+    assert result["restored"] is True
 
 
 @test()

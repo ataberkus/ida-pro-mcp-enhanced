@@ -133,13 +133,6 @@ def _score_function_candidate(candidate: dict[str, Any], goal: str) -> tuple[int
         score += 3
         reasons.append("unnamed function")
 
-    weights = GOAL_CATEGORY_WEIGHTS.get(goal, GOAL_CATEGORY_WEIGHTS["general"])
-    for category in candidate.get("import_categories") or []:
-        weight = weights.get(str(category), 0)
-        if weight:
-            score += weight
-            reasons.append(f"related to {category} imports")
-
     constants = candidate.get("constants") or []
     if constants and goal == "crackme":
         score += min(len(constants) * 4, 12)
@@ -446,7 +439,11 @@ def investigate_binary(
         "warnings": warnings,
         "survey": {
             "metadata": metadata,
-            "statistics": _build_statistics(all_func_eas, len(strings), len(segments)),
+            "statistics": {
+                **_build_statistics(func_eas, len(strings), len(segments)),
+                "total_functions": len(all_func_eas),
+                "functions_scored": len(func_eas),
+            },
             "entrypoints": _build_entrypoints(),
             "call_graph_summary": _build_call_graph_summary(func_eas),
         },

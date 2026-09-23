@@ -43,20 +43,23 @@ class WorkerLifecycle:
         self._on_shutdown: Callable[[str], None] | None = None
 
     def start(self, on_shutdown: Callable[[str], None]) -> None:
-        if self._thread is not None:
-            return
-        self._on_shutdown = on_shutdown
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="idalib-watchdog"
-        )
-        self._thread.start()
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._on_shutdown = on_shutdown
+            self._thread = threading.Thread(
+                target=self._run, daemon=True, name="idalib-watchdog"
+            )
+            self._thread.start()
 
-    def stop(self) -> None:
-        self._stop_event.set()
-        thread = self._thread
-        self._thread = None
+    def stop(self, timeout: float | None = None) -> None:
+        with self._lock:
+            thread = self._thread
+            self._thread = None
+            self._stop_event.set()
         if thread is not None:
-            thread.join(timeout=5.0)
+            thread.join(timeout=timeout if timeout is not None else max(5.0, self.poll_interval_sec + 2.0))
 
     def touch(self) -> None:
         with self._lock:

@@ -28,6 +28,7 @@ from ..api_resources import (
 )
 from ..api_modify import rename
 from ..api_stack import stack_frame
+from ..sync import IDAError
 
 
 MAIN = "0x1013ef0"
@@ -43,7 +44,7 @@ TYPED_FIXTURE_LOCAL_NAME = "rhs_handle"
 
 
 def _plain_hex_bytes(text: str) -> str:
-    return text.replace("0x", "").replace(" ", "").lower()
+    return "".join(part.zfill(2) for part in text.replace("0x", "").split()).lower()
 
 
 @test(binary="typed_fixture.elf")
@@ -249,12 +250,14 @@ def test_typed_fixture_import_export_resource_views():
     exp = export_name_resource("main")
     assert exp["addr"] == MAIN
 
-    imp = import_name_resource("printf")
-    if imp.get("error"):
+    try:
+        imp = import_name_resource("printf")
+    except IDAError:
         # Some IDA builds decorate import names differently.
-        imp = import_name_resource("printf@GLIBC_2.2.5")
-    if imp.get("error"):
-        skip_test("printf import name decoration differs on this IDA build")
+        try:
+            imp = import_name_resource("printf@GLIBC_2.2.5")
+        except IDAError:
+            skip_test("printf import name decoration differs on this IDA build")
     assert "printf" in imp["name"]
 
 

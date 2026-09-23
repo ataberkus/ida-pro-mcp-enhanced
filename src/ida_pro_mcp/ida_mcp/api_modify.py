@@ -147,10 +147,6 @@ def set_comments(items: list[CommentOp] | CommentOp):
                 continue
             nearest_ea = eamap[ea][0].ea
 
-            if cfunc.has_orphan_cmts():
-                cfunc.del_orphan_cmts()
-                cfunc.save_user_cmts()
-
             tl = idaapi.treeloc_t()
             tl.ea = nearest_ea
             for itp in range(idaapi.ITP_SEMI, idaapi.ITP_COLON):
@@ -260,6 +256,8 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
     if isinstance(items, dict):
         items = [items]
 
+    from .api_memory import _require_mapped_range
+
     results = []
     for item in items:
         addr_str = item.get("addr", "")
@@ -267,27 +265,28 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
 
         try:
             ea = parse_address(addr_str)
+            if not str(instructions).strip():
+                results.append({"addr": addr_str, "ok": False, "error": "Empty assembly"})
+                continue
             statements = [part.strip() for part in instructions.split(";") if part.strip()]
-            assembled: list[tuple[int, bytes]] = []
-            cursor = ea
+            assembled = bytearray()
             assemble_error = None
-            for assemble in statements:
+            for line_index, assemble in enumerate(statements):
                 try:
-                    check_assemble, bytes_to_patch = idautils.Assemble(cursor, assemble)
+                    check_assemble, bytes_to_patch = idautils.Assemble(ea + len(assembled), assemble)
                     if not check_assemble:
-                        assemble_error = f"Failed to assemble: {assemble}"
+                        assemble_error = f"Failed to assemble line {line_index} at {hex(ea)}: {assemble}"
                         break
-                    assembled.append((cursor, bytes_to_patch))
-                    cursor += len(bytes_to_patch)
+                    assembled += bytes_to_patch
                 except Exception as e:
-                    assemble_error = f"Failed at {hex(cursor)}: {e}"
+                    assemble_error = f"Failed at line {line_index} ({hex(ea)}): {e}"
                     break
             if assemble_error:
                 results.append({"addr": addr_str, "ok": False, "error": assemble_error})
-            else:
-                for patch_ea, data in assembled:
-                    ida_bytes.patch_bytes(patch_ea, data)
-                results.append({"addr": addr_str, "ok": True})
+                continue
+            _require_mapped_range(ea, len(assembled), hex(ea))
+            ida_bytes.patch_bytes(ea, bytes(assembled))
+            results.append({"addr": addr_str, "ok": True})
         except Exception as e:
             results.append({"addr": addr_str, "error": str(e)})
 
@@ -298,7 +297,11 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
 @idasync
 @unsafe
 def rename(batch: RenameBatch | dict) -> dict:
-    """Batch-rename funcs/globals/locals/stack vars with dry-run options."""
+    """Batch-rename funcs/globals/locals/stack vars with dry-run options.
+
+    Successful first-time function renames are also linked under the /vibe/
+    function-tree folder (dry_run links nothing and reports dir: null).
+    """
 
     if not isinstance(batch, dict):
         return {"error": "batch must be a dict"}
@@ -360,7 +363,7 @@ def rename(batch: RenameBatch | dict) -> dict:
 
     def _place_func_in_vibe_dir(ea: int) -> tuple[bool, str | None]:
         if dry_run:
-            return True, None
+            return False, None
 
         tree = ida_dirtree.get_std_dirtree(ida_dirtree.DIRTREE_FUNCS)
         if tree is None:
@@ -446,7 +449,7 @@ def rename(batch: RenameBatch | dict) -> dict:
                 success, error = _set_name_checked(func.start_ea, str(new_name))
 
                 placed, place_error = None, None
-                if success and not had_user_name:
+                if success and not dry_run and not had_user_name:
                     placed, place_error = _place_func_in_vibe_dir(func.start_ea)
                 if success and not dry_run:
                     refresh_decompiler_ctext(func.start_ea)
@@ -1100,6 +1103,22 @@ def make_data(
         decl = type_decl if type_decl.endswith(";") else type_decl + ";"
 
         try:
+            tif = ida_typeinf.tinfo_t()
+            parsed = ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL)
+            badsize = getattr(idaapi, "BADSIZE", idaapi.BADADDR)
+            size = tif.get_size() if parsed is not None else 0
+            if parsed is None or size in (0, badsize):
+                results.append(
+                    {
+                        "addr": addr_str,
+                        "ok": False,
+                        "error": f"Could not parse declaration: {decl!r}",
+                    }
+                )
+                continue
+
+            if delete_existing:
+                ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, size)
             apply_ok = idc.SetType(ea, decl)
             if not apply_ok:
                 results.append(
@@ -1110,26 +1129,6 @@ def make_data(
                     }
                 )
                 continue
-
-            tif = ida_typeinf.tinfo_t()
-            try:
-                ok_t = ida_typeinf.guess_tinfo(tif, ea)
-            except Exception:
-                ok_t = False
-            size = tif.get_size() if ok_t else 0
-
-            if delete_existing and size > 0:
-                ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, size)
-                apply_ok = idc.SetType(ea, decl)
-                if not apply_ok:
-                    results.append(
-                        {
-                            "addr": addr_str,
-                            "ok": False,
-                            "error": f"SetType failed after deleting existing items: {decl!r}",
-                        }
-                    )
-                    continue
 
             if name:
                 ida_name.set_name(ea, name, ida_name.SN_NOCHECK | ida_name.SN_FORCE)

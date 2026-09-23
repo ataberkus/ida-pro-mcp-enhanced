@@ -311,6 +311,15 @@ def test_xrefs_to_field_nonexistent_struct():
 
 
 @test()
+def test_xrefs_to_field_limit_and_more_flag():
+    """xrefs_to_field honors limit and always reports more."""
+    result = xrefs_to_field({"struct": "NonExistentStruct", "field": "x"}, limit=1)
+    assert_is_list(result, min_length=1)
+    assert result[0]["more"] is False
+    assert len(result[0]["xrefs"]) <= 1
+
+
+@test()
 def test_xrefs_to_field_batch():
     """xrefs_to_field accepts batch input and returns one result per query."""
     result = xrefs_to_field(
@@ -320,6 +329,36 @@ def test_xrefs_to_field_batch():
         ]
     )
     assert_is_list(result, min_length=2)
+
+
+@test(binary="crackme03.elf")
+def test_callees_interior_matches_start():
+    """callees at main+5 equals callees at main (whole-function scan)."""
+    import idaapi
+    import idc
+
+    interior = idc.next_head(int(CRACKME_MAIN, 16), idaapi.BADADDR)
+    at_start = {c["addr"] for c in callees(CRACKME_MAIN)[0]["callees"] or []}
+    at_interior = {c["addr"] for c in callees(hex(interior))[0]["callees"] or []}
+    assert at_start == at_interior
+
+
+@test(binary="crackme03.elf")
+def test_disasm_zero_max_means_default_cap():
+    """disasm(max_instructions=0) returns at most 5000 instructions."""
+    result = disasm(CRACKME_MAIN, max_instructions=0)
+    assert_ok(result, "asm")
+    assert len(result["asm"]["lines"]) <= 5000
+
+
+@test(binary="crackme03.elf")
+def test_callgraph_depth_clamped_to_20():
+    """callgraph(max_depth=100000) clamps depth to 20."""
+    result = callgraph(CRACKME_MAIN, max_depth=100000)
+    assert_is_list(result, min_length=1)
+    entry = result[0]
+    depths = [node.get("depth", 0) for node in entry.get("nodes", [])]
+    assert depths and max(depths) <= 20
 
 
 @test(binary="crackme03.elf")

@@ -1,10 +1,12 @@
 import fnmatch
+import hashlib
 import json
 import os
 import re
 import struct
 import sys
 import tempfile
+import zlib
 from typing import (
     Annotated,
     Any,
@@ -517,6 +519,8 @@ class StructureMember(TypedDict):
     offset: str
     size: str
     type: str
+    bit_offset: NotRequired[int]
+    bit_size: NotRequired[int]
 
 
 class StructureDefinition(TypedDict):
@@ -533,6 +537,7 @@ class RegisterValue(TypedDict):
 class ThreadRegisters(TypedDict):
     thread_id: int
     registers: list[RegisterValue]
+    unknown: NotRequired[list[str]]
 
 
 class Breakpoint(TypedDict):
@@ -606,7 +611,13 @@ def get_image_size() -> int:
 def parse_address(addr: str | int) -> int:
     if addr is None or (isinstance(addr, str) and not addr.strip()):
         raise IDAError("Failed to parse address: empty address")
+    if isinstance(addr, bool):
+        raise IDAError("Failed to parse address: invalid bool address")
     if isinstance(addr, int):
+        if addr < 0:
+            raise IDAError(f"Failed to parse address: negative address {addr!r}")
+        if addr > 0xFFFFFFFFFFFFFFFF:
+            raise IDAError(f"Failed to parse address: out of range {addr!r}")
         return addr
     try:
         return int(addr, 0)
@@ -648,19 +659,7 @@ def normalize_dict_list(
     if isinstance(value, dict):
         return [value]
     elif isinstance(value, list):
-        if not value:
-            return [{}]
-        # Check if list[str] or list[dict]
-        if all(isinstance(item, dict) for item in value):
-            return value
-        elif all(isinstance(item, str) for item in value):
-            # list[str] → map with parser
-            if string_parser:
-                return [string_parser(s.strip()) for s in value if s.strip()]
-            return [{}]
-        else:
-            # Mixed types - filter dicts only
-            return [item for item in value if isinstance(item, dict)] or [{}]
+        return _normalize_parsed_list(value, string_parser)
     elif isinstance(value, str):
         # Try JSON parse first
         try:
@@ -668,7 +667,7 @@ def normalize_dict_list(
             if isinstance(parsed, dict):
                 return [parsed]
             elif isinstance(parsed, list):
-                return parsed
+                return _normalize_parsed_list(parsed, string_parser)
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -685,14 +684,68 @@ def normalize_dict_list(
         return [{}]
 
 
-def looks_like_address(s: str) -> bool:
-    """Check if string looks like an address (0x prefix or all hex chars)"""
+def _normalize_parsed_list(value: list, string_parser=None) -> list[dict]:
+    if not value:
+        return [{}]
+    if all(isinstance(item, dict) for item in value):
+        return value
+    if all(isinstance(item, str) for item in value):
+        if string_parser:
+            return [string_parser(s.strip()) for s in value if s.strip()]
+        return []
+    return [item for item in value if isinstance(item, dict)] or [{}]
+
+
+def clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    try:
+        i = int(value)  # type: ignore[arg-type]
+    except Exception:
+        i = default
+    if i < minimum:
+        return minimum
+    if i > maximum:
+        return maximum
+    return i
+
+
+def resolve_address_or_name(addr: str | int) -> int:
+    """Resolve an int, hex string, or IDA symbol name to an ea."""
+    import idaapi
+
+    if isinstance(addr, int) and not isinstance(addr, bool):
+        return parse_address(addr)
+    s = str(addr)
     if s.startswith("0x") or s.startswith("0X"):
-        return True
-    # All hex chars and at least 4 chars → likely address
-    if len(s) >= 4 and all(c in "0123456789abcdefABCDEF" for c in s):
-        return True
-    return False
+        return parse_address(s)
+    ea = idaapi.get_name_ea(idaapi.BADADDR, s)
+    if ea != idaapi.BADADDR:
+        return int(ea)
+    return parse_address(s)
+
+
+def hash_input_file(path: str, *, chunk_size: int = 1 << 20) -> dict:
+    """Hash a file in chunks. All values are "unavailable" on OSError."""
+    try:
+        size = os.path.getsize(path)
+        md5 = hashlib.md5()
+        sha256 = hashlib.sha256()
+        crc = 0
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                md5.update(chunk)
+                sha256.update(chunk)
+                crc = zlib.crc32(chunk, crc)
+        return {
+            "md5": md5.hexdigest(),
+            "sha256": sha256.hexdigest(),
+            "crc32": hex(crc & 0xFFFFFFFF),
+            "filesize": size,
+        }
+    except OSError:
+        return {"md5": "unavailable", "sha256": "unavailable", "crc32": "unavailable", "filesize": "unavailable"}
 
 
 @overload
@@ -862,8 +915,12 @@ def get_type_by_name(type_name: str) -> ida_typeinf.tinfo_t:
 
 
 def paginate(data: list[T], offset: int, count: int) -> Page[T]:
+    offset = clamp_int(offset, 0, 0, 2_000_000_000)
+    count = clamp_int(count, 0, 0, 5000)
     if count == 0:
         count = len(data)
+    if offset >= len(data):
+        return {"data": [], "next_offset": None}
     next_offset = offset + count
     if next_offset >= len(data):
         next_offset = None
@@ -1300,6 +1357,7 @@ def get_callees(addr: str) -> list[dict]:
     func = compat.get_func(func_start)
     if not func:
         return []
+    func_start = int(func.start_ea)
     func_end = compat.get_func_end_ea(func)
     callees: list[dict[str, str]] = []
     current_ea = func_start

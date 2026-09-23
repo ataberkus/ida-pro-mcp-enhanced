@@ -97,6 +97,8 @@ def _tui_loop(read_key, render, on_key) -> bool:
 
 
 def interactive_choose(items: list[str], title: str, default: int = 0) -> str | None:
+    if not items:
+        return None
     read_key = _make_read_key()
     if read_key is None:
         return None
@@ -134,6 +136,8 @@ def interactive_choose(items: list[str], title: str, default: int = 0) -> str | 
 
 
 def interactive_select(items: list[tuple[str, bool]], title: str) -> list[str] | None:
+    if not items:
+        return None
     read_key = _make_read_key()
     if read_key is None:
         return None

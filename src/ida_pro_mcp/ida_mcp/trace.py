@@ -14,6 +14,7 @@ Use the `ida-mcp-trace-dump` script to export an IDB's trace as JSONL.
 import atexit
 import gzip
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timezone
@@ -45,6 +46,31 @@ _META_TOTAL_RECORDS = 3
 
 _DEFAULT_BATCH_RECORDS = 256
 _DEFAULT_BATCH_BYTES = 64 * 1024
+
+
+logger = logging.getLogger(__name__)
+
+_TRACE_STRUCTURED_CAP_BYTES = 4096
+_MAX_PENDING_RECORDS = 2048
+_MAX_PENDING_BYTES = 512 * 1024
+
+
+def _trim() -> None:
+    with _state_lock:
+        backend = _state.get("idb_backend")
+    if backend is None:
+        return
+    with backend._lock:
+        dropped = 0
+        while (
+            len(backend._buffer) > _MAX_PENDING_RECORDS
+            or backend._buffered_bytes > _MAX_PENDING_BYTES
+        ) and backend._buffer:
+            line = backend._buffer.pop(0)
+            backend._buffered_bytes -= len(line) + 1
+            dropped += 1
+    if dropped:
+        logger.debug("ida-mcp trace: trimmed %d pending records", dropped)
 
 
 _state_lock = threading.Lock()
@@ -115,6 +141,7 @@ class NetnodeBackend:
                 or self._buffered_bytes >= self.batch_bytes
             ):
                 flush_now = True
+        _trim()
         if flush_now:
             self.flush()
 
@@ -130,13 +157,15 @@ class NetnodeBackend:
             compressed = gzip.compress(payload, mtime=0)
             try:
                 _netnode_flush_segment(compressed, len(to_flush))
-            except Exception:
+            except Exception as exc:
+                logger.debug("ida-mcp trace: flush: %r", exc, exc_info=True)
                 # Re-prepend the failed batch so retries keep wall-clock order.
                 with self._lock:
                     self._buffer[:0] = to_flush
                     self._buffered_bytes = sum(
                         len(line) + 1 for line in self._buffer
                     )
+                _trim()
                 return
 
     def close(self) -> None:
@@ -182,8 +211,8 @@ def _install_idb_hook() -> None:
             if b is not None:
                 try:
                     b.flush()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("ida-mcp trace: closebase: %r", exc, exc_info=True)
             return 0
 
     hook = _TraceFlushHook()
@@ -221,13 +250,13 @@ def shutdown() -> None:
     if hook is not None:
         try:
             hook.unhook()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("ida-mcp trace: shutdown unhook: %r", exc, exc_info=True)
     if idb_b is not None:
         try:
             idb_b.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("ida-mcp trace: shutdown close: %r", exc, exc_info=True)
 
 
 def iter_idb_records() -> Iterator[dict]:
@@ -254,8 +283,8 @@ def _dispatch(record: dict) -> None:
     if idb_b is not None:
         try:
             idb_b.append(record)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("ida-mcp trace: dispatch: %r", exc, exc_info=True)
 
 
 def install_tracer() -> None:
@@ -275,6 +304,7 @@ def install_tracer() -> None:
         try:
             response = original(name, arguments, _meta)
         except Exception as e:
+            logger.debug("ida-mcp trace: traced: %r", e, exc_info=True)
             record["duration_ms"] = round((time.monotonic() - start) * 1000, 2)
             record["error"] = f"{type(e).__name__}: {e}"
             _dispatch(record)
@@ -282,7 +312,20 @@ def install_tracer() -> None:
 
         record["duration_ms"] = round((time.monotonic() - start) * 1000, 2)
         record["isError"] = bool(response.get("isError"))
-        record["structuredContent"] = response.get("structuredContent")
+        try:
+            structured_json = json.dumps(response.get("structuredContent"), default=str)
+        except Exception as exc:
+            logger.debug("ida-mcp trace: dumps: %r", exc, exc_info=True)
+            structured_json = ""
+        if len(structured_json) > _TRACE_STRUCTURED_CAP_BYTES:
+            record["structuredContent"] = {
+                "__truncated__": True,
+                "preview_json": structured_json[:_TRACE_STRUCTURED_CAP_BYTES],
+                "full_chars": len(structured_json),
+            }
+            record["truncated"] = True
+        else:
+            record["structuredContent"] = response.get("structuredContent")
 
         meta = (response.get("_meta") or {}).get("ida_mcp") or {}
         if meta.get("output_truncated"):

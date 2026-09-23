@@ -57,9 +57,12 @@ Stable failures include `PROFILE_DENIED`, `AUTH_REQUIRED`, `NOT_SUPPORTED`,
 `mutation_preview` validates a complete discriminated operation batch and
 records required scopes, affected arguments, revision, expiry, and estimated
 checkpoint size without changing the IDB. `mutation_commit` accepts only that
-preview identifier, rechecks database/revision/scopes, creates an external
-recovery IDB in the platform cache, and applies operations through the existing
-main-thread-safe IDA functions. IDB hooks cover names, comments, bookmarks,
+preview identifier, rechecks database/revision/scopes, writes an external
+recovery IDB to the platform cache only when the dashboard Recovery-checkpoints
+option is enabled (off by default), and applies operations through the existing
+main-thread-safe IDA functions. When checkpoints are disabled the receipt
+checkpoint is null and rollback relies on native undo; otherwise it raises
+REOPEN_REQUIRED. IDB hooks cover names, comments, bookmarks,
 bytes, code/data, functions, types, stack members, and segments so out-of-band
 edits invalidate previews and caches.
 
@@ -67,6 +70,10 @@ Rollback uses native undo when available. Otherwise the checkpoint is returned
 with `REOPEN_REQUIRED`; a live database is never described as atomically
 restored when it was not. Debug-memory writes require `debug` and
 `confirm_nonrollbackable=true`; Python requires its isolated scope.
+
+`idb_open`, `idb_list`, and `idb_close` are supervisor-only canonical tools.
+`entity_query`, `decompile`, `type_query`, `int_convert`, and `idb_save` are
+canonical legacy tools in both runtimes.
 
 ## Jobs, investigations, and analysis
 

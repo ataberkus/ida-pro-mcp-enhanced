@@ -1376,3 +1376,138 @@ def test_closed_gui_session_does_not_reappear_if_closed_during_headless_fallback
         assert sup.spawned[-1].process.returncode == 0
     finally:
         restore()
+
+
+def test_concurrent_open_same_path_single_idb_open(tmp_path):
+    import threading
+
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    restore = _patch_discovery(instances=[], probe=False)
+    try:
+        sup = _FakeSupervisor()
+        barrier = threading.Barrier(2)
+        results: list = []
+
+        def opener():
+            barrier.wait(timeout=5)
+            results.append(sup.open_session(str(sample)))
+
+        threads = [threading.Thread(target=opener) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert all(thread.is_alive() is False for thread in threads)
+        assert len(results) == 2
+        assert results[0].session_id == results[1].session_id
+        assert len(sup.opened) == 1
+        assert sup._pending_slots == 0
+        assert sup._pending_opens == {}
+    finally:
+        restore()
+
+
+def test_terminate_worker_never_raises():
+    import subprocess
+
+    class _HangingProcess(_FakeProcess):
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("cmd", timeout)
+
+        def kill(self):
+            raise OSError("nope")
+
+    sup = _FakeSupervisor()
+    worker = supmod.WorkerSession(
+        session_id="hang",
+        input_path="",
+        filename="",
+        process=_HangingProcess(),
+    )
+    sup._terminate_worker(worker)
+
+
+def test_worker_open_timeout_rejects_bogus_env(monkeypatch):
+    monkeypatch.setenv("IDA_MCP_OPEN_TIMEOUT", "bogus")
+    assert supmod._get_worker_open_timeout_sec() == 1800.0
+    monkeypatch.setenv("IDA_MCP_OPEN_TIMEOUT", "-5")
+    assert supmod._get_worker_open_timeout_sec() == 1800.0
+
+
+def test_open_session_rejects_evil_session_id(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    restore = _patch_discovery(instances=[], probe=False)
+    try:
+        sup = _FakeSupervisor()
+        with __import__("pytest").raises(ValueError):
+            sup.open_session(str(sample), session_id="../evil")
+        with __import__("pytest").raises(ValueError):
+            sup.open_session(str(sample), session_id="__worker_schema_x")
+    finally:
+        restore()
+
+
+def test_spawn_failure_reports_log_tail(monkeypatch, tmp_path):
+    worker = supmod.WorkerSession(
+        session_id="__worker_schema_x",
+        input_path="",
+        filename="",
+        host="127.0.0.1",
+        port=1,
+        process=_DeadProcess(),
+        log_path=str(tmp_path / "missing.log"),
+    )
+    (tmp_path / "worker.log").write_bytes(b"boom\n")
+    worker.log_path = str(tmp_path / "worker.log")
+    sup = _FakeSupervisor()
+    try:
+        sup._wait_worker_ready(worker, timeout=0.1)
+    except RuntimeError as e:
+        assert "boom" in str(e)
+        assert "log:" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_adoption_reads_token_sidecar(tmp_path, monkeypatch):
+    from pathlib import Path as _Path
+
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    instances_dir = tmp_path / "instances"
+    instances_dir.mkdir()
+    monkeypatch.setenv("IDA_MCP_INSTANCE_DIR", str(instances_dir))
+    import importlib.util as _ilu
+
+    spec = _ilu.spec_from_file_location(
+        "gui_discovery_sidecar",
+        _Path(__file__).resolve().parents[1] / "src" / "ida_pro_mcp" / "ida_mcp" / "discovery.py",
+    )
+    gui_discovery = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(gui_discovery)
+
+    gui_discovery.register_instance(
+        "127.0.0.1", 31415, 999999, "sample.bin", str(sample),
+        backend="worker", input_file="sample.bin", auth_token="sidecar-secret",
+    )
+    instance = {
+        "host": "127.0.0.1",
+        "port": 31415,
+        "pid": 999999,
+        "binary": "sample.bin",
+        "idb_path": str(sample),
+        "started_at": "now",
+        "backend": "worker",
+    }
+    restore = _patch_discovery(instances=[instance], probe=True)
+    try:
+        sup = _FakeSupervisor()
+        sup._session_is_reachable = lambda session: True
+        adopted = sup._adopt_worker_instance(str(sample), "adopted", instance)
+        assert adopted is not None
+        assert adopted.auth_token == "sidecar-secret"
+        assert (instances_dir / "instance_31415.token").exists()
+    finally:
+        restore()

@@ -201,6 +201,25 @@ def test_int_convert_non_ascii():
 
 
 @test()
+def test_int_convert_sign_bit_sizing():
+    """int_convert sizes 128 to 2 bytes (80 00)."""
+    result = int_convert({"text": "128"})
+    assert_is_list(result, min_length=1)
+    assert_ok(result[0], "result")
+    assert result[0]["result"]["bytes"] == "80 00"
+
+
+@test()
+def test_find_regex_invalid_pattern():
+    """find_regex reports invalid regex instead of raising."""
+    result = find_regex("[")
+    assert result["n"] == 0
+    assert result["matches"] == []
+    assert result["cursor"] == {"done": True}
+    assert str(result.get("error", "")).startswith("invalid regex:")
+
+
+@test()
 def test_list_funcs_returns_non_empty_page_of_functions():
     """list_funcs returns a non-empty page and every function round-trips through lookup_funcs."""
     result = list_funcs({"offset": 0, "count": 10})
@@ -325,7 +344,7 @@ def test_find_regex_matches_known_correct_strings():
 
 
 @test()
-def test_func_query():
+def test_func_query_api_core():
     """func_query returns richer function entries"""
     result = func_query({})
     assert_is_list(result, min_length=1)
@@ -336,7 +355,7 @@ def test_func_query():
 
 
 @test()
-def test_func_query_filters():
+def test_func_query_filters_api_core():
     """func_query supports size/type filters"""
     result = func_query({"min_size": 0, "max_size": 0xFFFFFFFF, "has_type": False})
     assert_is_list(result, min_length=1)

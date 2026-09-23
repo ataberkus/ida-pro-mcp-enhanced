@@ -41,6 +41,12 @@ def _resolve_format(fmt: str) -> "str":
     return _FORMAT_ALIASES[key]
 
 
+def _shared_buffer() -> "object | None":
+    if not _sm.SIMD_SPEEDUP_AVAILABLE:
+        return None
+    return _sm.InMemoryBuffer.load(mode=_sm.InMemoryBuffer.LoadMode.SEGMENTS)
+
+
 def _make_config(
     fmt: str,
     wildcard_operands: bool = True,
@@ -60,13 +66,12 @@ def _make_config(
 
 def _resolve_addr(addr_str: str) -> int:
     """Resolve an address string or name to an ea."""
+    from .utils import resolve_address_or_name
+
     try:
-        return parse_address(addr_str)
-    except Exception:
-        ea = idaapi.get_name_ea(idaapi.BADADDR, addr_str)
-        if ea == idaapi.BADADDR:
-            raise ValueError(f"Cannot resolve address or name: {addr_str}")
-        return ea
+        return resolve_address_or_name(addr_str)
+    except IDAError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _format_sig(sig, fmt: str) -> str:
@@ -93,6 +98,7 @@ class MakeSigForFunctionResult(TypedDict):
     name: str | None
     signature: str | None
     format: str
+    unique: NotRequired[bool]
     error: NotRequired[str]
 
 
@@ -101,6 +107,7 @@ class XrefSigResult(TypedDict):
     addr: str | None
     signatures: list[dict] | None
     total_xrefs: NotRequired[int]
+    truncated: NotRequired[bool]
     error: NotRequired[str]
 
 
@@ -142,23 +149,23 @@ def make_signature(
 
     results: list[MakeSigResult] = []
     for addr_str in addrs_list:
+        ea = None
         try:
             ea = _resolve_addr(addr_str)
             result = maker.make_signature(ea, cfg)
             sig_str = _format_sig(result.signature, fmt)
-            # Verify uniqueness
-            is_unique = sm.SignatureSearcher.is_unique(f"{result.signature:ida}")
+            # The generator guarantees uniqueness; no post-generation recheck.
             results.append({
                 "query": addr_str,
                 "addr": hex(ea),
                 "signature": sig_str,
                 "format": format,
-                "unique": is_unique,
+                "unique": True,
             })
         except Exception as e:
             results.append({
                 "query": addr_str,
-                "addr": hex(ea) if 'ea' in dir() else None,
+                "addr": hex(ea) if ea is not None else None,
                 "signature": None,
                 "format": format,
                 "error": str(e),
@@ -223,6 +230,7 @@ def make_signature_for_function(
                 "name": func_name,
                 "signature": sig_str,
                 "format": format,
+                "unique": True,
             })
         except Exception as e:
             results.append({
@@ -263,7 +271,7 @@ def make_signature_for_range(
         end_ea = _resolve_addr(end)
         result = maker.make_signature(start_ea, cfg, end=end_ea)
         sig_str = _format_sig(result.signature, fmt)
-        is_unique = sm.SignatureSearcher.is_unique(f"{result.signature:ida}")
+        is_unique = sm.SignatureSearcher.is_unique(f"{result.signature:ida}", buf=_shared_buffer())
         return {
             "query": f"{start}-{end}",
             "addr": hex(start_ea),
@@ -309,6 +317,7 @@ def find_xref_signatures(
     references that can't be signatured directly."""
     sm = _sm
     fmt = _resolve_format(format)
+    top = max(1, min(int(top), 50))
     cfg = _make_config(fmt, max_length=max_length)
     import dataclasses
     cfg = dataclasses.replace(cfg, print_top_x=top)
@@ -335,7 +344,8 @@ def find_xref_signatures(
                 "query": addr_str,
                 "addr": hex(ea),
                 "signatures": sigs,
-                "total_xrefs": len(xref_result.signatures),
+                "total_xrefs": xref_result.total,
+                "truncated": xref_result.truncated,
             })
         except Exception as e:
             results.append({

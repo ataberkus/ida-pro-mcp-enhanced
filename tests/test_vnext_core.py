@@ -126,8 +126,10 @@ def test_workspace_policy_rejects_escape(tmp_path: Path):
 
 
 def test_audit_redacts_secrets_and_large_payloads():
-    value = redact({"authorization": "Bearer secret", "code": "print('secret')", "safe": "ok"})
-    assert value == {"authorization": "<redacted>", "code": "<redacted>", "safe": "ok"}
+    value = redact({"authorization": "Bearer secret", "password": "x", "safe": "ok"})
+    assert value == {"authorization": "<redacted>", "password": "<redacted>", "safe": "ok"}
+    assert redact({"code": "NOT_SUPPORTED"}, tool="job_result") == {"code": "NOT_SUPPORTED"}
+    assert redact({"code": "print(1)"}, tool="python_execute") == {"code": "<redacted>"}
     log = AuditLog(capacity=2)
     log.append(tool="python_execute", arguments={"code": "secret"}, outcome="success")
     assert log.records()[0]["arguments"]["code"] == "<redacted>"
@@ -358,3 +360,92 @@ def test_investigation_exports_are_deterministic():
     assert "Unchecked copy" in manager.export(record.investigation_id, "markdown")
     assert '"version": "2.1.0"' in manager.export(record.investigation_id, "sarif")
     assert manager.export(record.investigation_id, "dot").startswith("digraph")
+
+
+def test_commit_begin_called_once_and_undo_on_partial_failure():
+    revisions = RevisionTracker()
+    manager = TransactionManager(revisions, ttl_seconds=30)
+    operations = [
+        MutationOperation("rename", {"items": [{"addr": "0x1"}]}, SafetyScope.ANNOTATE),
+        MutationOperation("rename", {"items": [{"addr": "0x2"}]}, SafetyScope.ANNOTATE),
+    ]
+    preview = manager.preview(
+        "db",
+        operations,
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        preview_operation=lambda op: {"kind": op.kind},
+    )
+    calls = {"begin": 0, "undo": 0, "applied": 0}
+
+    def begin():
+        calls["begin"] += 1
+        return True
+
+    def apply(operation):
+        calls["applied"] += 1
+        if calls["applied"] == 2:
+            raise RuntimeError("second op failed")
+
+    def undo():
+        calls["undo"] += 1
+        return True
+
+    with pytest.raises(VNextError):
+        manager.commit(
+            preview.transaction_id,
+            database="db",
+            enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+            checkpoint=lambda _tx: "checkpoint.i64",
+            apply_operation=apply,
+            undo=undo,
+            begin=begin,
+        )
+    assert calls["begin"] == 1
+    assert calls["undo"] == 1
+    receipt = manager._receipts[preview.transaction_id]
+    assert receipt.status == "failed_rolled_back"
+
+
+def test_rollback_without_checkpoint_names_disabled_checkpoints():
+    revisions = RevisionTracker()
+    manager = TransactionManager(revisions, ttl_seconds=30)
+    preview = manager.preview(
+        "db",
+        [MutationOperation("rename", {"items": []}, SafetyScope.ANNOTATE)],
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        preview_operation=lambda op: {"kind": op.kind},
+    )
+    manager.commit(
+        preview.transaction_id,
+        database="db",
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        checkpoint=lambda _tx: None,
+        apply_operation=lambda _op: None,
+    )
+    with pytest.raises(VNextError) as rollback:
+        manager.rollback(preview.transaction_id, rollback_undo=lambda: False)
+    assert rollback.value.code is ErrorCode.REOPEN_REQUIRED
+    assert "recovery checkpoints are disabled" in str(rollback.value)
+
+
+def test_tool_envelope_keeps_from_to_ints():
+    envelope = ToolEnvelope({"from": 0, "to": 100}).to_dict()
+    assert envelope["data"] == {"from": 0, "to": 100}
+
+
+def test_investigation_restore_skips_corrupt_record():
+    from ida_pro_mcp.vnext.investigations import InvestigationManager
+
+    manager = InvestigationManager()
+    good = {
+        "objective": "ok",
+        "database": "db",
+        "state": "running",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "findings": [{"finding_id": "f1", "title": "t", "description": "d"}],
+    }
+    manager._restore({"good": good, "bad": {"findings": [{"nope": 1}]}})
+    assert "good" in manager._records
+    assert "bad" not in manager._records
+    assert manager._records["good"].findings[0].finding_id == "f1"

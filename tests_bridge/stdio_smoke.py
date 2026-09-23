@@ -1,6 +1,6 @@
 """Smoke test: launch the bridge over stdio and drive it like an MCP client.
 
-Spawns `python server.py`, sends newline-delimited JSON-RPC, and verifies the
+Spawns `python bridge_server.py`, sends newline-delimited JSON-RPC, and verifies the
 bridge starts (no ENOENT / import errors) and answers tools/list using live
 discovery. Run while at least one IDA instance is up.
 

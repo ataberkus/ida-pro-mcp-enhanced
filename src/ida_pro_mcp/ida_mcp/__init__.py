@@ -59,8 +59,8 @@ from .rpc import (
 from .http import IdaMcpHttpRequestHandler
 from .api_core import init_caches
 
-# Tracing is always on: every tools/call is recorded into the IDB netnode.
-trace.configure_idb()
+# Tracing is enabled explicitly by the host (ida_mcp.py / idalib_server.py)
+# after the IDA database is ready; importing this package has no IDB side effects.
 
 __all__ = [
     # Infrastructure modules

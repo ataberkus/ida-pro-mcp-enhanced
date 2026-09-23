@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from typing import TypedDict
 
 
@@ -34,16 +35,24 @@ class InstanceInfo(TypedDict, total=False):
     binary: str
     idb_path: str
     started_at: str
-    backend: str  # "gui" or "worker"
+    backend: str
+    input_file: str
+
+
+INSTANCE_DIR_ENV = "IDA_MCP_INSTANCE_DIR"
 
 
 def _get_ida_user_dir() -> str:
     if sys.platform == "win32":
-        return os.path.join(os.environ["APPDATA"], "Hex-Rays", "IDA Pro")
+        appdata = os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return os.path.join(appdata, "Hex-Rays", "IDA Pro")
     return os.path.join(os.path.expanduser("~"), ".idapro")
 
 
 def get_instances_dir() -> str:
+    override = os.environ.get(INSTANCE_DIR_ENV)
+    if override:
+        return override
     return os.path.join(_get_ida_user_dir(), "mcp", "instances")
 
 
@@ -51,8 +60,12 @@ def _instance_file_path(port: int) -> str:
     return os.path.join(get_instances_dir(), f"instance_{port}.json")
 
 
+def _instance_token_path(port: int) -> str:
+    return os.path.join(get_instances_dir(), f"instance_{port}.token")
+
+
 def register_instance(
-    host: str, port: int, pid: int, binary: str, idb_path: str, backend: str = "gui"
+    host: str, port: int, pid: int, binary: str, idb_path: str, backend: str = "gui", *, input_file: str = "", auth_token: str | None = None
 ) -> str:
     """Write an instance registration file. Returns the file path."""
     info: InstanceInfo = {
@@ -63,9 +76,14 @@ def register_instance(
         "idb_path": idb_path,
         "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "backend": backend,
+        "input_file": input_file,
     }
     instances_dir = get_instances_dir()
     os.makedirs(instances_dir, exist_ok=True)
+    if auth_token is not None:
+        from ida_pro_mcp.vnext.auth import write_token_file
+
+        write_token_file(__import__("pathlib").Path(_instance_token_path(port)), auth_token)
     file_path = _instance_file_path(port)
     # Atomic write
     fd, tmp_path = tempfile.mkstemp(dir=instances_dir, prefix=".tmp_", suffix=".json")
@@ -85,6 +103,10 @@ def register_instance(
 def unregister_instance(port: int) -> bool:
     """Remove an instance registration file. Returns True if removed."""
     file_path = _instance_file_path(port)
+    try:
+        os.unlink(_instance_token_path(port))
+    except OSError:
+        pass
     try:
         os.unlink(file_path)
         return True
@@ -132,6 +154,17 @@ def discover_instances() -> list[InstanceInfo]:
     if not os.path.isdir(instances_dir):
         return []
 
+    def _drop_stale(file_path: str) -> None:
+        try:
+            os.unlink(file_path)
+        except OSError:
+            pass
+        try:
+            port = int(file_path.rsplit("_", 1)[1].split(".", 1)[0])
+            os.unlink(_instance_token_path(port))
+        except (OSError, ValueError, IndexError):
+            pass
+
     result: list[InstanceInfo] = []
     pattern = os.path.join(instances_dir, "instance_*.json")
     for file_path in glob.glob(pattern):
@@ -139,34 +172,22 @@ def discover_instances() -> list[InstanceInfo]:
             with open(file_path, "r", encoding="utf-8") as f:
                 info: InstanceInfo = json.load(f)
         except (json.JSONDecodeError, OSError):
-            try:
-                os.unlink(file_path)
-            except OSError:
-                pass
+            _drop_stale(file_path)
             continue
 
         if not all(k in info for k in ("host", "port", "pid")):
-            try:
-                os.unlink(file_path)
-            except OSError:
-                pass
+            _drop_stale(file_path)
             continue
 
         if not is_pid_alive(info["pid"]):
-            try:
-                os.unlink(file_path)
-            except OSError:
-                pass
+            _drop_stale(file_path)
             continue
 
         # Secondary check: verify the instance is actually listening.
         # Catches PID reuse (Windows can recycle PIDs quickly) and
         # cases where the process is alive but the server crashed.
         if not probe_instance(info["host"], info["port"], timeout=1.0):
-            try:
-                os.unlink(file_path)
-            except OSError:
-                pass
+            _drop_stale(file_path)
             continue
 
         result.append(info)

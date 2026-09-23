@@ -18,6 +18,7 @@ import os
 import re
 import signal
 import socket
+import threading
 import subprocess
 import sys
 import time
@@ -76,7 +77,32 @@ PARTIAL_DATABASE_EXTENSIONS = (".id0", ".id1", ".id2", ".nam", ".til")
 # no limit this silently wedges the worker process (and the blocking supervisor
 # RPC waiting on it) forever, with no progress feedback and no recovery.
 # Set IDA_MCP_OPEN_TIMEOUT=0 to wait indefinitely (previous behavior).
-WORKER_OPEN_TIMEOUT_SEC = float(os.environ.get("IDA_MCP_OPEN_TIMEOUT", "1800"))
+def _get_worker_open_timeout_sec() -> float:
+    raw = os.environ.get("IDA_MCP_OPEN_TIMEOUT", "1800")
+    try:
+        value = float(raw.strip() if isinstance(raw, str) else raw)
+    except (ValueError, TypeError, AttributeError):
+        logger.warning("Invalid IDA_MCP_OPEN_TIMEOUT=%r; using 1800.0", raw)
+        return 1800.0
+    if value != value or value == float("inf") or value < 0:
+        logger.warning("Invalid IDA_MCP_OPEN_TIMEOUT=%r; using 1800.0", raw)
+        return 1800.0
+    return value
+
+
+WORKER_OPEN_TIMEOUT_SEC = _get_worker_open_timeout_sec()
+
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def normalize_session_id(preferred: str | None) -> str:
+    """Validate a client session id or mint a random one."""
+    if preferred is None or preferred == "":
+        return uuid.uuid4().hex
+    candidate = preferred.strip()
+    if not _SESSION_ID_RE.match(candidate) or candidate.startswith("__worker_schema_"):
+        raise ValueError(f"Invalid session_id {preferred!r}: use 1-64 chars [A-Za-z0-9_-]")
+    return candidate
 
 
 def _import_zeromcp():
@@ -179,6 +205,7 @@ class WorkerSession:
     pid: int | None = None
     last_warmup: dict[str, Any] | None = None
     auth_token: str | None = field(default=None, repr=False)
+    log_path: str | None = None
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -192,6 +219,8 @@ class WorkerSession:
         }
 
     def to_list_dict(self, *, active: bool | None = None) -> IdalibSessionListInfo:
+        # Registered sessions (spawned or adopted) report adopted=True;
+        # list_sessions synthesizes adopted=False rows for discovered instances.
         return {
             **self.to_dict(),
             "is_active": self.is_alive() if active is None else active,
@@ -231,6 +260,8 @@ class IdalibSupervisor:
         self._resources_cache: dict[str, list[dict]] = {}
         self._lock = RLock()
         self._pending_worker_requests: dict[tuple[str | None, Any], WorkerSession] = {}
+        self._pending_opens: dict[str, threading.Event] = {}
+        self._pending_slots = 0
 
     # ------------------------------------------------------------------
     # Worker process lifecycle
@@ -241,9 +272,67 @@ class IdalibSupervisor:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
+    def _open_worker_log(self, port: int) -> tuple[Any, str]:
+        import tempfile
+        from typing import BinaryIO
+
+        directory = os.path.join(tempfile.gettempdir(), "ida-pro-mcp-workers")
+        os.makedirs(directory, exist_ok=True)
+        log_path = os.path.join(directory, f"worker-{port}.log")
+        handle = open(log_path, "wb")
+        return handle, log_path
+
+    @staticmethod
+    def _read_worker_log_tail(path: str | None, max_bytes: int = 8192, max_lines: int = 30) -> str:
+        if not path:
+            return "<log unavailable>"
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max_bytes))
+                data = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return "<log unavailable>"
+        lines = data.splitlines()
+        return "\n".join(lines[-max_lines:]) if lines else "<log empty>"
+
+    _PORT_IN_USE_MARKERS = ("Address already in use", "10048", "10013", "EADDRINUSE")
+
     def _spawn_worker(self) -> WorkerSession:
-        port = self._pick_port()
-        worker_token = create_token()
+        last_error: Exception | None = None
+        last_log: str | None = None
+        for _ in range(3):
+            port = self._pick_port()
+            worker: WorkerSession | None = None
+            started_at = time.monotonic()
+            try:
+                worker = self._spawn_worker_on_port(port, create_token())
+                last_log = worker.log_path
+                self._wait_worker_ready(worker)
+                return worker
+            except Exception as exc:
+                last_error = exc
+                if worker is not None:
+                    last_log = worker.log_path
+                tail = self._read_worker_log_tail(last_log)
+                port_busy = any(marker in tail for marker in self._PORT_IN_USE_MARKERS)
+                exited_fast = (
+                    worker is not None
+                    and worker.process is not None
+                    and worker.process.poll() is not None
+                    and time.monotonic() - started_at < 2.0
+                )
+                if worker is not None:
+                    self._terminate_worker(worker)
+                if not (port_busy or exited_fast):
+                    raise
+        assert last_error is not None
+        raise RuntimeError(
+            f"idalib worker did not become ready after 3 ports; last: {last_error}; log: {last_log}"
+        ) from last_error
+
+    def _spawn_worker_on_port(self, port: int, worker_token: str) -> WorkerSession:
         cmd = [
             sys.executable,
             "-m",
@@ -265,16 +354,20 @@ class IdalibSupervisor:
             start_new_session = True
         worker_environment = os.environ.copy()
         worker_environment["IDA_MCP_AUTH_TOKEN"] = worker_token
-        process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            start_new_session=start_new_session,
-            env=worker_environment,
-        )
-        worker = WorkerSession(
+        log_handle, log_path = self._open_worker_log(port)
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+                start_new_session=start_new_session,
+                env=worker_environment,
+            )
+        finally:
+            log_handle.close()
+        return WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
             input_path="",
             filename="",
@@ -285,21 +378,18 @@ class IdalibSupervisor:
             owned=True,
             pid=process.pid,
             auth_token=worker_token,
+            log_path=log_path,
         )
-        try:
-            self._wait_worker_ready(worker)
-        except Exception:
-            self._terminate_worker(worker)
-            raise
-        return worker
 
     def _wait_worker_ready(self, worker: WorkerSession, timeout: float = 120.0) -> None:
         deadline = time.monotonic() + timeout
         last_error: Exception | None = None
+        log_path = worker.log_path
         while time.monotonic() < deadline:
             if worker.process is not None and worker.process.poll() is not None:
+                tail = self._read_worker_log_tail(log_path)
                 raise RuntimeError(
-                    f"idalib worker exited early with code {worker.process.returncode}"
+                    f"idalib worker exited early with code {worker.process.returncode}; log: {log_path}\n{tail}"
                 )
             try:
                 self._worker_rpc(worker, {"jsonrpc": "2.0", "id": 1, "method": "ping"}, timeout=2.0)
@@ -307,7 +397,8 @@ class IdalibSupervisor:
             except Exception as e:
                 last_error = e
                 time.sleep(0.2)
-        raise TimeoutError(f"idalib worker did not become ready: {last_error}")
+        tail = self._read_worker_log_tail(log_path)
+        raise TimeoutError(f"idalib worker did not become ready: {last_error}; log: {log_path}\n{tail}")
 
     def _terminate_worker(self, worker: WorkerSession) -> None:
         if worker.backend != "worker" or not worker.owned:
@@ -317,10 +408,16 @@ class IdalibSupervisor:
             return
         try:
             proc.terminate()
-            proc.wait(timeout=10)
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    logger.debug("Worker kill failed", exc_info=True)
         except Exception:
-            proc.kill()
-            proc.wait(timeout=5)
+            logger.debug("Worker terminate failed", exc_info=True)
 
     @staticmethod
     def _partial_database_paths(input_path: str) -> tuple[Path, ...]:
@@ -364,7 +461,7 @@ class IdalibSupervisor:
             except OSError:
                 pass
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, save: bool = True) -> None:
         """Terminate supervisor-owned workers whose credentials are ephemeral."""
         with self._lock:
             schema = self._schema_worker
@@ -376,11 +473,24 @@ class IdalibSupervisor:
             self.sessions.clear()
             self.path_to_session.clear()
             self._schema_worker = None
-        if schema is not None:
-            self._terminate_worker(schema)
-        for session in owned:
-            if session is not schema:
-                self._terminate_worker(session)
+        if save:
+            for session in owned:
+                try:
+                    self.call_worker_tool(session, "idb_save", timeout=10)
+                except Exception:
+                    logger.debug("Shutdown idb_save failed", exc_info=True)
+        # Adopted (owned=False) sessions are never terminated.
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(self._terminate_worker, session) for session in owned]
+            if schema is not None and schema not in owned:
+                futures.append(pool.submit(self._terminate_worker, schema))
+            for future in futures:
+                try:
+                    future.result(timeout=15)
+                except Exception:
+                    logger.debug("Shutdown terminate failed", exc_info=True)
 
     def _schema_or_idle_worker(self) -> WorkerSession:
         with self._lock:
@@ -389,8 +499,17 @@ class IdalibSupervisor:
                     return worker
             if self._schema_worker is not None and self._schema_worker.is_alive():
                 return self._schema_worker
-            self._schema_worker = self._spawn_worker()
-            return self._schema_worker
+        extra = self._spawn_worker()
+        with self._lock:
+            for worker in self.sessions.values():
+                if worker.backend == "worker" and worker.is_alive():
+                    self._terminate_worker(extra)
+                    return worker
+            if self._schema_worker is not None and self._schema_worker.is_alive():
+                self._terminate_worker(extra)
+                return self._schema_worker
+            self._schema_worker = extra
+            return extra
 
     def _take_schema_worker_for_session(self) -> WorkerSession | None:
         if self._schema_worker is not None and self._schema_worker.is_alive():
@@ -411,24 +530,26 @@ class IdalibSupervisor:
             if stale is not None:
                 self._terminate_worker(stale)
 
-    def _allocate_worker_locked(self) -> WorkerSession:
-        worker = self._take_schema_worker_for_session()
-        if worker is not None:
-            return worker
-
-        self._prune_dead_worker_sessions_locked()
+    def _reserve_open_slot_locked(self) -> None:
+        """Reserve worker capacity without doing I/O. Caller must hold the lock."""
+        stale = [
+            session.session_id
+            for session in self.sessions.values()
+            if session.backend == "worker" and session.owned and not session.is_alive()
+        ]
+        for session_id in stale:
+            self._unregister_session_locked(session_id)
         owned_workers = sum(
             1
             for session in self.sessions.values()
             if session.backend == "worker" and session.owned and session.is_alive()
         )
-        if self.max_workers <= 0 or owned_workers < self.max_workers:
-            return self._spawn_worker()
-
-        raise RuntimeError(
-            f"Maximum idalib worker count reached ({self.max_workers}). "
-            "Wait for an existing worker to be released or increase --max-workers."
-        )
+        if self.max_workers > 0 and owned_workers + self._pending_slots >= self.max_workers:
+            raise RuntimeError(
+                f"Maximum idalib worker count reached ({self.max_workers}). "
+                "Wait for an existing worker to be released or increase --max-workers."
+            )
+        self._pending_slots += 1
 
     # ------------------------------------------------------------------
     # JSON-RPC forwarding
@@ -869,7 +990,16 @@ class IdalibSupervisor:
         self, resolved_path: str, session_id: str, instance: dict[str, Any]
     ) -> WorkerSession | None:
         """Register a session pointing at a persistent worker discovered via
-        the registry. Returns None if the worker is no longer reachable."""
+        the registry. Returns None if the worker is no longer reachable.
+
+        Adopted instances stay detached; lifetime is bounded by the worker
+        idle TTL, not the supervisor."""
+        try:
+            adopted_token = load_token_file(
+                Path(_discovery.get_instances_dir()) / f"instance_{instance.get('port')}.token"
+            )
+        except (OSError, UnicodeDecodeError, VNextError):
+            adopted_token = None
         worker_stub = WorkerSession(
             session_id=session_id,
             input_path=str(instance.get("idb_path") or resolved_path),
@@ -880,6 +1010,7 @@ class IdalibSupervisor:
             backend="worker",
             owned=False,
             pid=int(instance["pid"]) if instance.get("pid") is not None else None,
+            auth_token=adopted_token,
         )
         if not self._session_is_reachable(worker_stub):
             return None
@@ -948,8 +1079,11 @@ class IdalibSupervisor:
                 must_exist=True,
             )
         )
+        path_key = self._path_key(resolved)
+        # Phase (a): fast checks under the lock. No worker I/O happens here;
+        # spawning and the idb_open RPC run outside the lock in phase (b).
         with self._lock:
-            existing = self.path_to_session.get(self._path_key(resolved))
+            existing = self.path_to_session.get(path_key)
             if existing is not None:
                 session = self.sessions.get(existing)
                 if session is not None and self._session_is_reachable(session):
@@ -957,31 +1091,33 @@ class IdalibSupervisor:
                     return session
                 self._unregister_session_locked(existing)
 
-            if session_id is None:
-                session_id = str(uuid.uuid4())[:8]
-            elif session_id in self.sessions:
+            session_id = normalize_session_id(session_id)
+            if session_id in self.sessions:
                 raise ValueError(f"Session already exists: {session_id}")
 
+            pending = self._pending_opens.get(path_key)
+            if pending is None:
+                slot_reserved = True
+                try:
+                    self._reserve_open_slot_locked()
+                except Exception:
+                    raise
+                pending = threading.Event()
+                self._pending_opens[path_key] = pending
+            else:
+                slot_reserved = False
+
+            launch_gui = False
+            gui_session: WorkerSession | None = None
+            worker: WorkerSession | None = None
             if mode in ("prefer_gui", "force_gui"):
                 gui_instance = self._find_instance_for_path(resolved, backend="gui")
                 if gui_instance is not None:
-                    session = self._make_gui_session(resolved, session_id, gui_instance)
-                    self._register_session_locked(session, resolved)
-                    logger.info(
-                        "Using GUI IDA instance %s:%s for %s",
-                        session.host,
-                        session.port,
-                        resolved,
-                    )
-                    return session
-                if mode == "force_gui":
-                    # Drop the lock so the long-running subprocess launch + poll
-                    # doesn't block other supervisor operations.
-                    break_for_launch = True
-                else:
-                    break_for_launch = False
+                    gui_session = self._make_gui_session(resolved, session_id, gui_instance)
+                    self._register_session_locked(gui_session, resolved)
+                elif mode == "force_gui":
+                    launch_gui = True
             else:
-                break_for_launch = False
                 # Headless modes never look at GUI instances. Try to attach
                 # to a persistent idalib worker that already has this path
                 # open (orphan from a previous supervisor).
@@ -989,92 +1125,132 @@ class IdalibSupervisor:
                 if worker_instance is not None:
                     adopted = self._adopt_worker_instance(resolved, session_id, worker_instance)
                     if adopted is not None:
-                        return adopted
+                        gui_session = adopted
+            if gui_session is None and not launch_gui and slot_reserved:
+                worker = self._take_schema_worker_for_session()
+            preexisting_parts = self._existing_partial_database_parts(resolved)
 
-            if not break_for_launch:
-                worker = self._allocate_worker_locked()
+        if gui_session is not None:
+            self._finish_pending_open(path_key, slot_reserved)
+            if gui_session.backend == "gui":
+                logger.info(
+                    "Using GUI IDA instance %s:%s for %s",
+                    gui_session.host,
+                    gui_session.port,
+                    resolved,
+                )
+            return gui_session
 
-        if break_for_launch:
-            return self._launch_gui_and_adopt(resolved, session_id)
+        if launch_gui:
+            try:
+                return self._launch_gui_and_adopt(resolved, session_id)
+            finally:
+                self._finish_pending_open(path_key, slot_reserved)
 
-        open_timeout = (WORKER_OPEN_TIMEOUT_SEC or None) if run_auto_analysis else None
-        preexisting_parts = self._existing_partial_database_parts(resolved)
+        if worker is None and not slot_reserved and gui_session is None and not launch_gui:
+            # Another thread is opening this path; wait for it, then return
+            # whatever it registered.
+            pending.wait(timeout=(WORKER_OPEN_TIMEOUT_SEC or 120))
+            with self._lock:
+                winner_id = self.path_to_session.get(path_key)
+                winner = self.sessions.get(winner_id) if winner_id else None
+            if winner is not None:
+                return winner
+            raise RuntimeError("Concurrent open failed; retry")
+
+        # Phase (b): spawn (if needed) and open outside the lock.
         try:
-            opened = self.call_worker_tool(
-                worker,
-                "idb_open",
-                {
-                    "input_path": resolved,
-                    "run_auto_analysis": run_auto_analysis,
-                    "build_caches": build_caches,
-                    "init_hexrays": init_hexrays,
-                    "idle_ttl_sec": idle_ttl_sec,
-                    "preferred_session_id": session_id,
-                },
-                timeout=open_timeout,
+            if worker is None:
+                worker = self._spawn_worker()
+            open_timeout = (WORKER_OPEN_TIMEOUT_SEC or None) if run_auto_analysis else None
+            try:
+                opened = self.call_worker_tool(
+                    worker,
+                    "idb_open",
+                    {
+                        "input_path": resolved,
+                        "run_auto_analysis": run_auto_analysis,
+                        "build_caches": build_caches,
+                        "init_hexrays": init_hexrays,
+                        "idle_ttl_sec": idle_ttl_sec,
+                        "preferred_session_id": session_id,
+                    },
+                    timeout=open_timeout,
+                )
+                if isinstance(opened, dict) and opened.get("error"):
+                    raise RuntimeError(str(opened["error"]))
+            except TimeoutError:
+                self._terminate_worker(worker)
+                self._cleanup_partial_database(resolved, preserve=preexisting_parts)
+                raise RuntimeError(
+                    f"idalib worker timed out after {open_timeout:.0f}s while opening and "
+                    f"analyzing {resolved}. The binary may drive auto-analysis into an "
+                    f"unbounded loop. Retry with run_auto_analysis=false (open without "
+                    f"analysis and decompile on demand), or raise IDA_MCP_OPEN_TIMEOUT."
+                ) from None
+            except Exception:
+                self._terminate_worker(worker)
+                self._cleanup_partial_database(resolved, preserve=preexisting_parts)
+                raise
+
+            worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
+            session = WorkerSession(
+                session_id=session_id,
+                input_path=str(worker_session.get("input_path") or resolved),
+                filename=str(worker_session.get("filename") or Path(resolved).name),
+                is_analyzing=bool(worker_session.get("is_analyzing", False)),
+                metadata=dict(worker_session.get("metadata") or {}),
+                host=worker.host,
+                port=worker.port,
+                process=worker.process,
+                backend="worker",
+                owned=True,
+                pid=worker.process.pid if worker.process is not None else None,
+                last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
+                auth_token=worker.auth_token,
             )
-            if isinstance(opened, dict) and opened.get("error"):
-                raise RuntimeError(str(opened["error"]))
-        except TimeoutError:
-            self._terminate_worker(worker)
-            self._cleanup_partial_database(resolved, preserve=preexisting_parts)
-            raise RuntimeError(
-                f"idalib worker timed out after {open_timeout:.0f}s while opening and "
-                f"analyzing {resolved}. The binary may drive auto-analysis into an "
-                f"unbounded loop. Retry with run_auto_analysis=false (open without "
-                f"analysis and decompile on demand), or raise IDA_MCP_OPEN_TIMEOUT."
-            ) from None
-        except Exception:
-            self._terminate_worker(worker)
-            self._cleanup_partial_database(resolved, preserve=preexisting_parts)
-            raise
-
-        worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
-        session = WorkerSession(
-            session_id=session_id,
-            input_path=str(worker_session.get("input_path") or resolved),
-            filename=str(worker_session.get("filename") or Path(resolved).name),
-            is_analyzing=bool(worker_session.get("is_analyzing", False)),
-            metadata=dict(worker_session.get("metadata") or {}),
-            host=worker.host,
-            port=worker.port,
-            process=worker.process,
-            backend="worker",
-            owned=True,
-            pid=worker.process.pid if worker.process is not None else None,
-            last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
-            auth_token=worker.auth_token,
-        )
-        with self._lock:
-            existing = self.path_to_session.get(self._path_key(resolved))
-            if existing is not None:
-                existing_session = self.sessions.get(existing)
-                if existing_session is not None and self._session_is_reachable(existing_session):
-                    existing_session.last_accessed = datetime.now()
-                else:
-                    self._unregister_session_locked(existing)
-                    existing_session = None
-            else:
-                existing_session = None
-
-            session_collision_error = None
-            if existing_session is None:
-                existing_by_id = self.sessions.get(session_id)
-                if existing_by_id is not None:
-                    if self._session_is_reachable(existing_by_id):
-                        existing_by_id.last_accessed = datetime.now()
-                        session_collision_error = ValueError(f"Session already exists: {session_id}")
+            # Phase (c): winner/loser recheck under the lock.
+            with self._lock:
+                existing = self.path_to_session.get(path_key)
+                if existing is not None:
+                    existing_session = self.sessions.get(existing)
+                    if existing_session is not None and self._session_is_reachable(existing_session):
+                        existing_session.last_accessed = datetime.now()
                     else:
-                        self._unregister_session_locked(session_id)
+                        self._unregister_session_locked(existing)
+                        existing_session = None
+                else:
+                    existing_session = None
 
-            if existing_session is None and session_collision_error is None:
-                self._register_session_locked(session, resolved)
-                return session
+                session_collision_error = None
+                if existing_session is None:
+                    existing_by_id = self.sessions.get(session_id)
+                    if existing_by_id is not None:
+                        if self._session_is_reachable(existing_by_id):
+                            existing_by_id.last_accessed = datetime.now()
+                            session_collision_error = ValueError(f"Session already exists: {session_id}")
+                        else:
+                            self._unregister_session_locked(session_id)
 
-        self._discard_opened_worker_session(worker)
-        if session_collision_error is not None:
-            raise session_collision_error
-        return existing_session
+                if existing_session is None and session_collision_error is None:
+                    self._register_session_locked(session, resolved)
+                    return session
+
+            self._discard_opened_worker_session(worker)
+            if session_collision_error is not None:
+                raise session_collision_error
+            assert existing_session is not None
+            return existing_session
+        finally:
+            self._finish_pending_open(path_key, slot_reserved)
+
+    def _finish_pending_open(self, path_key: str, slot_reserved: bool) -> None:
+        with self._lock:
+            if slot_reserved:
+                self._pending_slots = max(0, self._pending_slots - 1)
+            event = self._pending_opens.pop(path_key, None)
+        if event is not None:
+            event.set()
 
     def _resolve_gui_fallback_path(self, session: WorkerSession) -> str:
         candidates = [session.input_path]
@@ -1102,66 +1278,73 @@ class IdalibSupervisor:
         )
         resolved = self._resolve_gui_fallback_path(session)
         with self._lock:
-            worker = self._allocate_worker_locked()
-        preexisting_parts = self._existing_partial_database_parts(resolved)
+            self._reserve_open_slot_locked()
+            worker = self._take_schema_worker_for_session()
         try:
-            opened = self.call_worker_tool(
-                worker,
-                "idb_open",
-                {
-                    "input_path": resolved,
-                    "run_auto_analysis": False,
-                    "build_caches": True,
-                    "init_hexrays": True,
-                    "preferred_session_id": session.session_id,
-                },
-            )
-            if isinstance(opened, dict) and opened.get("error"):
-                raise RuntimeError(str(opened["error"]))
-        except Exception:
-            self._terminate_worker(worker)
-            self._cleanup_partial_database(resolved, preserve=preexisting_parts)
-            raise
-
-        worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
-        replacement = WorkerSession(
-            session_id=session.session_id,
-            input_path=str(worker_session.get("input_path") or resolved),
-            filename=str(worker_session.get("filename") or Path(resolved).name),
-            is_analyzing=bool(worker_session.get("is_analyzing", False)),
-            metadata={**session.metadata, **dict(worker_session.get("metadata") or {}), "fallback_from_gui": True},
-            host=worker.host,
-            port=worker.port,
-            process=worker.process,
-            backend="worker",
-            owned=True,
-            pid=worker.process.pid if worker.process is not None else None,
-            last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
-            auth_token=worker.auth_token,
-        )
-        with self._lock:
-            current = self.sessions.get(session.session_id)
-            if current is session:
-                self._register_session_locked(replacement, resolved)
-                return replacement
-            if current is not None and self._session_is_reachable(current):
-                current.last_accessed = datetime.now()
-                replacement_session = current
-                reopen_error = None
-            else:
-                if current is not None:
-                    self._unregister_session_locked(session.session_id)
-                replacement_session = None
-                reopen_error = RuntimeError(
-                    f"Session '{session.session_id}' was closed or replaced while reopening headlessly"
+            if worker is None:
+                worker = self._spawn_worker()
+            preexisting_parts = self._existing_partial_database_parts(resolved)
+            try:
+                opened = self.call_worker_tool(
+                    worker,
+                    "idb_open",
+                    {
+                        "input_path": resolved,
+                        "run_auto_analysis": False,
+                        "build_caches": True,
+                        "init_hexrays": True,
+                        "preferred_session_id": session.session_id,
+                    },
                 )
+                if isinstance(opened, dict) and opened.get("error"):
+                    raise RuntimeError(str(opened["error"]))
+            except Exception:
+                self._terminate_worker(worker)
+                self._cleanup_partial_database(resolved, preserve=preexisting_parts)
+                raise
 
-        self._discard_opened_worker_session(worker)
-        if replacement_session is not None:
-            return replacement_session
-        if reopen_error is not None:
-            raise reopen_error
-        raise RuntimeError(f"Session '{session.session_id}' changed while reopening headlessly")
+            worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
+            replacement = WorkerSession(
+                session_id=session.session_id,
+                input_path=str(worker_session.get("input_path") or resolved),
+                filename=str(worker_session.get("filename") or Path(resolved).name),
+                is_analyzing=bool(worker_session.get("is_analyzing", False)),
+                metadata={**session.metadata, **dict(worker_session.get("metadata") or {}), "fallback_from_gui": True},
+                host=worker.host,
+                port=worker.port,
+                process=worker.process,
+                backend="worker",
+                owned=True,
+                pid=worker.process.pid if worker.process is not None else None,
+                last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
+                auth_token=worker.auth_token,
+            )
+            with self._lock:
+                current = self.sessions.get(session.session_id)
+                if current is session:
+                    self._register_session_locked(replacement, resolved)
+                    return replacement
+                if current is not None and self._session_is_reachable(current):
+                    current.last_accessed = datetime.now()
+                    replacement_session = current
+                    reopen_error = None
+                else:
+                    if current is not None:
+                        self._unregister_session_locked(session.session_id)
+                    replacement_session = None
+                    reopen_error = RuntimeError(
+                        f"Session '{session.session_id}' was closed or replaced while reopening headlessly"
+                    )
+
+            self._discard_opened_worker_session(worker)
+            if replacement_session is not None:
+                return replacement_session
+            if reopen_error is not None:
+                raise reopen_error
+            raise RuntimeError(f"Session '{session.session_id}' changed while reopening headlessly")
+        finally:
+            with self._lock:
+                self._pending_slots = max(0, self._pending_slots - 1)
 
     def resolve_session(self, database: str) -> WorkerSession:
         session = self.peek_session(database)
@@ -1695,7 +1878,7 @@ def main() -> None:
         if args.stdio:
             mcp.stdio()
         else:
-            mcp.serve(host=args.host, port=args.port, background=False)
+            mcp.serve(host=args.host, port=args.port, background=False, threaded=True)
     finally:
         if supervisor is not None:
             supervisor.shutdown()

@@ -59,6 +59,7 @@ SOFTWARE.
 from __future__ import annotations
 
 import array
+import bisect
 import contextlib
 import contextvars
 import dataclasses
@@ -220,6 +221,12 @@ class InMemoryBuffer:
     _buffer: bytearray = dataclasses.field(
         default_factory=bytearray, init=False, repr=False
     )
+    _segments: list[tuple[int, int, int]] = dataclasses.field(
+        default_factory=list, init=False, repr=False
+    )
+    _seg_starts: list[int] = dataclasses.field(
+        default_factory=list, init=False, repr=False
+    )
 
     @property
     def file_size(self) -> int:
@@ -231,13 +238,35 @@ class InMemoryBuffer:
 
     def _load_segments(self):
         buf = self._buffer
+        segments: list[tuple[int, int, int]] = []
         seg = idaapi.get_first_seg()
         while seg:
             size = seg.end_ea - seg.start_ea
             data = idaapi.get_bytes(seg.start_ea, size)
             if data:
+                buf_start = len(buf)
                 buf.extend(data)
+                segments.append((buf_start, buf_start + len(data), seg.start_ea))
             seg = idaapi.get_next_seg(seg.start_ea)
+        self._segments = segments
+        self._seg_starts = [entry[0] for entry in segments]
+
+    def offset_to_ea(self, off: int) -> int | None:
+        """Map a buffer offset to an IDA address, or None in a gap."""
+        index = bisect.bisect_right(self._seg_starts, off) - 1
+        if index < 0 or index >= len(self._segments):
+            return None
+        buf_start, buf_end, seg_start_ea = self._segments[index]
+        if off < buf_start or off >= buf_end:
+            return None
+        return seg_start_ea + (off - buf_start)
+
+    def ea_to_offset(self, ea: int) -> int | None:
+        """Map an IDA address to a buffer offset, or None when unmapped."""
+        for buf_start, buf_end, seg_start_ea in self._segments:
+            if seg_start_ea <= ea < seg_start_ea + (buf_end - buf_start):
+                return buf_start + (ea - seg_start_ea)
+        return None
 
     def _load_input_file(self):
         if not self.file_path.exists():
@@ -283,6 +312,9 @@ class InMemoryBuffer:
             raise RuntimeError(
                 "segment_offset_to_ida_addr is only valid in 'segments' mode."
             )
+        mapped = self.offset_to_ea(seg_offset)
+        if mapped is not None:
+            return mapped
         return self.imagebase + seg_offset
 
     def ida_addr_to_segment_offset(self, ida_addr: int) -> int:
@@ -290,6 +322,9 @@ class InMemoryBuffer:
             raise RuntimeError(
                 "ida_addr_to_segment_offset is only valid in 'segments' mode."
             )
+        mapped = self.ea_to_offset(ida_addr)
+        if mapped is not None:
+            return mapped
         return ida_addr - self.imagebase
 
 
@@ -617,9 +652,14 @@ class GeneratedSignature:
         )
 
 
+MAX_XREF_SITES = 200
+
+
 @dataclasses.dataclass(slots=True)
 class XrefGeneratedSignature:
     signatures: list[GeneratedSignature]
+    total: int = 0
+    truncated: bool = False
 
 
 class SigText:
@@ -1399,15 +1439,17 @@ class XrefFinder:
     def find_xrefs(self, ea: int, cfg: SigMakerConfig) -> XrefGeneratedSignature:
         xref_signatures: list[GeneratedSignature] = []
 
-        total = self.count_code_xrefs_to(ea)
-        if total == 0:
-            return XrefGeneratedSignature([])
-
         cfg_no_prompt = dataclasses.replace(cfg, ask_longer_signature=False)
 
         shortest_len = cfg.max_xref_signature_length + 1
+        total = 0
+        truncated = False
 
         for i, frm_ea in enumerate(self.iter_code_xrefs_to(ea), start=1):
+            total += 1
+            if total > MAX_XREF_SITES:
+                truncated = True
+                continue
             try:
                 result = self.signature_maker.make_signature(frm_ea, cfg_no_prompt)
                 sig: typing.Optional[Signature] = result.signature
@@ -1422,7 +1464,8 @@ class XrefFinder:
             xref_signatures.append(GeneratedSignature(sig, Match(frm_ea)))
 
         xref_signatures.sort()
-        return XrefGeneratedSignature(xref_signatures)
+        sliced = xref_signatures[: cfg.print_top_x]
+        return XrefGeneratedSignature(sliced, total=total, truncated=truncated)
 
 
 @dataclasses.dataclass(slots=True)
@@ -1539,9 +1582,10 @@ class SignatureSearcher:
 
         sig = _SimdSignature(simd_signature)
         results: list[Match] = []
-        base = idaapi.inf_get_min_ea()
         if (k := sig.size_bytes) == 0:
-            return [Match(base)]
+            from .compat import inf_get_min_ea
+
+            return [Match(inf_get_min_ea())]
 
         n = len(data_mv)
         off = 0
@@ -1558,8 +1602,20 @@ class SignatureSearcher:
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
                 break
-            ea = base + off + idx
-            results.append(Match(ea))
+            start, end = off + idx, off + idx + k - 1
+            start_ea = buf.offset_to_ea(start)
+            end_ea = buf.offset_to_ea(end)
+            if start_ea is None or end_ea is None:
+                off += idx + 1
+                continue
+            # Reject matches spanning a segment gap: both ends must sit in
+            # the same segment entry.
+            start_entry = bisect.bisect_right(buf._seg_starts, start) - 1
+            end_entry = bisect.bisect_right(buf._seg_starts, end) - 1
+            if start_entry != end_entry or start_entry < 0:
+                off += idx + 1
+                continue
+            results.append(Match(start_ea))
             if skip_more_than_one and len(results) > 1:
                 break
             off += idx + 1
@@ -1610,11 +1666,12 @@ class SignatureSearcher:
             return SignatureSearcher._find_all_simd(
                 ida_signature, skip_more_than_one=skip_more_than_one, buf=buf
             )
+        from .compat import inf_get_min_ea, inf_get_max_ea
         binary = idaapi.compiled_binpat_vec_t()
-        idaapi.parse_binpat_str(binary, idaapi.inf_get_min_ea(), ida_signature, 16)
+        idaapi.parse_binpat_str(binary, inf_get_min_ea(), ida_signature, 16)
         out: list[Match] = []
-        ea = idaapi.inf_get_min_ea()
-        max_ea = idaapi.inf_get_max_ea()
+        ea = inf_get_min_ea()
+        max_ea = inf_get_max_ea()
         _bin_search = getattr(idaapi, "bin_search", None) or getattr(
             idaapi, "bin_search3"
         )

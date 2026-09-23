@@ -60,10 +60,9 @@ def test_failed_tool_fetch_is_retried(monkeypatch):
         1,
         "127.0.0.1",
         13337,
+        "input.bin",
+        "input.bin",
         "started",
-        "input.bin",
-        "input.bin",
-        "token",
     )
     attempts = []
     monkeypatch.setattr(
@@ -72,8 +71,8 @@ def test_failed_tool_fetch_is_retried(monkeypatch):
         lambda _path: [instance],
     )
     monkeypatch.setattr(
-        bridge_server._registry,
-        "registry_dir",
+        bridge_server._gui_discovery,
+        "get_instances_dir",
         lambda: "unused",
     )
 
@@ -106,10 +105,9 @@ def test_force_refresh_replaces_changed_tool_schema(monkeypatch):
         1,
         "127.0.0.1",
         13337,
+        "input.bin",
+        "input.bin",
         "started",
-        "input.bin",
-        "input.bin",
-        "token",
     )
     advertised = [[_tool("decompile")], [_tool("rename")]]
     changed = []
@@ -118,7 +116,7 @@ def test_force_refresh_replaces_changed_tool_schema(monkeypatch):
         "read_registry_dir",
         lambda _path: [instance],
     )
-    monkeypatch.setattr(bridge_server._registry, "registry_dir", lambda: "unused")
+    monkeypatch.setattr(bridge_server._gui_discovery, "get_instances_dir", lambda: "unused")
     monkeypatch.setattr(
         bridge_server,
         "_fetch_tools_for",
@@ -201,3 +199,60 @@ def test_cancellation_uses_inflight_tool_route(monkeypatch):
         item for item in forwarded if item[0]["method"] == "notifications/cancelled"
     )
     assert cancellation[1:] == ("127.0.0.1", 13337)
+
+
+def test_tools_call_forwards_transport_session_and_bearer(monkeypatch):
+    target = bridge_server._discovery.InstanceTarget(
+        id="instance-a", host="127.0.0.1", port=13337, prefix="",
+    )
+    table = bridge_server._discovery.build_tool_table(
+        [target], {"instance-a": [{"name": "decompile", "description": "", "inputSchema": {"type": "object", "properties": {}}}]},
+    )
+    seen = {}
+    def fake_refresh(**_kwargs):
+        return table
+    def fake_post(payload, host, port):
+        request = json.loads(payload)
+        seen["headers"] = bridge_server._get_proxy_request_headers()
+        return bridge_server.JsonRpcResponse({"jsonrpc": "2.0", "id": request.get("id"), "result": {}})
+    monkeypatch.setattr(bridge_server, "_refresh_tool_table", fake_refresh)
+    monkeypatch.setattr(bridge_server, "_post_to_ida", fake_post)
+    monkeypatch.setattr(bridge_server.mcp._transport_session_id, "data", "http:session-456", raising=False)
+    monkeypatch.setattr(bridge_server, "_BRIDGE_AUTH_TOKEN", "t", raising=False)
+    try:
+        resp = bridge_server.dispatch_proxy(
+            {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+             "params": {"name": "decompile", "arguments": {}}}
+        )
+    finally:
+        monkeypatch.setattr(bridge_server.mcp._transport_session_id, "data", None, raising=False)
+        monkeypatch.setattr(bridge_server, "_BRIDGE_AUTH_TOKEN", None, raising=False)
+    assert resp is not None
+    assert seen["headers"]["Mcp-Session-Id"] == "session-456"
+    assert seen["headers"]["Authorization"] == "Bearer t"
+    assert bridge_server._pending_routes == {}
+
+
+def test_tools_list_uses_ttl_cache(monkeypatch):
+    calls = []
+    instance = bridge_server._discovery.InstanceInfo(
+        "port13337", 1, "127.0.0.1", 13337, "", "a.exe", "t",
+    )
+    monkeypatch.setattr(
+        bridge_server._discovery, "read_registry_dir", lambda _path: [instance],
+    )
+    monkeypatch.setattr(
+        bridge_server._gui_discovery, "get_instances_dir", lambda: "unused",
+    )
+    monkeypatch.setattr(
+        bridge_server, "_fetch_tools_for", lambda _h, _p: calls.append(1) or [],
+    )
+    monkeypatch.setattr(bridge_server, "_emit_tools_list_changed", lambda: None)
+    bridge_server._tool_table = None
+    bridge_server._tool_table_signature = None
+    bridge_server._tool_fetch_failures = set()
+    bridge_server._tool_table_fetched_at = None
+    first = bridge_server.dispatch_proxy({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+    second = bridge_server.dispatch_proxy({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    assert first is not None and second is not None
+    assert len(calls) == 1

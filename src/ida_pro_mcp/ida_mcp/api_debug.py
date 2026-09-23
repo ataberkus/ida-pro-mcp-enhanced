@@ -167,13 +167,22 @@ def _get_registers_specific_for_thread(
 ) -> ThreadRegisters:
     """Helper to get specific registers for a given thread."""
     all_registers = _get_registers_for_thread(dbg, tid)
-    specific_registers = [
-        reg for reg in all_registers["registers"] if reg["name"] in register_names
-    ]
-    return ThreadRegisters(
+    by_name = {reg["name"].upper(): reg for reg in all_registers["registers"]}
+    specific_registers = []
+    unknown = []
+    for requested in register_names:
+        key = requested.strip().upper()
+        if key in by_name:
+            specific_registers.append(by_name[key])
+        elif requested.strip():
+            unknown.append(requested.strip())
+    result = ThreadRegisters(
         thread_id=tid,
         registers=specific_registers,
     )
+    if unknown:
+        result["unknown"] = unknown
+    return result
 
 
 def list_breakpoints():
@@ -210,18 +219,25 @@ def dbg_status() -> DebugControlResult:
 @tool
 @idasync
 def dbg_start():
-    """Start debugger session for current target."""
+    """Start debugger session for current target.
+
+    When no breakpoints exist, entry-point breakpoints are added automatically
+    so the debugger suspends instead of running to completion. Returns
+    auto_breakpoints listing any breakpoints this call added.
+    """
+    auto_breakpoints: list[str] = []
     if len(list_breakpoints()) == 0:
         for i in range(ida_entry.get_entry_qty()):
             ordinal = ida_entry.get_entry_ordinal(i)
             addr = ida_entry.get_entry(ordinal)
             if addr != ida_idaapi.BADADDR:
                 ida_dbg.add_bpt(addr, 0, idaapi.BPT_SOFT)
+                auto_breakpoints.append(hex(addr))
 
     if idaapi.start_process("", "", "") == 1:
         ip = ida_dbg.get_ip_val()
         if ip is not None:
-            return hex(ip)
+            return {"ip": hex(ip), "auto_breakpoints": auto_breakpoints}
     raise IDAError("Failed to start debugger")
 
 
@@ -558,6 +574,7 @@ def dbg_regs_named(
 @idasync
 def dbg_stacktrace() -> list[dict[str, str]]:
     """Return current call stack with module and symbol context."""
+    dbg_ensure_running()
     callstack = []
     try:
         tid = ida_dbg.get_current_thread()
@@ -588,20 +605,24 @@ def dbg_stacktrace() -> list[dict[str, str]]:
                 )
                 frame_info["symbol"] = name
 
-            except Exception as e:
-                frame_info["module"] = "<error>"
-                frame_info["symbol"] = str(e)
+            except Exception:
+                frame_info["module"] = "<unknown>"
+                frame_info["symbol"] = "<unknown>"
 
             callstack.append(frame_info)
 
-    except Exception:
-        pass
+    except Exception as e:
+        raise IDAError(f"Stack trace failed: {e}")
     return callstack
 
 
 # ============================================================================
 # Debugger Memory Operations
 # ============================================================================
+
+
+MAX_DBG_READ = 65536
+MAX_DBG_WRITE = 65536
 
 
 @ext("dbg")
@@ -619,6 +640,16 @@ def dbg_read(regions: list[MemoryRead] | MemoryRead) -> list[dict]:
         try:
             addr = parse_address(region["addr"])
             size = region["size"]
+            if not isinstance(size, int) or size <= 0:
+                results.append(
+                    {"addr": region.get("addr"), "size": 0, "data": None, "error": "Size must be positive"}
+                )
+                continue
+            if size > MAX_DBG_READ:
+                results.append(
+                    {"addr": region.get("addr"), "size": 0, "data": None, "error": f"Read size {size} exceeds limit {MAX_DBG_READ}"}
+                )
+                continue
 
             data = idaapi.dbg_read_memory(addr, size)
             if data:
@@ -663,6 +694,12 @@ def dbg_write(regions: list[MemoryPatch] | MemoryPatch) -> list[dict]:
         try:
             addr = parse_address(region["addr"])
             data = bytes.fromhex(region["data"])
+            if len(data) <= 0:
+                results.append({"addr": region.get("addr"), "size": 0, "error": "Size must be positive"})
+                continue
+            if len(data) > MAX_DBG_WRITE:
+                results.append({"addr": region.get("addr"), "size": 0, "error": f"Write size {len(data)} exceeds limit {MAX_DBG_WRITE}"})
+                continue
 
             success = idaapi.dbg_write_memory(addr, data)
             results.append(

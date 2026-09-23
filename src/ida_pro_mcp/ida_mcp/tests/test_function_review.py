@@ -61,3 +61,45 @@ def test_function_review_preview_does_not_change_names():
     assert preview.get("transaction_id")
     restored = lookup_funcs(fn_addr)[0]
     assert restored["fn"]["name"] == original_name
+
+
+@test(binary="crackme03.elf")
+def test_mutation_commit_two_renames_then_rollback():
+    """Commit two renames, roll back, and both names revert."""
+    import idaapi
+
+    from ..rpc import configure_tool_policy, get_active_scopes
+    from ..api_vnext import mutation_commit, mutation_rollback
+    from ida_pro_mcp.vnext.contracts import SafetyScope
+
+    eas = []
+    for ea in __import__("idautils").Functions():
+        eas.append(ea)
+        if len(eas) == 2:
+            break
+    if len(eas) < 2:
+        skip_test("binary has fewer than two functions")
+    originals = [idaapi.get_name(ea) or "" for ea in eas]
+    operations = [
+        {"kind": "rename", "addr": hex(eas[0]), "name": "__rb_a__"},
+        {"kind": "rename", "addr": hex(eas[1]), "name": "__rb_b__"},
+    ]
+    previous_scopes = get_active_scopes()
+    configure_tool_policy(scopes=set(SafetyScope), legacy_tools=True)
+    try:
+        preview = mutation_preview(operations)
+        tid = preview.get("transaction_id")
+        assert tid, f"preview failed: {preview}"
+        receipt = mutation_commit(tid)
+        assert receipt.get("status") == "committed", f"commit failed: {receipt}"
+        assert idaapi.get_name(eas[0]) == "__rb_a__"
+        assert idaapi.get_name(eas[1]) == "__rb_b__"
+        rolled = mutation_rollback(tid)
+        assert rolled.get("status") == "rolled_back", f"rollback failed: {rolled}"
+        assert idaapi.get_name(eas[0]) == originals[0]
+        assert idaapi.get_name(eas[1]) == originals[1]
+    finally:
+        configure_tool_policy(scopes=previous_scopes, legacy_tools=True)
+        for ea, name in zip(eas, originals):
+            if idaapi.get_name(ea) != name:
+                idaapi.set_name(ea, name, idaapi.SN_NOWARN)

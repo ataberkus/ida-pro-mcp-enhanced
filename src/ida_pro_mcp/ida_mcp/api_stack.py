@@ -34,9 +34,11 @@ def stack_frame(addrs: Annotated[list[str] | str, "Address(es)"]) -> list[dict]:
     addrs = normalize_list_input(addrs)
     results = []
 
+    from .utils import resolve_address_or_name
+
     for addr in addrs:
         try:
-            ea = parse_address(addr)
+            ea = resolve_address_or_name(addr)
             vars = get_stack_frame_variables_internal(ea, True)
             results.append({"addr": addr, "vars": vars})
         except Exception as e:
@@ -68,7 +70,8 @@ def declare_stack(
                 )
                 continue
 
-            ea = parse_address(offset)
+            # Frame offsets are signed (e.g. -8); they are not addresses.
+            ea = int(offset, 0) if isinstance(offset, str) else int(offset)
 
             frame_tif = ida_typeinf.tinfo_t()
             if not ida_frame.get_func_frame(frame_tif, func):
