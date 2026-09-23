@@ -219,11 +219,11 @@ def _decompile_section(func: ida_funcs.func_t) -> tuple[str | None, str | None, 
 def _xrefs_section(ea: int) -> dict:
     """Xrefs to/from *ea*, each side capped at 200."""
     xrefs = get_all_xrefs(ea)
-    xrefs_to, to_truncated = _limit_items(xrefs["to"], 200)
-    xrefs_from, from_truncated = _limit_items(xrefs["from"], 200)
+    to_xrefs, to_truncated = _limit_items(xrefs["to"], 200)
+    from_xrefs, from_truncated = _limit_items(xrefs["from"], 200)
     return {
-        "to": xrefs_to,
-        "from": xrefs_from,
+        "to": to_xrefs,
+        "from": from_xrefs,
         "to_truncated": to_truncated,
         "from_truncated": from_truncated,
         "to_count": len(xrefs["to"]),
