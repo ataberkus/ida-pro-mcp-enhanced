@@ -21,7 +21,6 @@ from ..api_analysis import (
     disasm,
     func_profile,
     analyze_batch,
-    xrefs_to,
     xref_query,
     insn_query,
     xrefs_to_field,
@@ -220,33 +219,6 @@ def test_disasm_interior_address_preserves_cursor():
     result = disasm(hex(interior), max_instructions=4)
     assert_ok(result, "asm")
     assert result["asm"]["start_ea"] == hex(interior)
-
-
-@test(binary="crackme03.elf")
-def test_xrefs_to_check_pw_from_main():
-    """xrefs_to(check_pw) includes the known call from main."""
-    result = xrefs_to(CRACKME_CHECK_PW)
-    assert_is_list(result, min_length=1)
-    entry = result[0]
-    assert entry["addr"] == CRACKME_CHECK_PW
-    assert_is_list(entry["xrefs"], min_length=1)
-    hit = next(
-        (xref for xref in entry["xrefs"] if xref["addr"] == CRACKME_CALL_TO_CHECK_PW),
-        None,
-    )
-    assert hit is not None, "expected call site 0x12d3 -> check_pw"
-    assert hit["type"] == "code"
-    assert hit["fn"]["name"] == "main"
-
-
-@test()
-def test_xrefs_to_invalid():
-    """xrefs_to reports an error or empty xrefs for an invalid address."""
-    result = xrefs_to(get_unmapped_address())
-    assert_is_list(result, min_length=1)
-    assert result[0]["addr"] == get_unmapped_address()
-    if result[0].get("xrefs") is None:
-        assert_error(result[0])
 
 
 @test()

@@ -30,20 +30,6 @@ def test_unsafe_tools_registered():
 
 
 @test()
-def test_unsafe_tools_enabled_on_default_profile():
-    """The default allow-all profile enables Python tools for new installs."""
-    from ida_pro_mcp.vnext.profiles import default_profile_enabled
-    from ..rpc import MCP_POLICY
-    from .. import http as http_mod
-
-    for name in ("py_eval", "py_exec_file"):
-        assert name in http_mod.ORIGINAL_TOOLS, f"{name} not registered"
-        assert default_profile_enabled(name, MCP_POLICY), (
-            f"{name} should be enabled by the default profile"
-        )
-
-
-@test()
 def test_unsafe_tools_hidden_after_removal():
     """tools/list should exclude tools removed from the registry (idalib --unsafe behavior)."""
     with _saved_tools():

@@ -8,7 +8,6 @@ while presenting a smaller and versioned public API.
 from __future__ import annotations
 
 import base64
-import functools
 import json
 import os
 import platform
@@ -51,11 +50,15 @@ from .rpc import (
     tool,
 )
 try:
-    from .sync import IDASyncError
+    from .sync import IDASyncError, idasync
     from .sync import CancelledError as SyncCancelledError
 except ImportError:  # IDA-free contexts (tests) stub these modules
     IDASyncError = None  # type: ignore[assignment,misc]
     SyncCancelledError = None  # type: ignore[assignment,misc]
+
+    def idasync(func):  # type: ignore[no-redef]
+        # ponytail: no IDA main thread in unit tests; helpers run inline there.
+        return func
 try:
     from .zeromcp.jsonrpc import RequestCancelledError
 except ImportError:
@@ -87,34 +90,6 @@ _TRANSACTIONS = TransactionManager(_REVISIONS)
 _REVISION_HOOK: Any = None
 _DEBUG_HOOK: Any = None
 _DEBUG_SNAPSHOTS: dict[str, dict[str, Any]] = {}
-
-
-def _ida_synchronized(func):
-    """Run *func* on the IDA main thread, lazily wrapping with idasync.
-
-    Direct-call when already on the IDA main thread so IDB hooks and nested
-    helpers do not re-enter the sync queue. Worker/job threads still dispatch.
-    """
-
-    synced = None
-
-    @functools.wraps(func)
-    def wrapped(*args, **kwargs):
-        nonlocal synced
-        try:
-            import ida_pro
-
-            if ida_pro.is_main_thread():
-                return func(*args, **kwargs)
-        except Exception:
-            pass
-        from .sync import idasync
-
-        if synced is None:
-            synced = idasync(func)
-        return synced(*args, **kwargs)
-
-    return wrapped
 
 
 def _load_idb_state(key: str) -> dict[str, Any]:
@@ -179,38 +154,19 @@ def _legacy_call(name: str, arguments: dict[str, Any] | None = None, *, check_pa
     # profile filtering does not break canonical analysis jobs.
     if check_paths:
         resolve_tool_paths(name, arguments or {})
-    implementation_methods = getattr(MCP_SERVER.tools, "_all_methods", None)
-    if isinstance(implementation_methods, dict):
-        implementation = implementation_methods.get(name)
-        if implementation is None:
-            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool is not registered: {name}")
-        try:
-            return implementation(**(arguments or {}))
-        except VNextError:
+    implementation = getattr(MCP_SERVER.tools, "_all_methods", {}).get(name)
+    if implementation is None:
+        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool is not registered: {name}")
+    try:
+        return implementation(**(arguments or {}))
+    except VNextError:
+        raise
+    except Exception as exc:
+        if isinstance(exc, _legacy_passthrough_errors()):
             raise
-        except Exception as exc:
-            if isinstance(exc, _legacy_passthrough_errors()):
-                raise
-            if isinstance(exc, (TypeError, ValueError, KeyError)):
-                raise VNextError(ErrorCode.INVALID_OPERATION, f"Legacy tool failed: {name}: {exc}") from exc
-            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool failed: {name}: {exc}") from exc
+        if isinstance(exc, (TypeError, ValueError, KeyError)):
             raise VNextError(ErrorCode.INVALID_OPERATION, f"Legacy tool failed: {name}: {exc}") from exc
-        except Exception as exc:
-            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool failed: {name}: {exc}") from exc
-
-    response = MCP_SERVER.tools.dispatch(
-        {"jsonrpc": "2.0", "method": name, "params": arguments or {}, "id": None}
-    )
-    if response and "error" in response:
-        error = response["error"]
-        data = error.get("data") or {}
-        raw_code = data.get("code", ErrorCode.NOT_SUPPORTED.value)
-        try:
-            code = ErrorCode(raw_code)
-        except ValueError:
-            code = ErrorCode.NOT_SUPPORTED
-        raise VNextError(code, error.get("message", f"Legacy tool failed: {name}"), details=data)
-    return response.get("result") if response else None
+        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool failed: {name}: {exc}") from exc
 
 
 def _database_id_lookup() -> str:
@@ -234,7 +190,7 @@ def _database_id_lookup() -> str:
     return get_current_transport_session_id() or "active"
 
 
-_database_id_sync = _ida_synchronized(_database_id_lookup)
+_database_id_sync = idasync(_database_id_lookup)
 
 
 def _database_id() -> str:
@@ -455,7 +411,7 @@ def _ida_capabilities_impl() -> CapabilityManifest:
     )
 
 
-_ida_capabilities_sync = _ida_synchronized(_ida_capabilities_impl)
+_ida_capabilities_sync = idasync(_ida_capabilities_impl)
 
 
 def _encode_cursor_value(value: dict[str, Any]) -> str:
@@ -527,43 +483,54 @@ def _result_truncated(result: Any) -> bool:
     )
 
 
-def _instruction_cursor_states(
+def _per_target_cursor_states(
     cursor: str | None,
     target_count: int,
+    key: str,
 ) -> list[dict[str, Any] | None]:
+    """Decode one ``{offset[, start]}`` state per target (None = target exhausted)."""
     if not cursor:
         return [{"offset": 0} for _ in range(target_count)]
     value = _decode_cursor_value(cursor)
-    if "instruction" not in value:
-        try:
-            offset = max(0, int(value["offset"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid pagination cursor") from exc
-        return [{"offset": offset} for _ in range(target_count)]
-    states = value["instruction"]
+    if key not in value:
+        return [{"offset": _decode_cursor(cursor)} for _ in range(target_count)]
+    states = value[key]
     if not isinstance(states, list) or len(states) != target_count:
-        raise VNextError(ErrorCode.INVALID_OPERATION, "Instruction cursor does not match targets")
-    if any(state is not None and not isinstance(state, dict) for state in states):
-        raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid instruction cursor state")
-    return states
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"{key.title()} cursor does not match targets")
+    normalized: list[dict[str, Any] | None] = []
+    for state in states:
+        if state is None:
+            normalized.append(None)
+            continue
+        try:
+            entry: dict[str, Any] = {"offset": max(0, int(state["offset"]))}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid {key} cursor state") from exc
+        if state.get("start"):
+            entry["start"] = str(state["start"])
+        normalized.append(entry)
+    return normalized
 
 
-def _instruction_next_cursor(
+def _per_target_next_cursor(
     result: Any,
     pending: list[tuple[int, str, dict[str, Any]]],
     target_count: int,
+    key: str,
 ) -> str | None:
+    """Encode per-target continuation; collapses to a plain offset cursor when uniform."""
     if not isinstance(result, list):
         return None
     states: list[dict[str, Any] | None] = [None] * target_count
     for (target_index, _target, prior), item in zip(pending, result):
         if not isinstance(item, dict):
             continue
-        legacy_cursor = item.get("cursor")
         if item.get("truncated") and item.get("next_start"):
             states[target_index] = {"offset": 0, "start": str(item["next_start"])}
-        elif isinstance(legacy_cursor, dict) and legacy_cursor.get("next") is not None:
-            state = {"offset": max(0, int(legacy_cursor["next"]))}
+            continue
+        encoded = _search_next_cursor(item)
+        if encoded is not None:
+            state: dict[str, Any] = {"offset": _decode_cursor(encoded)}
             if prior.get("start"):
                 state["start"] = prior["start"]
             states[target_index] = state
@@ -573,61 +540,6 @@ def _instruction_next_cursor(
     if (
         len(active) == target_count
         and all(not state.get("start") for state in active)
-        and len({int(state["offset"]) for state in active}) == 1
-    ):
-        return _encode_cursor(int(active[0]["offset"]))
-    return _encode_cursor_value({"instruction": states})
-
-
-def _batch_cursor_states(
-    cursor: str | None,
-    target_count: int,
-    key: str,
-) -> list[dict[str, int] | None]:
-    if not cursor:
-        return [{"offset": 0} for _ in range(target_count)]
-    value = _decode_cursor_value(cursor)
-    if key not in value:
-        try:
-            offset = max(0, int(value["offset"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid pagination cursor") from exc
-        return [{"offset": offset} for _ in range(target_count)]
-    states = value[key]
-    if not isinstance(states, list) or len(states) != target_count:
-        raise VNextError(ErrorCode.INVALID_OPERATION, f"{key.title()} cursor does not match targets")
-    normalized: list[dict[str, int] | None] = []
-    for state in states:
-        if state is None:
-            normalized.append(None)
-            continue
-        if not isinstance(state, dict):
-            raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid {key} cursor state")
-        try:
-            normalized.append({"offset": max(0, int(state["offset"]))})
-        except (KeyError, TypeError, ValueError) as exc:
-            raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid {key} cursor state") from exc
-    return normalized
-
-
-def _batch_next_cursor(
-    result: Any,
-    pending: list[tuple[int, str, dict[str, int]]],
-    target_count: int,
-    key: str,
-) -> str | None:
-    if not isinstance(result, list):
-        return None
-    states: list[dict[str, int] | None] = [None] * target_count
-    for (target_index, _target, _prior), item in zip(pending, result):
-        encoded = _search_next_cursor(item)
-        if encoded is not None:
-            states[target_index] = {"offset": _decode_cursor(encoded)}
-    active = [state for state in states if state is not None]
-    if not active:
-        return None
-    if (
-        len(active) == target_count
         and len({state["offset"] for state in active}) == 1
     ):
         return _encode_cursor(active[0]["offset"])
@@ -653,7 +565,7 @@ def search(
     normalized = kind.lower()
     legacy_tool = normalized
     if normalized == "instruction":
-        states = _instruction_cursor_states(cursor, len(targets))
+        states = _per_target_cursor_states(cursor, len(targets), "instruction")
         pending = [
             (index, target, state)
             for index, (target, state) in enumerate(zip(targets, states))
@@ -663,7 +575,7 @@ def search(
         for _index, target, state in pending:
             query = {
                 "mnem": target,
-                "offset": max(0, int(state.get("offset", 0))),
+                "offset": state["offset"],
                 "count": limit,
                 "max_scan_insns": 200000,
                 "allow_broad": True,
@@ -673,7 +585,7 @@ def search(
                 query["start"] = state["start"]
             queries.append(query)
         result = _legacy_call("insn_query", {"queries": queries}) if queries else []
-        next_cursor = _instruction_next_cursor(result, pending, len(targets))
+        next_cursor = _per_target_next_cursor(result, pending, len(targets), "instruction")
         legacy_tool = "insn_query"
     else:
         offset = _decode_cursor(cursor)
@@ -697,8 +609,11 @@ def search(
         elif normalized == "regex":
             if len(targets) != 1:
                 raise VNextError(ErrorCode.INVALID_OPERATION, "Regex search accepts one pattern")
-            result = _legacy_call("find_regex", {"pattern": targets[0], "limit": limit, "offset": offset})
-            legacy_tool = "find_regex"
+            result = _legacy_call(
+                "entity_query",
+                {"queries": {"kind": "strings", "regex": targets[0], "case_sensitive": False, "offset": offset, "count": limit}},
+            )
+            legacy_tool = "entity_query"
         elif normalized == "bytes":
             result = _legacy_call("find_bytes", {"patterns": targets, "limit": limit, "offset": offset})
             legacy_tool = "find_bytes"
@@ -820,14 +735,12 @@ def _analysis_sync(mode: str, targets: list[str], options: dict[str, Any]) -> An
         return _legacy_call("analyze_component", {"addrs": targets})
     if mode == "batch":
         return _legacy_call("analyze_batch", {"queries": [{"addr": target} for target in targets]})
-    if mode == "binary_diff":
-        raise VNextError(ErrorCode.NOT_SUPPORTED, "Binary diff requires supervisor-level access to two database sessions")
     raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported analysis mode: {mode}")
 
 
 @tool
 def analysis_run(
-    mode: Annotated[str, "triage, function, component, batch, deep, or binary_diff"],
+    mode: Annotated[str, "triage, function, component, batch, or deep"],
     targets: Annotated[list[str], "Seed functions or addresses"] = [],
     options: Annotated[dict[str, Any] | None, "Analysis budgets and mode options"] = None,
 ) -> dict[str, Any]:
@@ -860,7 +773,7 @@ def analysis_run(
             provenance={"mode": "deep", "database": _database_id()},
         ).to_dict()
 
-    return _jobs().submit("analysis.deep", run, database=_database_id(), resumable=True).to_dict(include_result=False)
+    return _jobs().submit("analysis.deep", run, database=_database_id()).to_dict(include_result=False)
 
 
 @tool
@@ -874,7 +787,7 @@ def graph_query(
     """Query xrefs, call graphs, or control-flow graphs."""
 
     if kind in {"xrefs", "xrefs_from", "xrefs_both", "cfg"}:
-        states = _batch_cursor_states(cursor, len(targets), "graph")
+        states = _per_target_cursor_states(cursor, len(targets), "graph")
         pending = [
             (index, target, state)
             for index, (target, state) in enumerate(zip(targets, states))
@@ -912,7 +825,7 @@ def graph_query(
                     ]
                 },
             )
-        next_cursor = _batch_next_cursor(result, pending, len(targets), "graph")
+        next_cursor = _per_target_next_cursor(result, pending, len(targets), "graph")
     elif kind == "calls":
         if cursor:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Call graphs do not support cursor continuation")
@@ -1139,7 +1052,7 @@ def investigation_start(
             manager.set_state(record.investigation_id, "failed")
             raise
 
-    job = _jobs().submit("investigation.deep", run, database=record.database, resumable=True)
+    job = _jobs().submit("investigation.deep", run, database=record.database)
     manager.set_job(record.investigation_id, job.job_id)
     return manager.get(record.investigation_id).to_dict()
 
@@ -1179,7 +1092,7 @@ def investigation_add_finding(
 @tool
 def investigation_export(
     investigation_id: Annotated[str, "Investigation identifier"],
-    format: Annotated[str, "json, markdown, sarif, dot, or mermaid"] = "markdown",
+    format: Annotated[str, "json, markdown, or sarif"] = "markdown",
     path: Annotated[str | None, "Optional output path"] = None,
 ) -> dict[str, Any]:
     """Export an investigation deterministically, optionally writing a file."""
@@ -1243,13 +1156,6 @@ def _as_dict_list(value: Any) -> list[dict[str, Any]] | None:
     return None
 
 
-def _first_present(args: dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if key in args and args[key] not in (None, ""):
-            return args[key]
-    return None
-
-
 def _parse_mutation_address(raw: Any, *, index: int, field: str = "addr") -> str:
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         raise VNextError(
@@ -1276,10 +1182,7 @@ def _copy_passthrough(source: dict[str, Any], dest: dict[str, Any], keys: tuple[
 
 
 def _normalize_comment_item(item: dict[str, Any], *, index: int) -> dict[str, Any]:
-    addr = _parse_mutation_address(
-        item.get("addr") or item.get("ea") or item.get("func_addr"),
-        index=index,
-    )
+    addr = _parse_mutation_address(item.get("addr"), index=index)
     comment = item.get("comment")
     if comment is None:
         comment = item.get("text")
@@ -1294,73 +1197,49 @@ def _normalize_comment_item(item: dict[str, Any], *, index: int) -> dict[str, An
 
 
 def _reshape_mutation_arguments(kind: str, arguments: dict[str, Any], *, index: int = 0) -> tuple[str, dict[str, Any]]:
-    """Normalize agent-friendly mutation kinds/args into canonical forms."""
+    """Normalize the kinds/flat forms documented on mutation_preview into canonical arguments."""
     canonical = _MUTATION_KIND_ALIASES.get(kind, kind)
     args = dict(arguments)
 
     if canonical == "rename":
         if any(key in args for key in _RENAME_BATCH_KEYS):
-            for key in ("func", "data", "global", "globals", "local", "stack"):
-                items = _as_dict_list(args.get(key))
-                if items is None:
-                    continue
-                for item in items:
-                    if any(field in item for field in ("addr", "ea", "func_addr")):
-                        item["addr"] = _parse_mutation_address(
-                            item.get("addr") or item.get("func_addr") or item.get("ea"),
-                            index=index,
-                        )
+            for key in _RENAME_BATCH_KEYS:
+                for item in _as_dict_list(args.get(key)) or []:
+                    if "addr" in item:
+                        item["addr"] = _parse_mutation_address(item["addr"], index=index)
             return canonical, args
-        if any(key in args for key in ("addr", "func_addr", "ea", "name", "new", "new_name")):
-            addr = args.get("addr", args.get("func_addr", args.get("ea")))
-            name = _first_present(args, "name", "new", "new_name")
-            parsed_addr = _parse_mutation_address(addr, index=index)
-            if not name:
+        if "addr" in args or "name" in args:
+            parsed_addr = _parse_mutation_address(args.get("addr"), index=index)
+            if not args.get("name"):
                 raise VNextError(
                     ErrorCode.INVALID_OPERATION,
                     f"Mutation operation {index} rename is missing name",
                 )
-            reshaped: dict[str, Any] = {
-                "func": [{"addr": parsed_addr, "name": str(name)}]
-            }
+            reshaped: dict[str, Any] = {"func": [{"addr": parsed_addr, "name": str(args["name"])}]}
             _copy_passthrough(args, reshaped, _RENAME_PASSTHROUGH_KEYS)
             return canonical, reshaped
 
     elif canonical in {"comment", "append_comment"}:
-        items = _as_dict_list(args.get("items") if "items" in args else args.get("item"))
+        items = _as_dict_list(args.get("items"))
         if items is not None:
             return canonical, {"items": [_normalize_comment_item(item, index=index) for item in items]}
-        if any(key in args for key in ("addr", "ea", "func_addr", "comment", "text")):
-            item = {
-                "addr": args.get("addr", args.get("ea", args.get("func_addr"))),
-                "comment": args["comment"] if "comment" in args else args.get("text"),
-            }
-            _copy_passthrough(args, item, ("scope", "dedupe"))
-            return canonical, {"items": [_normalize_comment_item(item, index=index)]}
+        if any(key in args for key in ("addr", "comment", "text")):
+            return canonical, {"items": [_normalize_comment_item(args, index=index)]}
 
     elif canonical == "set_type":
         edits = _as_dict_list(args.get("edits"))
         if edits is not None:
             for edit in edits:
-                if any(field in edit for field in ("addr", "ea", "func_addr")):
-                    edit["addr"] = _parse_mutation_address(
-                        edit.get("addr") or edit.get("ea") or edit.get("func_addr"),
-                        index=index,
-                    )
-            return canonical, {"edits": edits, **{k: v for k, v in args.items() if k != "edits"}}
-        addr = args.get("addr") or args.get("ea") or args.get("func_addr")
-        type_text = _first_present(args, "type", "ty", "signature", "decl")
-        if addr and type_text:
-            edit = {"addr": _parse_mutation_address(addr, index=index), "type": str(type_text)}
-            _copy_passthrough(args, edit, ("kind", "name", "signature", "ty", "variable"))
+                if "addr" in edit:
+                    edit["addr"] = _parse_mutation_address(edit["addr"], index=index)
+            return canonical, {**args, "edits": edits}
+        if args.get("addr") and args.get("type"):
+            edit = {"addr": _parse_mutation_address(args["addr"], index=index), "type": str(args["type"])}
+            _copy_passthrough(args, edit, ("kind", "name", "variable"))
             return canonical, {"edits": [edit]}
 
-    elif canonical == "declare_type":
-        if "decls" in args and args["decls"] not in (None, "", []):
-            return canonical, args
-        decl = _first_present(args, "decl", "declaration", "type")
-        if decl:
-            return canonical, {"decls": decl}
+    elif canonical == "declare_type" and not args.get("decls") and args.get("decl"):
+        return canonical, {"decls": args["decl"]}
 
     return canonical, args
 
@@ -1512,7 +1391,7 @@ def _apply_operation(operation: MutationOperation) -> Any:
     return result
 
 
-@_ida_synchronized
+@idasync
 def _mutation_before_state(operation: MutationOperation) -> Any:
     """Capture current names/comments/bytes so preview is useful for reversing."""
 
@@ -1579,7 +1458,7 @@ def _mutation_before_state(operation: MutationOperation) -> Any:
     return None
 
 
-@_ida_synchronized
+@idasync
 def _create_undo_point() -> bool:
     try:
         import ida_undo
@@ -1601,7 +1480,7 @@ def _create_undo_point() -> bool:
         return False
 
 
-@_ida_synchronized
+@idasync
 def _perform_undo() -> bool:
     try:
         import ida_undo
@@ -1612,7 +1491,7 @@ def _perform_undo() -> bool:
         return False
 
 
-@_ida_synchronized
+@idasync
 def _debug_attach(pid: int, event_id: int = -1) -> dict[str, Any]:
     import ida_dbg
 
@@ -1622,7 +1501,7 @@ def _debug_attach(pid: int, event_id: int = -1) -> dict[str, Any]:
     return {"attached": True, "pid": int(pid), "result": result}
 
 
-@_ida_synchronized
+@idasync
 def _debug_pause() -> dict[str, Any]:
     import ida_dbg
 
@@ -1631,7 +1510,7 @@ def _debug_pause() -> dict[str, Any]:
     return {"pause_requested": True}
 
 
-@_ida_synchronized
+@idasync
 def _debug_add_watchpoints(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     import ida_dbg
     import idaapi
@@ -1660,7 +1539,7 @@ def _debug_add_watchpoints(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return results
 
 
-@_ida_synchronized
+@idasync
 def _debug_trace_action(action: str, options: dict[str, Any]) -> dict[str, Any]:
     import ida_dbg
 
@@ -1721,7 +1600,7 @@ def _debug_trace_action(action: str, options: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@_ida_synchronized
+@idasync
 def _debug_trace_export(path: str, description: str) -> dict[str, Any]:
     import ida_dbg
 
@@ -1846,14 +1725,14 @@ def debug_control(action: Annotated[str, "continue, step_into, step_over, pause,
 
 
 @tool
-def debug_breakpoints(action: Annotated[str, "list, add, delete, toggle, condition, or watch"], items: Annotated[list[dict[str, Any]] | list[str], "Breakpoint addresses or records"] = []) -> dict[str, Any]:
-    """List or mutate breakpoints and their conditions."""
+def debug_breakpoints(action: Annotated[str, "list, add, delete, toggle, or watch"], items: Annotated[list[dict[str, Any]] | list[str], "Breakpoint addresses or records"] = []) -> dict[str, Any]:
+    """List, add, delete, toggle breakpoints, or add watchpoints."""
 
     if action == "watch":
         if not all(isinstance(item, dict) for item in items):
             raise VNextError(ErrorCode.INVALID_OPERATION, "Watchpoints require record items")
         return ToolEnvelope(_debug_add_watchpoints(items)).to_dict()
-    mapping = {"list": ("dbg_bps", {}), "add": ("dbg_add_bp", {"addrs": items}), "delete": ("dbg_delete_bp", {"addrs": items}), "toggle": ("dbg_toggle_bp", {"items": items}), "condition": ("dbg_set_bp_condition", {"items": items})}
+    mapping = {"list": ("dbg_bps", {}), "add": ("dbg_add_bp", {"addrs": items}), "delete": ("dbg_delete_bp", {"addrs": items}), "toggle": ("dbg_toggle_bp", {"items": items})}
     if action not in mapping:
         raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported breakpoint action: {action}")
     name, arguments = mapping[action]
@@ -2071,13 +1950,6 @@ def deobfuscate_component(targets: str, database: str = "") -> str:
     """Plan evidence-preserving deobfuscation."""
 
     return _prompt(f"Analyze obfuscation around {targets}.", "Identify the transformation, document invariants, stage all IDB changes through mutation_preview, and do not commit without explicit approval.", database)
-
-
-@prompt
-def compare_binaries(left_database: str, right_database: str) -> str:
-    """Cross-database binary comparison workflow."""
-
-    return _prompt("Compare two binaries and explain meaningful code changes.", f"Use analysis_run binary_diff with `{left_database}` and `{right_database}`; correlate symbols, normalized instructions, signatures, callers, callees, and types.")
 
 
 @prompt

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from ida_pro_mcp.vnext.analysis import (
     bounded_subgraph,
-    merge_analysis_graphs,
     nearest_node_id,
     node_matches,
     normalize_reference_flow_graph,
@@ -104,24 +103,3 @@ def test_reference_flow_graph_normalizes_from_to_edges():
     assert edges[0]["target"] == "0x401010"
     assert edges[0]["kind"] == "data"
     assert truncated is False
-
-
-def test_merge_analysis_graphs_deduplicates_edges():
-    left = _graph(
-        nodes=[{"id": "a", "address": "0x1"}],
-        edges=[{"source": "a", "target": "b", "kind": "xref"}],
-        warnings=["left"],
-    )
-    right = AnalysisGraph(
-        engine=AnalysisEngine.REFERENCE_FLOW,
-        fidelity="reference",
-        nodes=[{"id": "b", "address": "0x2"}],
-        edges=[{"source": "a", "target": "b", "kind": "xref"}],
-        warnings=["right"],
-        truncated=True,
-    )
-    merged = merge_analysis_graphs(left, right)
-    assert {node["id"] for node in merged.nodes} == {"a", "b"}
-    assert len(merged.edges) == 1
-    assert merged.truncated is True
-    assert merged.warnings == ["left", "right"]

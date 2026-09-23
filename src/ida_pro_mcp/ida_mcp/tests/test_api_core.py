@@ -20,15 +20,12 @@ from ..utils import Function, ConvertedNumber
 from ..api_core import (
     lookup_funcs,
     int_convert,
-    list_funcs,
-    func_query,
     list_globals,
     entity_query,
     imports,
     imports_query,
     server_health,
     server_warmup,
-    find_regex,
 )
 
 
@@ -210,74 +207,6 @@ def test_int_convert_sign_bit_sizing():
 
 
 @test()
-def test_find_regex_invalid_pattern():
-    """find_regex reports invalid regex instead of raising."""
-    result = find_regex("[")
-    assert result["n"] == 0
-    assert result["matches"] == []
-    assert result["cursor"] == {"done": True}
-    assert str(result.get("error", "")).startswith("invalid regex:")
-
-
-@test()
-def test_list_funcs_returns_non_empty_page_of_functions():
-    """list_funcs returns a non-empty page and every function round-trips through lookup_funcs."""
-    result = list_funcs({"offset": 0, "count": 10})
-    assert_is_list(result, min_length=1)
-    page = result[0]
-    assert_shape(
-        page, {"data": list_of(Function, min_length=1), "next_offset": optional(int)}
-    )
-
-    for fn in page["data"][:5]:
-        resolved = lookup_funcs(fn["addr"])
-        assert_ok(resolved[0], "fn")
-        assert resolved[0]["fn"]["addr"] == fn["addr"]
-        assert resolved[0]["fn"]["name"] == fn["name"]
-
-
-@test(binary="crackme03.elf")
-def test_list_funcs_contains_known_crackme_functions():
-    """list_funcs includes the known crackme functions main and check_pw."""
-    page = list_funcs({"filter": "*", "offset": 0, "count": 100})[0]
-    names = {fn["name"]: fn["addr"] for fn in page["data"]}
-    assert names.get("main") == CRACKME_MAIN
-    assert names.get("check_pw") == CRACKME_CHECK_PW
-
-
-@test()
-def test_list_funcs_pagination():
-    """list_funcs enforces count limits and returns a usable next_offset."""
-    page = list_funcs({"offset": 0, "count": 5})[0]
-    assert len(page["data"]) <= 5
-    if page["next_offset"] is not None:
-        next_page = list_funcs({"offset": page["next_offset"], "count": 5})[0]
-        assert next_page["data"] != page["data"]
-
-
-@test()
-def test_func_query():
-    """func_query returns richer function entries"""
-    result = func_query({})
-    assert_is_list(result, min_length=1)
-    page = result[0]
-    assert_has_keys(page, "data", "next_offset")
-    if page["data"]:
-        assert_has_keys(page["data"][0], "addr", "name", "size", "has_type")
-
-
-@test()
-def test_func_query_filters():
-    """func_query supports size/type filters"""
-    result = func_query({"min_size": 0, "max_size": 0xFFFFFFFF, "has_type": False})
-    assert_is_list(result, min_length=1)
-    page = result[0]
-    assert_has_keys(page, "data", "next_offset")
-    for fn in page["data"]:
-        assert fn["has_type"] is False
-
-
-@test()
 def test_list_globals_returns_non_empty_results_for_all_query():
     """list_globals('*') returns at least one global item."""
     page = list_globals({"filter": "*", "offset": 0, "count": 50})[0]
@@ -326,59 +255,24 @@ def test_imports_contains_printf():
 
 
 @test(binary="crackme03.elf")
-def test_find_regex_matches_known_correct_strings():
-    """find_regex('correct') returns the two known crackme result strings."""
-    result = find_regex("correct")
-    assert_shape(
-        result,
-        {
-            "n": int,
-            "matches": list_of({"addr": is_hex_address, "string": str}, min_length=1),
-            "cursor": dict,
-        },
-    )
-    by_addr = {item["addr"]: item["string"] for item in result["matches"]}
+def test_entity_query_strings_regex_case_sensitivity():
+    """entity_query string regex is case-sensitive by default; case_sensitive=false folds case."""
+    query = {"kind": "strings", "regex": "CORRECT", "count": 0}
+    assert entity_query(query)[0]["total"] == 0
+
+    page = entity_query({**query, "case_sensitive": False})[0]
+    assert page["error"] is None
+    by_addr = {row["addr"]: row["text"] for row in page["data"]}
     assert by_addr.get("0x201f") == "Yes, %s is correct!\n"
     assert by_addr.get("0x2034") == "No, %s is not correct.\n"
-    assert result["n"] >= 2
 
 
 @test()
-def test_func_query_api_core():
-    """func_query returns richer function entries"""
-    result = func_query({})
-    assert_is_list(result, min_length=1)
-    page = result[0]
-    assert_has_keys(page, "data", "next_offset")
-    if page["data"]:
-        assert_has_keys(page["data"][0], "addr", "name", "size", "has_type")
-
-
-@test()
-def test_func_query_filters_api_core():
-    """func_query supports size/type filters"""
-    result = func_query({"min_size": 0, "max_size": 0xFFFFFFFF, "has_type": False})
-    assert_is_list(result, min_length=1)
-    page = result[0]
-    assert_has_keys(page, "data", "next_offset")
-    for fn in page["data"]:
-        assert fn["has_type"] is False
-
-
-@test()
-def test_func_query_multi_query_preserves_size_sort_state():
-    """func_query should not mutate shared rows across multiple queries in one call."""
-    result = func_query(
-        [
-            {"offset": 0, "count": 1},
-            {"offset": 0, "count": 10, "sort_by": "size", "descending": True},
-        ]
-    )
-    assert_is_list(result, min_length=2)
-    second_page = result[1]
-    assert_has_keys(second_page, "data", "next_offset")
-    sizes = [int(str(item["size"]), 0) for item in second_page["data"]]
-    assert sizes == sorted(sizes, reverse=True)
+def test_entity_query_invalid_regex_reports_error():
+    """entity_query reports an invalid regex in the page error instead of raising."""
+    page = entity_query({"kind": "strings", "regex": "["})[0]
+    assert page["data"] == []
+    assert str(page["error"]).startswith("Invalid regex:")
 
 
 # ============================================================================
@@ -474,14 +368,3 @@ def test_imports_query():
     if page["data"]:
         assert_has_keys(page["data"][0], "addr", "imported_name", "module")
 
-
-# ============================================================================
-# Tests for find_regex
-# ============================================================================
-
-
-@test()
-def test_find_regex():
-    """find_regex can search for patterns"""
-    result = find_regex(".*")
-    assert_has_keys(result, "matches", "cursor")

@@ -47,7 +47,6 @@ def test_vnext_prompts_and_resources_are_registered():
         "explain_function",
         "trace_input_to_sink",
         "deobfuscate_component",
-        "compare_binaries",
         "review_patch",
         "generate_report",
     }
@@ -548,6 +547,9 @@ def _load_sync_module(
     monkeypatch.setitem(sys.modules, "ida_kernwin", ida_kernwin)
     monkeypatch.setitem(sys.modules, "ida_pro", ida_pro)
     monkeypatch.setitem(sys.modules, "idc", idc)
+    compat = types.ModuleType("_test_stub_ida_mcp.compat")
+    compat.IDA_VERSION = (9, 4, 0)
+    monkeypatch.setitem(sys.modules, "_test_stub_ida_mcp.compat", compat)
 
     if single_shot is None:
 

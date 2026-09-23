@@ -21,7 +21,6 @@ from ida_pro_mcp.vnext.jobs import JobManager
 from ida_pro_mcp.vnext.policy import CANONICAL_TOOLS, ToolPolicyRegistry, register_builtin_policies
 from ida_pro_mcp.vnext.profiles import (
     DEFAULT_PROFILE_SCOPES,
-    default_profile_enabled,
     quick_profile_selection,
 )
 from ida_pro_mcp.vnext.transactions import RevisionTracker, TransactionManager
@@ -91,12 +90,6 @@ def test_quick_profiles_bound_tools_and_scopes():
     assert modify_tools["idb_save"] is False
     assert modify_tools["debug_state"] is False
     assert modify_tools["python_execute"] is False
-    assert default_profile_enabled("mutation_commit", registry) is True
-    assert default_profile_enabled("python_execute", registry) is True
-    assert default_profile_enabled("debug_state", registry) is True
-    assert default_profile_enabled("idb_save", registry) is True
-    assert default_profile_enabled("list_funcs", registry) is True
-    assert default_profile_enabled("py_eval", registry) is True
 
     with pytest.raises(ValueError, match="Choose read, annotate, or modify"):
         quick_profile_selection("unknown", tools, registry)
@@ -167,7 +160,7 @@ def test_job_state_is_persisted_and_active_jobs_restore_as_interrupted():
 
     manager = JobManager(max_workers=1, save_state=save)
     release = threading.Event()
-    record = manager.submit("resumable", lambda _context: release.wait(2), resumable=True)
+    record = manager.submit("resumable", lambda _context: release.wait(2))
     deadline = time.monotonic() + 2
     while saved.get(record.job_id, {}).get("state") == JobState.QUEUED.value and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -359,7 +352,6 @@ def test_investigation_exports_are_deterministic():
     assert first == second
     assert "Unchecked copy" in manager.export(record.investigation_id, "markdown")
     assert '"version": "2.1.0"' in manager.export(record.investigation_id, "sarif")
-    assert manager.export(record.investigation_id, "dot").startswith("digraph")
 
 
 def test_commit_begin_called_once_and_undo_on_partial_failure():

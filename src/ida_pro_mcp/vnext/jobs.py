@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from threading import Event, RLock
 from typing import Any, Callable
@@ -65,7 +65,6 @@ class JobManager:
         callback: Callable[[JobContext], Any],
         *,
         database: str | None = None,
-        resumable: bool = False,
     ) -> JobRecord:
         with self._lock:
             self._prune_locked()
@@ -80,7 +79,6 @@ class JobManager:
                 created_at=now,
                 updated_at=now,
                 database=database,
-                resumable=resumable,
             )
             cancelled = Event()
             self._records[job_id] = record
@@ -213,7 +211,6 @@ class JobManager:
                     result=raw.get("result"),
                     error=raw.get("error"),
                     database=raw.get("database"),
-                    resumable=bool(raw.get("resumable", False)),
                     schema_version=str(raw.get("schema_version", "unknown")),
                 )
             except (TypeError, ValueError):
@@ -223,17 +220,4 @@ class JobManager:
 
     @staticmethod
     def _copy(record: JobRecord) -> JobRecord:
-        return JobRecord(**{**record.__dict__}) if hasattr(record, "__dict__") else JobRecord(
-            job_id=record.job_id,
-            kind=record.kind,
-            state=record.state,
-            created_at=record.created_at,
-            updated_at=record.updated_at,
-            progress=record.progress,
-            message=record.message,
-            result=record.result,
-            error=record.error,
-            database=record.database,
-            resumable=record.resumable,
-            schema_version=record.schema_version,
-        )
+        return replace(record)

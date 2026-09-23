@@ -55,26 +55,14 @@ def test_single_instance_keeps_unprefixed_names(discovery):
 
 
 def test_failed_tool_fetch_is_retried(monkeypatch):
-    instance = bridge_server._discovery.InstanceInfo(
-        "instance-a",
-        1,
-        "127.0.0.1",
-        13337,
-        "input.bin",
-        "input.bin",
-        "started",
-    )
+    instance = {"host": "127.0.0.1", "port": 13337, "pid": 1, "input_file": "input.bin"}
     attempts = []
     monkeypatch.setattr(
         bridge_server._discovery,
         "read_registry_dir",
         lambda _path: [instance],
     )
-    monkeypatch.setattr(
-        bridge_server._gui_discovery,
-        "get_instances_dir",
-        lambda: "unused",
-    )
+    monkeypatch.setattr(bridge_server._discovery, "get_instances_dir", lambda: "unused")
 
     def fetch(_host, _port):
         attempts.append(True)
@@ -100,15 +88,7 @@ def test_failed_tool_fetch_is_retried(monkeypatch):
 
 
 def test_force_refresh_replaces_changed_tool_schema(monkeypatch):
-    instance = bridge_server._discovery.InstanceInfo(
-        "instance-a",
-        1,
-        "127.0.0.1",
-        13337,
-        "input.bin",
-        "input.bin",
-        "started",
-    )
+    instance = {"host": "127.0.0.1", "port": 13337, "pid": 1, "input_file": "input.bin"}
     advertised = [[_tool("decompile")], [_tool("rename")]]
     changed = []
     monkeypatch.setattr(
@@ -116,7 +96,7 @@ def test_force_refresh_replaces_changed_tool_schema(monkeypatch):
         "read_registry_dir",
         lambda _path: [instance],
     )
-    monkeypatch.setattr(bridge_server._gui_discovery, "get_instances_dir", lambda: "unused")
+    monkeypatch.setattr(bridge_server._discovery, "get_instances_dir", lambda: "unused")
     monkeypatch.setattr(
         bridge_server,
         "_fetch_tools_for",
@@ -235,15 +215,11 @@ def test_tools_call_forwards_transport_session_and_bearer(monkeypatch):
 
 def test_tools_list_uses_ttl_cache(monkeypatch):
     calls = []
-    instance = bridge_server._discovery.InstanceInfo(
-        "port13337", 1, "127.0.0.1", 13337, "", "a.exe", "t",
-    )
+    instance = {"host": "127.0.0.1", "port": 13337, "pid": 1, "input_file": "a.exe"}
     monkeypatch.setattr(
         bridge_server._discovery, "read_registry_dir", lambda _path: [instance],
     )
-    monkeypatch.setattr(
-        bridge_server._gui_discovery, "get_instances_dir", lambda: "unused",
-    )
+    monkeypatch.setattr(bridge_server._discovery, "get_instances_dir", lambda: "unused")
     monkeypatch.setattr(
         bridge_server, "_fetch_tools_for", lambda _h, _p: calls.append(1) or [],
     )

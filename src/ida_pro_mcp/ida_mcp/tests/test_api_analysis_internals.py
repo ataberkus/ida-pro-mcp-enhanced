@@ -4,7 +4,6 @@ from ..framework import test, assert_non_empty
 from ..api_analysis import (
     _resolve_insn_scan_ranges,
     _scan_insn_ranges,
-    _value_to_le_bytes,
     _value_candidates_for_immediate,
 )
 
@@ -95,19 +94,7 @@ def test_internal_scan_insn_ranges_match_offset_and_truncation():
 
 @test(binary="typed_fixture.elf")
 def test_internal_immediate_encoding_helpers():
-    """Immediate-value helper paths encode positive/negative values and reject oversize inputs."""
-    data, size, normalized = _value_to_le_bytes(1234)
-    assert data == b"\xd2\x04\x00\x00"
-    assert size == 4
-    assert normalized == 1234
-
-    data, size, normalized = _value_to_le_bytes(-2)
-    assert data == b"\xfe\xff\xff\xff"
-    assert size == 4
-    assert normalized == 0xFFFFFFFE
-
-    assert _value_to_le_bytes(1 << 80) is None
-
+    """Immediate-value candidates cover 32/64-bit encodings."""
     candidates = _value_candidates_for_immediate(1234)
     assert_non_empty(candidates)
     assert any(item[0] == 1234 and item[1] == 4 for item in candidates)

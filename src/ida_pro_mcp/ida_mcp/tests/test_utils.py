@@ -20,10 +20,8 @@ from ..utils import (
     get_all_comments,
     get_callees,
     get_callers,
-    get_xrefs_from_internal,
     extract_function_strings,
     extract_function_constants,
-    handle_large_output,
 )
 
 
@@ -139,7 +137,7 @@ def test_utils_assembly_xrefs_and_comments_helpers():
 
 
 @test(binary="typed_fixture.elf")
-def test_utils_callees_callers_and_xrefs_from_helpers():
+def test_utils_callees_callers_helpers():
     """Call graph related utility helpers resolve deterministic relationships."""
     callees = get_callees("0x1013dc0")
     callee_names = {c["name"] for c in callees}
@@ -147,9 +145,6 @@ def test_utils_callees_callers_and_xrefs_from_helpers():
 
     callers = get_callers("0x1013dc0")
     assert isinstance(callers, list)
-
-    xrefs_from = get_xrefs_from_internal(0x1013F1B)
-    assert any(x["addr"] == "0x1013dc0" for x in xrefs_from)
 
 
 @test(binary="crackme03.elf")
@@ -162,14 +157,3 @@ def test_utils_extract_strings_and_constants():
     values = {c["decimal"] for c in constants}
     assert any(v != 0 for v in values)
 
-
-@test(binary="crackme03.elf")
-def test_utils_handle_large_output():
-    """Large output helper leaves small payloads inline and spills large payloads to a file reference."""
-    small = handle_large_output({"x": 1}, line_threshold=100)
-    assert small == {"x": 1}
-
-    big = handle_large_output({"lines": [str(i) for i in range(100)]}, line_threshold=3)
-    assert big["type"] == "file_reference"
-    assert "path" in big
-    assert big["line_count"] > 3

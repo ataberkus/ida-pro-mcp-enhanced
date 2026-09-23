@@ -13,21 +13,12 @@ from ..framework import (
     test,
     skip_test,
     assert_is_list,
-    assert_ok,
-    assert_error,
-    assert_valid_address,
     assert_non_empty,
-    optional,
     get_any_function,
     get_data_address,
     get_unmapped_address,
 )
-from ..api_sigmaker import (
-    make_signature,
-    make_signature_for_function,
-    make_signature_for_range,
-    find_xref_signatures,
-)
+from ..api_sigmaker import make_signature, make_signature_for_function
 from ..api_analysis import find_bytes
 
 
@@ -193,73 +184,6 @@ def test_make_signature_for_function_batch_mixed_input():
 
     # Both should resolve to different addresses (different functions)
     assert result[0]["addr"] != result[1]["addr"]
-
-
-# ============================================================================
-# make_signature_for_range
-# ============================================================================
-
-
-@test()
-def test_make_signature_for_range_valid():
-    """make_signature_for_range encodes an address range as a signature."""
-    fn_addr = get_any_function()
-    if not fn_addr:
-        skip_test("binary has no functions")
-
-    import ida_funcs
-    func = ida_funcs.get_func(int(fn_addr, 16))
-    if not func:
-        skip_test("cannot get function object")
-
-    start = hex(func.start_ea)
-    # Use a small range: first 16 bytes or function end, whichever is smaller
-    end_ea = min(func.start_ea + 16, func.end_ea)
-    end = hex(end_ea)
-
-    result = make_signature_for_range(start, end)
-    assert result["signature"] is not None
-    assert_non_empty(result["signature"])
-    assert_valid_address(result["addr"])
-
-
-@test(binary="crackme03.elf")
-def test_make_signature_for_range_crackme():
-    """make_signature_for_range works on a known crackme function range."""
-    result = make_signature_for_range("0x11a9", "0x11b9")
-    assert result["signature"] is not None
-    assert "error" not in result
-
-
-# ============================================================================
-# find_xref_signatures
-# ============================================================================
-
-
-@test(binary="crackme03.elf")
-def test_find_xref_signatures_for_string():
-    """find_xref_signatures finds signatures for xrefs to a known string address."""
-    # "Need exactly one argument." string at 0x2004
-    result = find_xref_signatures("0x2004")
-    assert_is_list(result, min_length=1)
-    entry = result[0]
-    if entry.get("signatures") and len(entry["signatures"]) > 0:
-        sig = entry["signatures"][0]
-        assert sig["signature"] is not None
-        assert sig["length"] > 0
-        assert_valid_address(sig["xref_addr"])
-
-
-@test()
-def test_find_xref_signatures_no_xrefs():
-    """find_xref_signatures returns empty list for address with no xrefs."""
-    result = find_xref_signatures(get_unmapped_address())
-    assert_is_list(result, min_length=1)
-    entry = result[0]
-    # Either error or empty signatures
-    if "error" not in entry:
-        assert entry["signatures"] is not None
-        assert entry["total_xrefs"] == 0
 
 
 # ============================================================================

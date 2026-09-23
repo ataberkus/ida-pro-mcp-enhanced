@@ -1,11 +1,11 @@
 """Binary-specific tests for tests/typed_fixture.elf."""
 
-from ..framework import test, assert_is_list, assert_ok, skip_test
-from ..api_core import lookup_funcs, find_regex, list_globals
+from ..framework import test, assert_is_list, assert_ok
+from ..api_core import lookup_funcs, entity_query, list_globals
 from ..api_analysis import (
     decompile,
     disasm,
-    xrefs_to,
+    xref_query,
     callees,
     find,
     basic_blocks,
@@ -20,15 +20,9 @@ from ..api_memory import (
     patch,
     get_bytes,
 )
-from ..api_types import search_structs, set_type, read_struct, infer_types
-from ..api_resources import (
-    struct_name_resource,
-    import_name_resource,
-    export_name_resource,
-)
+from ..api_types import type_query, set_type, read_struct, infer_types
 from ..api_modify import rename
 from ..api_stack import stack_frame
-from ..sync import IDAError
 
 
 MAIN = "0x1013ef0"
@@ -73,9 +67,9 @@ def test_typed_fixture_decompile_and_disasm():
 @test(binary="typed_fixture.elf")
 def test_typed_fixture_xrefs_and_callees():
     """typed fixture has the expected main -> use_wrapper relationship."""
-    xrefs = xrefs_to(USE_WRAPPER)
+    xrefs = xref_query({"query": USE_WRAPPER, "direction": "to"})
     assert_is_list(xrefs, min_length=1)
-    assert any(item["addr"] == CALL_USE_WRAPPER for item in xrefs[0]["xrefs"])
+    assert any(item["addr"] == CALL_USE_WRAPPER for item in xrefs[0]["data"])
 
     call_result = callees(USE_WRAPPER)
     names = {item["name"] for item in call_result[0]["callees"]}
@@ -93,9 +87,9 @@ def test_typed_fixture_find_variants():
     assert CALL_USE_WRAPPER in find("code_ref", USE_WRAPPER)[0]["matches"]
     assert data_ref[0]["count"] >= 1
 
-    regex = find_regex("typed fixture says hi")
-    assert regex["n"] >= 1
-    assert regex["matches"][0]["addr"] == G_MESSAGE
+    regex = entity_query({"kind": "strings", "regex": "typed fixture says hi"})[0]
+    assert regex["total"] >= 1
+    assert regex["data"][0]["addr"] == G_MESSAGE
 
 
 @test(binary="typed_fixture.elf")
@@ -152,12 +146,14 @@ def test_typed_fixture_put_int_roundtrip():
 
 
 @test(binary="typed_fixture.elf")
-def test_typed_fixture_struct_types_and_resources():
-    """typed fixture drives struct search, type application, auto-detected read_struct and resource lookups."""
-    point_matches = search_structs("Point")
-    wrapper_matches = search_structs("Wrapper")
-    assert any(item["name"] == "Point" for item in point_matches)
-    assert any(item["name"] == "Wrapper" for item in wrapper_matches)
+def test_typed_fixture_struct_types():
+    """typed fixture drives struct lookup, type application and auto-detected read_struct."""
+    udts = {
+        row["name"]: row
+        for row in type_query({"kind": "udt", "include_members": True, "count": 5000})[0]["data"]
+    }
+    assert "Point" in udts
+    assert "Wrapper" in udts
 
     set_point = set_type({"addr": G_POINT, "ty": "Point"})[0]
     assert set_point.get("ok") is True
@@ -167,9 +163,7 @@ def test_typed_fixture_struct_types_and_resources():
     assert members["x"].endswith("(11)")
     assert members["y"].endswith("(22)")
 
-    wrapper = struct_name_resource("Wrapper")
-    assert wrapper.get("error") is None
-    assert len(wrapper["members"]) == 2
+    assert udts["Wrapper"]["member_count"] == 2
 
     inferred = infer_types(G_POINT)[0]
     assert inferred["inferred_type"] is not None
@@ -242,23 +236,6 @@ def test_typed_fixture_infer_types_size_based_path():
     assert inferred["method"] == "size_based"
     assert inferred["confidence"] == "low"
     assert inferred["inferred_type"] == "uint8_t[12]"
-
-
-@test(binary="typed_fixture.elf")
-def test_typed_fixture_import_export_resource_views():
-    """typed fixture import/export resource lookups resolve known symbols."""
-    exp = export_name_resource("main")
-    assert exp["addr"] == MAIN
-
-    try:
-        imp = import_name_resource("printf")
-    except IDAError:
-        # Some IDA builds decorate import names differently.
-        try:
-            imp = import_name_resource("printf@GLIBC_2.2.5")
-        except IDAError:
-            skip_test("printf import name decoration differs on this IDA build")
-    assert "printf" in imp["name"]
 
 
 @test(binary="typed_fixture.elf")

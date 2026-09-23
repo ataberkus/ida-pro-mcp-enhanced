@@ -142,7 +142,6 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
         "rename",
         "declare_type",
         "set_type",
-        "type_apply_batch",
         "declare_stack",
         "delete_stack",
     }:
@@ -159,8 +158,6 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
         "make_data",
     }:
         registry.set_scope(name, SafetyScope.MODIFY, replacement="mutation_preview")
-    registry.set_scope("force_recompile", SafetyScope.MODIFY)
-    registry.set_scope("diff_before_after", SafetyScope.MODIFY)
 
     registry.register(ToolPolicy(name="mutation_preview", canonical=True))
     registry.register(
@@ -206,22 +203,12 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
         "dbg_add_bp",
         "dbg_delete_bp",
         "dbg_toggle_bp",
-        "dbg_set_bp_condition",
-        "dbg_regs_all",
-        "dbg_regs_remote",
         "dbg_regs",
-        "dbg_gpregs_remote",
-        "dbg_gpregs",
-        "dbg_regs_named_remote",
-        "dbg_regs_named",
         "dbg_stacktrace",
         "dbg_read",
         "dbg_write",
-        "debug_session",
-        "debug_control",
-        "debug_breakpoints",
-        "debug_state",
-        "debug_memory",
-        "debug_trace",
     }:
         registry.set_scope(name, SafetyScope.DEBUG, replacement="debug_session")
+    for name in CANONICAL_TOOLS:
+        if name.startswith("debug_"):
+            registry.set_scope(name, SafetyScope.DEBUG)

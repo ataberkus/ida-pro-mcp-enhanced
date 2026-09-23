@@ -5,7 +5,6 @@ import ida_hexrays
 import ida_bytes
 import ida_typeinf
 import ida_frame
-import ida_dirtree
 import ida_funcs
 import ida_name
 import ida_ua
@@ -90,87 +89,99 @@ _OP_FORMAT_FLAGS = {
 }
 
 
-@tool
-@idasync
-@unsafe
-def set_comments(items: list[CommentOp] | CommentOp):
-    """Set comments at addresses (both disassembly and decompiler views)"""
+def _comment_batch(items, append: bool) -> list[dict]:
     if isinstance(items, dict):
         items = [items]
     if not items:
         return [{"error": "Comment batch is empty; provide addr + comment"}]
 
+    apply = _append_comment if append else _set_comment
     results = []
     for item in items:
         addr_str = item.get("addr", "")
         comment = item.get("comment")
         if comment is None:
             comment = item.get("text", "")
-
         try:
-            ea = parse_address(addr_str)
-
-            if not idaapi.set_cmt(ea, comment, False):
-                results.append(
-                    {
-                        "addr": addr_str,
-                        "error": f"Failed to set disassembly comment at {hex(ea)}",
-                    }
-                )
-                continue
-
-            if not ida_hexrays.init_hexrays_plugin():
-                results.append({"addr": addr_str, "ok": True})
-                continue
-
-            try:
-                cfunc = decompile_checked(ea)
-            except IDAError:
-                results.append({"addr": addr_str, "ok": True})
-                continue
-
-            if ea == cfunc.entry_ea:
-                idc.set_func_cmt(ea, comment, True)
-                cfunc.refresh_func_ctext()
-                results.append({"addr": addr_str, "ok": True})
-                continue
-
-            eamap = cfunc.get_eamap()
-            if ea not in eamap:
-                results.append(
-                    {
-                        "addr": addr_str,
-                        "ok": True,
-                        "decompiler_comment": False, "warning": f"Disassembly comment set; decompiler comment failed at {hex(ea)}",
-                    }
-                )
-                continue
-            nearest_ea = eamap[ea][0].ea
-
-            tl = idaapi.treeloc_t()
-            tl.ea = nearest_ea
-            for itp in range(idaapi.ITP_SEMI, idaapi.ITP_COLON):
-                tl.itp = itp
-                cfunc.set_user_cmt(tl, comment)
-                cfunc.save_user_cmts()
-                cfunc.refresh_func_ctext()
-                if not cfunc.has_orphan_cmts():
-                    results.append({"addr": addr_str, "ok": True})
-                    break
-                cfunc.del_orphan_cmts()
-                cfunc.save_user_cmts()
-            else:
-                results.append(
-                    {
-                        "addr": addr_str,
-                        "ok": True,
-                        "decompiler_comment": False, "warning": f"Disassembly comment set; decompiler comment failed at {hex(ea)}",
-                    }
-                )
+            results.append({"addr": addr_str, **apply(parse_address(addr_str), comment, item)})
         except Exception as e:
             results.append({"addr": addr_str, "error": str(e)})
-
     return results
+
+
+def _set_comment(ea: int, comment: str, item: dict) -> dict:
+    if not idaapi.set_cmt(ea, comment, False):
+        return {"error": f"Failed to set disassembly comment at {hex(ea)}"}
+
+    if not ida_hexrays.init_hexrays_plugin():
+        return {"ok": True}
+
+    try:
+        cfunc = decompile_checked(ea)
+    except IDAError:
+        return {"ok": True}
+
+    if ea == cfunc.entry_ea:
+        idc.set_func_cmt(ea, comment, True)
+        cfunc.refresh_func_ctext()
+        return {"ok": True}
+
+    decompiler_failed = {
+        "ok": True,
+        "decompiler_comment": False,
+        "warning": f"Disassembly comment set; decompiler comment failed at {hex(ea)}",
+    }
+    eamap = cfunc.get_eamap()
+    if ea not in eamap:
+        return decompiler_failed
+
+    tl = idaapi.treeloc_t()
+    tl.ea = eamap[ea][0].ea
+    for itp in range(idaapi.ITP_SEMI, idaapi.ITP_COLON):
+        tl.itp = itp
+        cfunc.set_user_cmt(tl, comment)
+        cfunc.save_user_cmts()
+        cfunc.refresh_func_ctext()
+        if not cfunc.has_orphan_cmts():
+            return {"ok": True}
+        cfunc.del_orphan_cmts()
+        cfunc.save_user_cmts()
+    return decompiler_failed
+
+
+def _append_comment(ea: int, comment: str, item: dict) -> dict:
+    scope = str(item.get("scope", "auto") or "auto").lower()
+    dedupe = bool(item.get("dedupe", True))
+    if scope not in {"auto", "func", "line"}:
+        return {"error": f"Unsupported scope: {scope}"}
+
+    fn = ida_funcs.get_func(ea)
+    if scope == "func" or (scope == "auto" and fn is not None and fn.start_ea == ea):
+        if fn is None:
+            return {"error": f"No function found at {hex(ea)}"}
+        current = idc.get_func_cmt(fn.start_ea, False) or ""
+        new_comment, skipped = _append_comment_text(current, comment, dedupe=dedupe)
+        if skipped:
+            return {"ok": True, "scope": "func", "skipped": True}
+        if not idc.set_func_cmt(fn.start_ea, new_comment, False):
+            return {"error": f"Failed to set function comment at {hex(fn.start_ea)}"}
+        return {"ok": True, "scope": "func", "appended": True}
+
+    current = idaapi.get_cmt(ea, False) or ""
+    new_comment, skipped = _append_comment_text(current, comment, dedupe=dedupe)
+    if skipped:
+        return {"ok": True, "scope": "line", "skipped": True}
+    if not idaapi.set_cmt(ea, new_comment, False):
+        return {"error": f"Failed to set disassembly comment at {hex(ea)}"}
+    return {"ok": True, "scope": "line", "appended": True}
+
+
+@tool
+@idasync
+@unsafe
+def set_comments(items: list[CommentOp] | CommentOp):
+    """Set comments at addresses (both disassembly and decompiler views)"""
+    return _comment_batch(items, append=False)
 
 
 @tool
@@ -178,60 +189,7 @@ def set_comments(items: list[CommentOp] | CommentOp):
 @unsafe
 def append_comments(items: list[CommentAppendOp] | CommentAppendOp):
     """Append comments at addresses, deduping exact text by default."""
-    if isinstance(items, dict):
-        items = [items]
-    if not items:
-        return [{"error": "Comment batch is empty; provide addr + comment"}]
-
-    results = []
-    for item in items:
-        addr_str = item.get("addr", "")
-        comment = item.get("comment")
-        if comment is None:
-            comment = item.get("text", "")
-        scope = str(item.get("scope", "auto") or "auto").lower()
-        dedupe = bool(item.get("dedupe", True))
-
-        try:
-            ea = parse_address(addr_str)
-            if scope not in {"auto", "func", "line"}:
-                results.append({"addr": addr_str, "error": f"Unsupported scope: {scope}"})
-                continue
-
-            fn = ida_funcs.get_func(ea)
-            use_func_comment = scope == "func" or (scope == "auto" and fn is not None and fn.start_ea == ea)
-
-            if use_func_comment:
-                if fn is None:
-                    results.append({"addr": addr_str, "error": f"No function found at {hex(ea)}"})
-                    continue
-                target_ea = fn.start_ea
-                current = idc.get_func_cmt(target_ea, False) or ""
-                new_comment, skipped = _append_comment_text(current, comment, dedupe=dedupe)
-                if skipped:
-                    results.append({"addr": addr_str, "ok": True, "scope": "func", "skipped": True})
-                    continue
-                if not idc.set_func_cmt(target_ea, new_comment, False):
-                    results.append(
-                        {"addr": addr_str, "error": f"Failed to set function comment at {hex(target_ea)}"}
-                    )
-                    continue
-                results.append({"addr": addr_str, "ok": True, "scope": "func", "appended": True})
-                continue
-
-            current = idaapi.get_cmt(ea, False) or ""
-            new_comment, skipped = _append_comment_text(current, comment, dedupe=dedupe)
-            if skipped:
-                results.append({"addr": addr_str, "ok": True, "scope": "line", "skipped": True})
-                continue
-            if not idaapi.set_cmt(ea, new_comment, False):
-                results.append({"addr": addr_str, "error": f"Failed to set disassembly comment at {hex(ea)}"})
-                continue
-            results.append({"addr": addr_str, "ok": True, "scope": "line", "appended": True})
-        except Exception as e:
-            results.append({"addr": addr_str, "error": str(e)})
-
-    return results
+    return _comment_batch(items, append=True)
 
 
 def _append_comment_text(current: str, new_text: str, *, dedupe: bool) -> tuple[str, bool]:
@@ -297,11 +255,7 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
 @idasync
 @unsafe
 def rename(batch: RenameBatch | dict) -> dict:
-    """Batch-rename funcs/globals/locals/stack vars with dry-run options.
-
-    Successful first-time function renames are also linked under the /vibe/
-    function-tree folder (dry_run links nothing and reports dir: null).
-    """
+    """Batch-rename funcs/globals/locals/stack vars with dry-run options."""
 
     if not isinstance(batch, dict):
         return {"error": "batch must be a dict"}
@@ -326,21 +280,6 @@ def rename(batch: RenameBatch | dict) -> dict:
             return [item for item in items if isinstance(item, dict)]
         return []
 
-    def _has_user_name(ea: int) -> bool:
-        flags = idaapi.get_flags(ea)
-        checker = getattr(idaapi, "has_user_name", None)
-        if checker is not None:
-            return checker(flags)
-        try:
-            import ida_name
-
-            checker = getattr(ida_name, "has_user_name", None)
-            if checker is not None:
-                return checker(flags)
-        except Exception:
-            pass
-        return False
-
     def _set_name_checked(ea: int, new_name: str) -> tuple[bool, str | None]:
         conflict_ea = idaapi.get_name_ea(idaapi.BADADDR, new_name)
         if (
@@ -359,37 +298,6 @@ def rename(batch: RenameBatch | dict) -> dict:
         ok = idaapi.set_name(ea, new_name, flags)
         if not ok:
             return False, "Rename failed"
-        return True, None
-
-    def _place_func_in_vibe_dir(ea: int) -> tuple[bool, str | None]:
-        if dry_run:
-            return False, None
-
-        tree = ida_dirtree.get_std_dirtree(ida_dirtree.DIRTREE_FUNCS)
-        if tree is None:
-            return False, "Function dirtree not available"
-        if not tree.load():
-            return False, "Failed to load function dirtree"
-
-        vibe_path = "/vibe/"
-        if not tree.isdir(vibe_path):
-            err = tree.mkdir(vibe_path)
-            if err not in (ida_dirtree.DTE_OK, ida_dirtree.DTE_ALREADY_EXISTS):
-                return False, f"mkdir failed: {err}"
-
-        old_cwd = tree.getcwd()
-        try:
-            if tree.chdir(vibe_path) != ida_dirtree.DTE_OK:
-                return False, "Failed to chdir to vibe"
-            err = tree.link(ea)
-            if err not in (ida_dirtree.DTE_OK, ida_dirtree.DTE_ALREADY_EXISTS):
-                return False, f"link failed: {err}"
-            if not tree.save():
-                return False, "Failed to save function dirtree"
-        finally:
-            if old_cwd:
-                tree.chdir(old_cwd)
-
         return True, None
 
     def _rename_funcs(items: list[FunctionRename]) -> tuple[list[dict], bool]:
@@ -445,12 +353,7 @@ def rename(batch: RenameBatch | dict) -> dict:
                     continue
 
                 old_name = idaapi.get_name(func.start_ea) or None
-                had_user_name = _has_user_name(func.start_ea)
                 success, error = _set_name_checked(func.start_ea, str(new_name))
-
-                placed, place_error = None, None
-                if success and not dry_run and not had_user_name:
-                    placed, place_error = _place_func_in_vibe_dir(func.start_ea)
                 if success and not dry_run:
                     refresh_decompiler_ctext(func.start_ea)
 
@@ -460,8 +363,6 @@ def rename(batch: RenameBatch | dict) -> dict:
                     "name": str(new_name),
                     "ok": success,
                     "error": error,
-                    "dir": "vibe" if success and placed else None,
-                    "dir_error": place_error if success else None,
                     "dry_run": dry_run,
                 }
                 results.append(result)

@@ -49,36 +49,6 @@ class DebugControlResult(TypedDict, total=False):
     error: str
 
 
-GENERAL_PURPOSE_REGISTERS = {
-    "EAX",
-    "EBX",
-    "ECX",
-    "EDX",
-    "ESI",
-    "EDI",
-    "EBP",
-    "ESP",
-    "EIP",
-    "RAX",
-    "RBX",
-    "RCX",
-    "RDX",
-    "RSI",
-    "RDI",
-    "RBP",
-    "RSP",
-    "RIP",
-    "R8",
-    "R9",
-    "R10",
-    "R11",
-    "R12",
-    "R13",
-    "R14",
-    "R15",
-}
-
-
 def dbg_ensure_running() -> "ida_idd.debugger_t":
     dbg = ida_idd.get_dbg()
     if not dbg:
@@ -143,22 +113,6 @@ def _get_registers_for_thread(dbg: "ida_idd.debugger_t", tid: int) -> ThreadRegi
     return ThreadRegisters(
         thread_id=tid,
         registers=regs,
-    )
-
-
-def _get_registers_general_for_thread(
-    dbg: "ida_idd.debugger_t", tid: int
-) -> ThreadRegisters:
-    """Helper to get general-purpose registers for a specific thread."""
-    all_registers = _get_registers_for_thread(dbg, tid)
-    general_registers = [
-        reg
-        for reg in all_registers["registers"]
-        if reg["name"] in GENERAL_PURPOSE_REGISTERS
-    ]
-    return ThreadRegisters(
-        thread_id=tid,
-        registers=general_registers,
     )
 
 
@@ -435,132 +389,19 @@ def dbg_toggle_bp(items: list[BreakpointOp] | BreakpointOp) -> list[dict]:
 @unsafe
 @tool
 @idasync
-def dbg_regs_all() -> list[ThreadRegisters]:
-    """Return full register sets for all debugger threads."""
-    result: list[ThreadRegisters] = []
-    dbg = dbg_ensure_running()
-    for thread_index in range(ida_dbg.get_thread_qty()):
-        tid = ida_dbg.getn_thread(thread_index)
-        result.append(_get_registers_for_thread(dbg, tid))
-    return result
-
-
-@ext("dbg")
-@unsafe
-@tool
-@idasync
-def dbg_regs_remote(
-    tids: Annotated[list[int] | int, "Thread ID(s) to get registers for"],
-) -> list[dict]:
-    """Return full register sets for specified thread IDs."""
-    if isinstance(tids, int):
-        tids = [tids]
-
-    dbg = dbg_ensure_running()
-    available_tids = [ida_dbg.getn_thread(i) for i in range(ida_dbg.get_thread_qty())]
-    results = []
-
-    for tid in tids:
-        try:
-            if tid not in available_tids:
-                results.append(
-                    {"tid": tid, "regs": None, "error": f"Thread {tid} not found"}
-                )
-                continue
-            regs = _get_registers_for_thread(dbg, tid)
-            results.append({"tid": tid, "regs": regs})
-        except Exception as e:
-            results.append({"tid": tid, "regs": None, "error": str(e)})
-
-    return results
-
-
-@ext("dbg")
-@unsafe
-@tool
-@idasync
-def dbg_regs() -> ThreadRegisters:
-    """Return full registers for current debugger thread."""
-    dbg = dbg_ensure_running()
-    tid = ida_dbg.get_current_thread()
-    return _get_registers_for_thread(dbg, tid)
-
-
-@ext("dbg")
-@unsafe
-@tool
-@idasync
-def dbg_gpregs_remote(
-    tids: Annotated[list[int] | int, "Thread ID(s) to get GP registers for"],
-) -> list[dict]:
-    """Get GP registers for threads"""
-    if isinstance(tids, int):
-        tids = [tids]
-
-    dbg = dbg_ensure_running()
-    available_tids = [ida_dbg.getn_thread(i) for i in range(ida_dbg.get_thread_qty())]
-    results = []
-
-    for tid in tids:
-        try:
-            if tid not in available_tids:
-                results.append(
-                    {"tid": tid, "regs": None, "error": f"Thread {tid} not found"}
-                )
-                continue
-            regs = _get_registers_general_for_thread(dbg, tid)
-            results.append({"tid": tid, "regs": regs})
-        except Exception as e:
-            results.append({"tid": tid, "regs": None, "error": str(e)})
-
-    return results
-
-
-@ext("dbg")
-@unsafe
-@tool
-@idasync
-def dbg_gpregs() -> ThreadRegisters:
-    """Get current thread GP registers"""
-    dbg = dbg_ensure_running()
-    tid = ida_dbg.get_current_thread()
-    return _get_registers_general_for_thread(dbg, tid)
-
-
-@ext("dbg")
-@unsafe
-@tool
-@idasync
-def dbg_regs_named_remote(
-    thread_id: Annotated[int, "Thread ID"],
-    register_names: Annotated[
-        str, "Comma-separated register names (e.g., 'RAX, RBX, RCX')"
-    ],
+def dbg_regs(
+    thread: Annotated[int | None, "Thread ID (default: current thread)"] = None,
+    names: Annotated[list[str] | None, "Register names to return (default: all)"] = None,
 ) -> ThreadRegisters:
-    """Return selected registers for a specific thread ID."""
+    """Return registers for a debugger thread, optionally only the named ones."""
     dbg = dbg_ensure_running()
-    if thread_id not in [
-        ida_dbg.getn_thread(i) for i in range(ida_dbg.get_thread_qty())
-    ]:
-        raise IDAError(f"Thread with ID {thread_id} not found")
-    names = [name.strip() for name in register_names.split(",")]
-    return _get_registers_specific_for_thread(dbg, thread_id, names)
-
-
-@ext("dbg")
-@unsafe
-@tool
-@idasync
-def dbg_regs_named(
-    register_names: Annotated[
-        str, "Comma-separated register names (e.g., 'RAX, RBX, RCX')"
-    ],
-) -> ThreadRegisters:
-    """Get specific current thread registers"""
-    dbg = dbg_ensure_running()
-    tid = ida_dbg.get_current_thread()
-    names = [name.strip() for name in register_names.split(",")]
-    return _get_registers_specific_for_thread(dbg, tid, names)
+    if thread is None:
+        thread = ida_dbg.get_current_thread()
+    elif thread not in [ida_dbg.getn_thread(i) for i in range(ida_dbg.get_thread_qty())]:
+        raise IDAError(f"Thread with ID {thread} not found")
+    if names:
+        return _get_registers_specific_for_thread(dbg, thread, names)
+    return _get_registers_for_thread(dbg, thread)
 
 
 # ============================================================================

@@ -21,17 +21,6 @@ QUICK_PROFILE_SCOPES: dict[str, frozenset[SafetyScope]] = {
 }
 
 
-def default_profile_enabled(name: str, policy_registry: ToolPolicyRegistry) -> bool:
-    """Return whether *name* is enabled on a new install.
-
-    The default profile is allow-all. Bounded subsets are the Read / Annotate /
-    Modify quick profiles, not the first-run selection.
-    """
-
-    del name, policy_registry
-    return True
-
-
 def quick_profile_selection(
     profile_name: str,
     tools: Mapping[str, object],

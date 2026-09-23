@@ -62,11 +62,6 @@ IDB_OPEN_MODES = {
     "force_gui",
 }
 
-IDB_MANAGEMENT_TOOLS = {
-    "idb_open",
-    "idb_list",
-    "idb_close",
-}
 WORKER_TCP_HEALTH_TIMEOUT_SEC = 0.5
 WORKER_RPC_HEALTH_TIMEOUT_SEC = 2.0
 PARTIAL_DATABASE_EXTENSIONS = (".id0", ".id1", ".id2", ".nam", ".til")
@@ -133,6 +128,7 @@ def _import_discovery():
 
 
 _discovery = _import_discovery()
+IDB_MANAGEMENT_TOOLS = _discovery.IDB_MANAGEMENT_TOOLS
 
 
 def _discovered_instance_backend(instance: dict[str, Any]) -> str:

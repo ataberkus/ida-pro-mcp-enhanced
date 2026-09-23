@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from threading import RLock
 from typing import Any
 
@@ -59,9 +57,8 @@ class AuditRecord:
 
 
 class AuditLog:
-    def __init__(self, *, capacity: int = 1000, jsonl_path: Path | None = None) -> None:
+    def __init__(self, *, capacity: int = 1000) -> None:
         self._records: deque[AuditRecord] = deque(maxlen=max(1, capacity))
-        self._jsonl_path = jsonl_path
         self._lock = RLock()
 
     def append(
@@ -87,10 +84,6 @@ class AuditLog:
         )
         with self._lock:
             self._records.append(record)
-            if self._jsonl_path is not None:
-                self._jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-                with self._jsonl_path.open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(asdict(record), sort_keys=True) + "\n")
         return record
 
     def records(self) -> list[dict[str, Any]]:

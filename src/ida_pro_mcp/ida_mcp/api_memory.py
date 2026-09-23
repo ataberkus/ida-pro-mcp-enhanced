@@ -50,13 +50,7 @@ def _read_mapped_bytes(addr: str | int, size: int) -> bytes:
     if size <= 0:
         raise ValueError("Read size must be positive")
     ea = _resolve_read_address(addr)
-    end_ea = ea + size
-    cursor = ea
-    while cursor < end_ea:
-        segment = compat.get_segment_info(cursor)
-        if segment is None:
-            raise ValueError(f"Address range is not mapped: {addr}")
-        cursor = min(end_ea, segment.end_ea)
+    _require_mapped_range(ea, size, str(addr))
     data = ida_bytes.get_bytes(ea, size)
     if data is None or len(data) != size:
         raise ValueError(f"Failed to read {size} bytes at {addr}")

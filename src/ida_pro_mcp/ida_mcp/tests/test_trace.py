@@ -47,16 +47,16 @@ def _read_stats() -> dict[str, int]:
             "total_records": 0,
         }
     segments = 0
-    i = node.altfirst(trace._TAG_INDEX)
+    i = node.altfirst(trace.TAG_INDEX)
     while i != ida_netnode.BADNODE:
         segments += 1
-        i = node.altnext(i, trace._TAG_INDEX)
+        i = node.altnext(i, trace.TAG_INDEX)
     return {
-        "version": node.altval(trace._META_VERSION, trace._TAG_META),
+        "version": node.altval(trace._META_VERSION, trace.TAG_META),
         "segments": segments,
-        "next_chunk_start": node.altval(trace._META_NEXT_CHUNK, trace._TAG_META),
-        "next_segment_id": node.altval(trace._META_NEXT_SEG_ID, trace._TAG_META),
-        "total_records": node.altval(trace._META_TOTAL_RECORDS, trace._TAG_META),
+        "next_chunk_start": node.altval(trace._META_NEXT_CHUNK, trace.TAG_META),
+        "next_segment_id": node.altval(trace._META_NEXT_SEG_ID, trace.TAG_META),
+        "total_records": node.altval(trace._META_TOTAL_RECORDS, trace.TAG_META),
     }
 
 

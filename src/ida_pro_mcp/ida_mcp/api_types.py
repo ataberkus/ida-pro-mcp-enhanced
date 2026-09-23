@@ -25,7 +25,6 @@ from .utils import (
     TypeEdit,
     TypeInspectQuery,
     TypeQuery,
-    TypeApplyBatch,
     EnumUpsert,
 )
 from . import compat
@@ -390,45 +389,6 @@ def read_struct(queries: list[StructRead] | StructRead) -> list[dict]:
     return results
 
 
-@tool
-@idasync
-def search_structs(
-    filter: Annotated[
-        str, "Case-insensitive substring to search for in structure names"
-    ],
-) -> list[dict]:
-    """Search local structs/unions by name pattern."""
-    results = []
-    limit = compat.get_ordinal_limit()
-
-    for ordinal in range(1, limit):
-        tif = ida_typeinf.tinfo_t()
-        if tif.get_numbered_type(None, ordinal):
-            type_name: str = tif.get_type_name()
-            if type_name and filter.lower() in type_name.lower():
-                if tif.is_udt():
-                    udt_data = ida_typeinf.udt_type_data_t()
-                    cardinality = 0
-                    if tif.get_udt_details(udt_data):
-                        cardinality = udt_data.size()
-
-                    results.append(
-                        {
-                            "name": type_name,
-                            "size": tif.get_size(),
-                            "cardinality": cardinality,
-                            "is_union": (
-                                udt_data.is_union
-                                if tif.get_udt_details(udt_data)
-                                else False
-                            ),
-                            "ordinal": ordinal,
-                        }
-                    )
-
-    return results
-
-
 def _type_kind(tif: ida_typeinf.tinfo_t) -> str:
     try:
         if tif.is_enum():
@@ -757,73 +717,41 @@ def _resolve_type_text(edit: dict) -> str:
     ).strip()
 
 
-def _parse_type_tinfo(type_text: str) -> ida_typeinf.tinfo_t:
+def _parse_tinfo(type_text: str, func: bool = False) -> ida_typeinf.tinfo_t:
+    """Parse a type declaration; with ``func`` only a function type is accepted."""
     text = type_text.strip()
     if not text:
-        raise ValueError("Type text is required")
+        raise ValueError("Function signature is required" if func else "Type text is required")
+
+    def usable(tif: ida_typeinf.tinfo_t) -> bool:
+        return tif.is_func() if func else not tif.empty()
 
     # Fast path for common type aliases and named types.
     try:
-        return get_type_by_name(text)
+        tif = get_type_by_name(text)
+        if usable(tif):
+            return tif
     except Exception:
         pass
 
     flags = ida_typeinf.PT_SIL | ida_typeinf.PT_TYP
-    parse_decl = getattr(ida_typeinf, "parse_decl", None)
-    if callable(parse_decl):
-        candidates = [text]
-        if not text.endswith(";"):
-            candidates.append(text + ";")
-        for candidate in candidates:
-            tif = ida_typeinf.tinfo_t()
-            try:
-                if parse_decl(tif, None, candidate, flags):
-                    return tif
-            except Exception:
-                continue
+    for candidate in (text,) if text.endswith(";") else (text, text + ";"):
+        tif = ida_typeinf.tinfo_t()
+        try:
+            if ida_typeinf.parse_decl(tif, None, candidate, flags) and usable(tif):
+                return tif
+        except Exception:
+            continue
 
     # Legacy constructor fallback.
     try:
         tif = ida_typeinf.tinfo_t(text, None, ida_typeinf.PT_SIL)
-        empty = getattr(tif, "empty", None)
-        if callable(empty):
-            if not empty():
-                return tif
-        else:
+        if usable(tif):
             return tif
     except Exception:
         pass
 
-    raise ValueError(f"Unable to parse type: {text}")
-
-
-def _parse_function_tinfo(signature_text: str) -> ida_typeinf.tinfo_t:
-    text = signature_text.strip()
-    if not text:
-        raise ValueError("Function signature is required")
-
-    flags = ida_typeinf.PT_SIL | ida_typeinf.PT_TYP
-    parse_decl = getattr(ida_typeinf, "parse_decl", None)
-    if callable(parse_decl):
-        candidates = [text]
-        if not text.endswith(";"):
-            candidates.append(text + ";")
-        for candidate in candidates:
-            tif = ida_typeinf.tinfo_t()
-            try:
-                if parse_decl(tif, None, candidate, flags) and tif.is_func():
-                    return tif
-            except Exception:
-                continue
-
-    try:
-        tif = ida_typeinf.tinfo_t(text, None, ida_typeinf.PT_SIL)
-        if tif.is_func():
-            return tif
-    except Exception:
-        pass
-
-    raise ValueError(f"Not a function type: {text}")
+    raise ValueError(f"Not a function type: {text}" if func else f"Unable to parse type: {text}")
 
 
 def _infer_type_edit_kind(edit: dict) -> str:
@@ -865,7 +793,7 @@ def _apply_type_edit(edit: dict) -> dict:
                 return {"edit": edit, "kind": kind, "error": "Function not found"}
 
             signature = str(edit.get("signature") or type_text).strip()
-            tif = _parse_function_tinfo(signature)
+            tif = _parse_tinfo(signature, func=True)
             ok = ida_typeinf.apply_tinfo(func.start_ea, tif, ida_typeinf.PT_SIL)
             return {
                 "edit": edit,
@@ -889,7 +817,7 @@ def _apply_type_edit(edit: dict) -> dict:
                     }
                 ea = parse_address(addr_text)
 
-            tif = _parse_type_tinfo(type_text)
+            tif = _parse_tinfo(type_text)
             ok = ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.PT_SIL)
             return {
                 "edit": edit,
@@ -910,7 +838,7 @@ def _apply_type_edit(edit: dict) -> dict:
             if not func:
                 return {"edit": edit, "kind": kind, "error": "Function not found"}
 
-            new_tif = _parse_type_tinfo(type_text)
+            new_tif = _parse_tinfo(type_text)
             modifier = my_modifier_t(var_name, new_tif)
             ok = ida_hexrays.modify_user_lvars(func.start_ea, modifier)
             return {
@@ -949,7 +877,7 @@ def _apply_type_edit(edit: dict) -> dict:
             frame_tif.get_udm_by_tid(udm, tid)
             offset = udm.offset // 8
 
-            tif = _parse_type_tinfo(type_text)
+            tif = _parse_tinfo(type_text)
             ok = ida_frame.set_frame_member_type(func, offset, tif)
             return {
                 "edit": edit,
@@ -970,43 +898,6 @@ def set_type(edits: list[TypeEdit] | TypeEdit) -> list[dict]:
     """Apply types (function/global/local/stack)"""
     normalized_edits = normalize_dict_list(edits, _parse_addr_type_shorthand)
     return [_apply_type_edit(edit) for edit in normalized_edits]
-
-
-@tool
-@idasync
-@unsafe
-def type_apply_batch(
-    batch: Annotated[
-        TypeApplyBatch | list[TypeEdit] | TypeEdit,
-        "Batch type edits with optional stop_on_error behavior",
-    ],
-) -> dict:
-    """Apply multiple type edits and return aggregate status."""
-    if isinstance(batch, dict) and "edits" in batch:
-        normalized_edits = normalize_dict_list(
-            batch.get("edits", []), _parse_addr_type_shorthand
-        )
-        stop_on_error = bool(batch.get("stop_on_error", False))
-    else:
-        normalized_edits = normalize_dict_list(batch, _parse_addr_type_shorthand)
-        stop_on_error = False
-
-    results: list[dict] = []
-    for edit in normalized_edits:
-        result = _apply_type_edit(edit)
-        results.append(result)
-        if stop_on_error and result.get("error"):
-            break
-
-    failed = sum(1 for r in results if r.get("error"))
-    applied = sum(1 for r in results if r.get("ok"))
-    return {
-        "ok": failed == 0,
-        "applied": applied,
-        "failed": failed,
-        "stopped": stop_on_error and failed > 0,
-        "results": results,
-    }
 
 
 @tool

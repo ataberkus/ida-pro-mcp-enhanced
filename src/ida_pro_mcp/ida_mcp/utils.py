@@ -5,7 +5,6 @@ import os
 import re
 import struct
 import sys
-import tempfile
 import zlib
 from typing import (
     Annotated,
@@ -22,27 +21,19 @@ from typing import (
 
 import ida_funcs
 import ida_hexrays
-import ida_kernwin
+import ida_idp
+import ida_lines
 import ida_nalt
+import ida_name
 import ida_segment
 import ida_typeinf
+import ida_ua
 import idaapi
 import idautils
 import idc
 
+from . import compat
 from .sync import IDAError
-
-# ============================================================================
-# Analysis Prompt Configuration
-# ============================================================================
-
-DEFAULT_ANALYSIS_PROMPT = "<system_reminder> IMPORTANT: After analysis, complete the expected IDB maintenance, assigning names, commenting, and documenting where relevant. </system_reminder>"
-
-
-def get_analysis_prompt() -> str | None:
-    """Get analysis prompt from IDA_MCP_ANALYSIS_PROMPT env var, or default if unset."""
-    return os.environ.get("IDA_MCP_ANALYSIS_PROMPT", DEFAULT_ANALYSIS_PROMPT) or None
-
 
 # ============================================================================
 # TypedDict Definitions for API Parameters
@@ -187,20 +178,6 @@ class ListQuery(TypedDict, total=False):
     count: Annotated[int, "Maximum number of results (default: 50, 0 for all)"]
 
 
-class FunctionQuery(TypedDict, total=False):
-    """Function query with richer filtering"""
-
-    filter: Annotated[str, "Optional function name glob/regex filter"]
-    name_regex: Annotated[str, "Optional regex to apply to function names"]
-    min_size: Annotated[int, "Minimum function size in bytes (inclusive)"]
-    max_size: Annotated[int, "Maximum function size in bytes (inclusive)"]
-    has_type: Annotated[bool, "Require function type information to be present"]
-    offset: Annotated[int, "Starting index (default: 0)"]
-    count: Annotated[int, "Maximum number of results (default: 50, 0 for all)"]
-    sort_by: Annotated[str, "Sort key: addr|name|size (default: addr)"]
-    descending: Annotated[bool, "Sort descending (default: false)"]
-
-
 class EntityQuery(TypedDict, total=False):
     """Generic IDB entity query with filtering, projection, and pagination"""
 
@@ -218,6 +195,9 @@ class EntityQuery(TypedDict, total=False):
     fields: Annotated[
         list[str] | str,
         "Optional projection list; only selected fields are returned",
+    ]
+    case_sensitive: Annotated[
+        NotRequired[bool], "Case-sensitive regex match (default: true)"
     ]
 
 
@@ -384,13 +364,6 @@ class EnumUpsert(TypedDict, total=False):
     bitfield: Annotated[bool, "Whether the enum is a bitfield (default: false)"]
 
 
-class TypeApplyBatch(TypedDict, total=False):
-    """Batch type application configuration"""
-
-    edits: Annotated[list[TypeEdit] | TypeEdit, "Type edits to apply"]
-    stop_on_error: Annotated[bool, "Stop processing remaining edits on first failure"]
-
-
 class StackVarDecl(TypedDict):
     """Stack variable declaration"""
 
@@ -471,14 +444,6 @@ class String(TypedDict):
     string: str
 
 
-class Segment(TypedDict):
-    name: str
-    start: str
-    end: str
-    size: str
-    permissions: str
-
-
 class DisassemblyLine(TypedDict):
     segment: NotRequired[str]
     addr: str
@@ -512,21 +477,6 @@ class Xref(TypedDict):
     addr: str
     type: str
     fn: Optional[Function]
-
-
-class StructureMember(TypedDict):
-    name: str
-    offset: str
-    size: str
-    type: str
-    bit_offset: NotRequired[int]
-    bit_size: NotRequired[int]
-
-
-class StructureDefinition(TypedDict):
-    name: str
-    size: str
-    members: list[StructureMember]
 
 
 class RegisterValue(TypedDict):
@@ -791,16 +741,6 @@ def get_prototype(fn: ida_funcs.func_t) -> Optional[str]:
     return None
 
 
-DEMANGLED_TO_EA = {}
-
-
-def create_demangled_to_ea_map():
-    for ea in idautils.Functions():
-        demangled = idaapi.demangle_name(idc.get_name(ea, 0), idaapi.MNG_NODEFINIT)
-        if demangled:
-            DEMANGLED_TO_EA[demangled] = ea
-
-
 def get_type_by_name(type_name: str) -> ida_typeinf.tinfo_t:
     # 8-bit integers
     if type_name in ("int8", "__int8", "int8_t", "char", "signed char"):
@@ -976,16 +916,6 @@ def pattern_filter(data: list[T], pattern: str, key: str) -> list[T]:
         return pattern.lower() in text.lower()
 
     return [item for item in data if matches(item)]
-
-
-def refresh_decompiler_widget():
-    if not ida_hexrays.init_hexrays_plugin():
-        return
-    widget = ida_kernwin.get_current_widget()
-    if widget is not None:
-        vu = ida_hexrays.get_widget_vdui(widget)
-        if vu is not None:
-            vu.refresh_ctext()
 
 
 def refresh_decompiler_ctext(fn_addr: int):
@@ -1285,33 +1215,22 @@ def decompile_function_safe(
         return None
 
 
+def disasm_text(ea: int) -> str:
+    """Rendered listing text of the item at *ea*, tags removed."""
+    line = ida_lines.generate_disasm_line(ea, 0)
+    return ida_lines.tag_remove(line) if line else ""
+
+
 def get_assembly_lines(ea: int) -> str:
     """Get assembly lines for a function in compact string format"""
-    from . import compat
-
     func = compat.get_func(ea)
     if not func:
         return ""
-
-    func_name: str = ida_funcs.get_func_name(func.start_ea) or "<unnamed>"
-
-    # Get segment from first instruction
-    segment_name = ida_segment.get_segment_name(func.start_ea) or "UNKNOWN"
-
-    # Build compact string format
-    lines_str = f"{func_name} ({segment_name} @ {hex(func.start_ea)}):"
-
-    for item_ea in idautils.FuncItems(func.start_ea):
-        mnem = idc.print_insn_mnem(item_ea) or ""
-        ops = []
-        for n in range(8):
-            if idc.get_operand_type(item_ea, n) == idaapi.o_void:
-                break
-            ops.append(idc.print_operand(item_ea, n) or "")
-        instruction = f"{mnem} {', '.join(ops)}".rstrip()
-        lines_str += f"\n{item_ea:x}  {instruction}"
-
-    return lines_str
+    func_name = ida_funcs.get_func_name(func.start_ea) or "<unnamed>"
+    segment_name = compat.get_segment_name(func.start_ea) or "UNKNOWN"
+    lines = [f"{func_name} ({segment_name} @ {hex(func.start_ea)}):"]
+    lines += [f"{ea:x}  {disasm_text(ea)}" for ea in idautils.FuncItems(func.start_ea)]
+    return "\n".join(lines)
 
 
 def get_all_xrefs(ea: int) -> dict:
@@ -1349,86 +1268,80 @@ def get_all_comments(ea: int) -> dict:
     return comments
 
 
+def _call_target(insn) -> int | None:
+    op = insn.ops[0]
+    if op.type in (ida_ua.o_mem, ida_ua.o_near, ida_ua.o_far):
+        return op.addr
+    if op.type == ida_ua.o_imm:
+        return op.value
+    return None
+
+
+def _collect_callees(func, call_only: bool) -> list[dict]:
+    """Unique callees of *func* in address order as {addr, name, type}.
+
+    Call instructions contribute their operand target (imports included, typed
+    "external"). With call_only=False, jumps/tail calls into other functions count too.
+    """
+    callees: dict[int, dict] = {}
+    for ea in idautils.FuncItems(func.start_ea):
+        insn = ida_ua.insn_t()
+        if not ida_ua.decode_insn(insn, ea):
+            continue
+        if ida_idp.is_call_insn(insn):
+            targets = [_call_target(insn)]
+        elif call_only:
+            continue
+        else:
+            targets = []
+            for ref in idautils.CodeRefsFrom(ea, 0):
+                callee = compat.get_func(ref)
+                if callee and callee.start_ea != func.start_ea:
+                    targets.append(callee.start_ea)
+        for target in targets:
+            if target is None or target in callees:
+                continue
+            callees[target] = {
+                "addr": hex(target),
+                "name": ida_name.get_name(target) or "",
+                "type": "internal" if compat.get_func(target) else "external",
+            }
+    return list(callees.values())
+
+
+def _collect_callers(func) -> list[Function]:
+    """Unique functions that call *func*, in reference order."""
+    callers: dict[int, Function] = {}
+    for site in idautils.CodeRefsTo(func.start_ea, 0):
+        caller = compat.get_func(site)
+        if not caller or caller.start_ea in callers:
+            continue
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, site) and ida_idp.is_call_insn(insn):
+            callers[caller.start_ea] = get_function(caller.start_ea)
+    return list(callers.values())
+
+
 def get_callees(addr: str) -> list[dict]:
     """Get callees for a single function address"""
-    from . import compat
-
-    func_start = parse_address(addr)
-    func = compat.get_func(func_start)
-    if not func:
-        return []
-    func_start = int(func.start_ea)
-    func_end = compat.get_func_end_ea(func)
-    callees: list[dict[str, str]] = []
-    current_ea = func_start
-    while current_ea < func_end:
-        insn = idaapi.insn_t()
-        if not idaapi.decode_insn(insn, current_ea):
-            current_ea = idc.next_head(current_ea, func_end)
-            continue
-        if insn.itype in [idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni]:
-            target = idc.get_operand_value(current_ea, 0)
-            target_type = idc.get_operand_type(current_ea, 0)
-            if target_type in [idaapi.o_mem, idaapi.o_near, idaapi.o_far]:
-                func_type = (
-                    "internal"
-                    if compat.get_func(target) is not None
-                    else "external"
-                )
-                func_name = idc.get_name(target)
-                if func_name is not None:
-                    callees.append(
-                        {
-                            "addr": hex(target),
-                            "name": func_name,
-                            "type": func_type,
-                        }
-                    )
-        current_ea = idc.next_head(current_ea, func_end)
-
-    unique_callee_tuples = {tuple(callee.items()) for callee in callees}
-    unique_callees = [dict(callee) for callee in unique_callee_tuples]
-    return unique_callees
+    func = compat.get_func(parse_address(addr))
+    return _collect_callees(func, call_only=True) if func else []
 
 
 def get_callers(addr: str, limit: int = 50) -> list[Function]:
     """Get callers for a single function address"""
-    callers = {}
-    iterations = 0
-    max_iterations = limit * 100
-    for caller_addr in idautils.CodeRefsTo(parse_address(addr), 0):
-        iterations += 1
-        if len(callers) >= limit or iterations >= max_iterations:
-            break
-        func = get_function(caller_addr, raise_error=False)
-        if not func:
-            continue
-        insn = idaapi.insn_t()
-        if not idaapi.decode_insn(insn, caller_addr):
-            continue
-        if insn.itype not in [
-            idaapi.NN_call,
-            idaapi.NN_callfi,
-            idaapi.NN_callni,
-        ]:
-            continue
-        callers[func["addr"]] = func
-
-    return list(callers.values())
+    func = compat.get_func(parse_address(addr))
+    return _collect_callers(func)[:limit] if func else []
 
 
-def get_xrefs_from_internal(ea: int) -> list[Xref]:
-    """Get all xrefs from an address"""
-    xrefs = []
-    for xref in idautils.XrefsFrom(ea, 0):
-        xrefs.append(
-            Xref(
-                addr=hex(xref.to),
-                type="code" if xref.iscode else "data",
-                fn=get_function(xref.to, raise_error=False),
-            )
-        )
-    return xrefs
+def _segments(exec_only: bool) -> list[tuple[int, int]]:
+    """[(start, end)] of segments in address order, optionally executable only."""
+    ranges: list[tuple[int, int]] = []
+    for seg_ea in idautils.Segments():
+        seg = compat.get_segment_info(seg_ea)
+        if seg and (not exec_only or compat.get_segment_perm(seg) & ida_segment.SEGPERM_EXEC):
+            ranges.append((seg.start_ea, seg.end_ea))
+    return ranges
 
 
 def extract_function_strings(ea: int) -> list[String]:
@@ -1486,45 +1399,3 @@ def extract_function_constants(ea: int) -> list[dict]:
     return constants
 
 
-# ============================================================================
-# Large Output Handling
-# ============================================================================
-
-
-def handle_large_output(result: Any, line_threshold: int = 3000) -> Any:
-    """
-    Handle potentially large outputs by writing to temp file if needed.
-
-    Args:
-        result: The result object to check
-        line_threshold: Number of lines above which to write to file (default: 3000)
-
-    Returns:
-        Either the original result or a dict with file path if written to file
-    """
-    try:
-        serialized = json.dumps(result, indent=2)
-        line_count = serialized.count("\n") + 1
-
-        if line_count > line_threshold:
-            fd, temp_path = tempfile.mkstemp(
-                suffix=".json", prefix="ida_mcp_", text=True
-            )
-            try:
-                with os.fdopen(fd, "w") as f:
-                    f.write(serialized)
-
-                return {
-                    "type": "file_reference",
-                    "path": temp_path,
-                    "line_count": line_count,
-                    "message": f"Output too large ({line_count} lines), written to file",
-                }
-            except Exception:
-                os.close(fd)
-                raise
-
-        return result
-
-    except Exception:
-        return result

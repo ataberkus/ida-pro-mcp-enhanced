@@ -318,7 +318,7 @@ def survey_binary(
     segment layout, entry points, statistics, top 15 strings and functions ranked
     by xref count (functions include classification: thunk/wrapper/leaf/dispatcher/
     complex), imports by category, and call graph summary. Use this as your FIRST
-    tool call when starting analysis. Do not call list_funcs, imports, or find_regex
+    tool call when starting analysis. Do not call entity_query, imports, or search
     separately for triage — this returns all of that. Use detail_level='minimal'
     for binaries with >10k functions."""
     import idautils
