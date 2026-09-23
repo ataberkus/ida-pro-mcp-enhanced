@@ -10,7 +10,7 @@ Build command recorded for a future from-source fixture rebuild:
 from ..api_core import entity_query
 from ..api_memory import get_bytes, patch
 from ..api_vnext import memory_read
-from ..framework import assert_is_list, skip_test, test
+from ..framework import assert_has_keys, assert_is_list, assert_valid_address, skip_test, test
 
 
 @test(binary="typed_fixture.elf")
@@ -99,9 +99,30 @@ def test_recovery_patch_roundtrip_lists_and_diffs():
 
 
 @test()
-def test_recovery_classes_placeholder_c2():
-    """C2 fills collect_classes; this placeholder tracks the contract."""
-    skip_test("C2: RTTI / vtable recovery not implemented")
+def test_recovery_classes_shape_or_skip():
+    """entity_query(kind="classes") recovers RTTI rows; skips when the binary has none."""
+    import ida_funcs
+
+    page = entity_query({"kind": "classes", "count": 0})[0]
+    assert page["error"] is None, f"classes query failed: {page['error']}"
+    rows = page["data"]
+    if not rows:
+        skip_test("no RTTI")
+    assert_is_list(rows, min_length=1)
+    for row in rows:
+        assert_has_keys(row, "addr", "name", "abi", "bases", "slots")
+        assert_valid_address(row["addr"])
+        assert row["abi"] in ("msvc", "itanium"), f"bad abi: {row['abi']!r}"
+        assert_is_list(row["bases"])
+        assert_is_list(row["slots"], min_length=1)
+        first = int(row["slots"][0]["addr"], 16)
+        func = ida_funcs.get_func(first)
+        assert func is not None and int(func.start_ea) == first, (
+            f"first slot {row['slots'][0]['addr']} of {row['name']!r} is not a function start"
+        )
+    vpage = entity_query({"kind": "vtables", "count": 0})[0]
+    assert vpage["error"] is None, f"vtables query failed: {vpage['error']}"
+    assert [r["addr"] for r in vpage["data"]] == [r["addr"] for r in rows]
 
 
 @test()
