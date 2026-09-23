@@ -1,16 +1,15 @@
-"""Switch-table, patch, RTTI/class, and FLIRT/TIL enumeration (Phase C module).
+"""Switch-table, patch, RTTI/class, FLIRT/TIL, and similarity enumeration (Phase C module).
 
 Pure collectors called on the IDA main thread via ``entity_query``'s
 existing ``@idasync`` path. Rows carry an ``"addr"`` hex-string key so the
 filter/sort/paginate pipeline applies unchanged.
-
-Remaining stub: ``similar_functions`` (task C4).
 """
 
 from __future__ import annotations
 
+from itertools import islice
+
 import os
-from typing import Annotated, Any
 
 import ida_auto
 import ida_bytes
@@ -21,6 +20,7 @@ import ida_name
 import ida_nalt
 import ida_segment
 import ida_typeinf
+import ida_ua
 import ida_xref
 import idaapi
 import idautils
@@ -33,9 +33,17 @@ from .sync import idasync
 from .utils import normalize_dict_list, parse_address, resolve_address_or_name
 
 
-def _not_supported(what: str) -> VNextError:
-    allowed = "switches, patches, classes, vtables, signatures, type_libraries"
-    return VNextError(ErrorCode.NOT_SUPPORTED, f"{what} is not implemented yet. Allowed: {allowed}")
+def _mnemonics(start_ea: int, cap: int) -> list[str]:
+    """Mnemonic per instruction head, capped so one giant function cannot stall the scan."""
+    mnems: list[str] = []
+    for item_ea in islice(idautils.FuncItems(start_ea), cap):
+        try:
+            mnem = ida_ua.print_insn_mnem(int(item_ea))
+        except Exception:
+            continue
+        if mnem:
+            mnems.append(str(mnem))
+    return mnems
 
 
 def collect_switches(func_eas: list[int] | None = None) -> list[dict]:
@@ -664,8 +672,48 @@ def collect_type_libraries() -> list[dict]:
     return rows
 
 
-def _stub_similar_functions(ea: int, limit: int, min_score: float) -> list[dict]:
-    raise _not_supported("similar_functions")
+def _trigrams(mnems: list[str]) -> set[tuple[str, ...]]:
+    return {tuple(mnems[i : i + 3]) for i in range(len(mnems) - 2)} if len(mnems) >= 3 else set()
+
+
+def similar_functions(ea: int, limit: int = 20, min_score: float = 0.3) -> list[dict]:
+    """Rank functions by mnemonic 3-gram Jaccard against the query function.
+
+    Per-function cost is bounded at 2000 instructions; the query function itself
+    always scores 1.0 and sorts first.
+    """
+    # ponytail: O(n) scan per query, MinHash/LSH index if slow on large IDBs
+    query = compat.get_func(int(ea))
+    if query is None:
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"Not a function: {int(ea):#x}")
+    cap = 2000
+    query_start = int(query.start_ea)
+    query_mnems = _mnemonics(query_start, cap)
+    query_grams = _trigrams(query_mnems)
+    query_count = len(query_mnems)
+    rows: list[dict] = []
+    for cand_ea in idautils.Functions():
+        cand_ea = int(cand_ea)
+        if compat.get_func(cand_ea) is None:
+            continue
+        mnems = query_mnems if cand_ea == query_start else _mnemonics(cand_ea, cap)
+        count = len(mnems)
+        if cand_ea == query_start:
+            rows.append({"addr": hex(cand_ea), "name": ida_funcs.get_func_name(cand_ea) or "", "score": 1.0, "insn_count": count})
+            continue
+        if not query_count or not count or count < query_count * 0.5 or count > query_count * 2:
+            continue
+        other = _trigrams(mnems)
+        if not query_grams and not other:
+            score = 1.0 if mnems == query_mnems else 0.0
+        elif not query_grams or not other:
+            score = 0.0
+        else:
+            score = len(query_grams & other) / len(query_grams | other)
+        if score >= float(min_score):
+            rows.append({"addr": hex(cand_ea), "name": ida_funcs.get_func_name(cand_ea) or "", "score": score, "insn_count": count})
+    rows.sort(key=lambda row: row["score"], reverse=True)
+    return rows[: max(0, int(limit))]
 
 
 def apply_flirt(name: str) -> dict:
@@ -715,10 +763,6 @@ def load_til(name: str) -> dict:
         raise VNextError(ErrorCode.INVALID_OPERATION, f"Failed to load type library {short!r} (result {result})")
     return {"name": short, "loaded": True}
 
-
-# Canonical collector name reserved for C4. The module-level alias keeps one
-# public spelling so the later task fills the implementation in place.
-similar_functions = _stub_similar_functions
 
 
 @tool

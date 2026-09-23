@@ -73,7 +73,7 @@ except ImportError:
 # constraints; bodies still `.lower()` for case-insensitive callers.
 SearchKind = Literal["text", "regex", "bytes", "constant", "instruction"]
 MemoryReadKind = Literal["bytes", "integer", "string", "global", "patch_diff"]
-AnalysisMode = Literal["triage", "function", "component", "batch", "deep"]
+AnalysisMode = Literal["triage", "function", "component", "batch", "similar", "deep"]
 GraphKind = Literal["xrefs", "xrefs_from", "xrefs_both", "calls", "cfg"]
 DataflowDirection = Literal["forward", "backward", "both"]
 SignatureFormat = Literal["ida", "x64dbg", "mask", "bitmask"]
@@ -821,13 +821,13 @@ def _analysis_sync(mode: str, targets: list[str], options: dict[str, Any]) -> An
 
 @tool
 def analysis_run(
-    mode: Annotated[AnalysisMode, "triage, function, component, batch, or deep"],
+    mode: Annotated[AnalysisMode, "triage, function, component, batch, similar, or deep"],
     targets: Annotated[list[str] | None, "Seed functions or addresses"] = None,
     options: Annotated[AnalysisOptions | None, "Analysis budgets and mode options"] = None,
 ) -> dict[str, Any]:
     """WHEN choosing analysis depth, use this; for one disassembly use disassemble.
     RETURNS inline {data,...} envelope, or a job record for deep. Per-mode arity below.
-    LIMITS triage takes no targets (detail_level fast/full); function takes 1 target; component/batch take N targets; deep submits a cancellable job (options max_depth 1-20, direction forward/backward/both) and large outputs use the rpc 50k download indirection. NEXT dataflow_trace/taint_analyze on the targets."""
+    LIMITS triage takes no targets (detail_level fast/full); function/similar take 1 target (similar ranks mnemonic 3-gram matches, options limit/min_score); component/batch take N targets; deep submits a cancellable job (options max_depth 1-20, direction forward/backward/both) and large outputs use the rpc 50k download indirection. NEXT dataflow_trace/taint_analyze on the targets."""
     normalized = str(mode).lower()
     effective_options = dict(options or {})
     if normalized not in get_args(AnalysisMode):

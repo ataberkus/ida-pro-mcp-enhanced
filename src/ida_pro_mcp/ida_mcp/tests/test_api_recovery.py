@@ -9,8 +9,8 @@ Build command recorded for a future from-source fixture rebuild:
 
 from ..api_core import entity_query
 from ..api_memory import get_bytes, patch
-from ..api_vnext import memory_read
-from ..framework import assert_has_keys, assert_is_list, assert_valid_address, skip_test, test
+from ..api_vnext import analysis_run, memory_read
+from ..framework import assert_has_keys, assert_is_list, assert_valid_address, get_named_address, skip_test, test
 
 
 @test(binary="typed_fixture.elf")
@@ -198,7 +198,20 @@ def test_recovery_type_libraries_list_and_load_roundtrip():
         configure_tool_policy(scopes=previous_scopes, legacy_tools=True)
 
 
-@test()
-def test_recovery_similar_placeholder_c4():
-    """C4 fills similar_functions; this placeholder tracks the contract."""
-    skip_test("C4: function similarity not implemented")
+@test(binary="typed_fixture.elf")
+def test_recovery_similar_self_match_top():
+    """analysis_run(mode="similar", targets=[main]) ranks main first at 1.0, sorted desc."""
+    main = get_named_address("main")
+    if not main:
+        skip_test("main symbol not present")
+    rows = analysis_run("similar", [main])["data"]
+    assert_is_list(rows, min_length=1)
+    for row in rows:
+        assert_has_keys(row, "addr", "name", "score", "insn_count")
+        assert_valid_address(row["addr"])
+        assert 0.0 <= row["score"] <= 1.0, f"score out of range: {row!r}"
+        assert row["insn_count"] > 0, f"bad insn_count: {row!r}"
+    assert int(rows[0]["addr"], 16) == int(main, 16), f"top row not main: {rows[0]!r}"
+    assert rows[0]["score"] == 1.0, f"self-match score != 1.0: {rows[0]!r}"
+    scores = [row["score"] for row in rows]
+    assert scores == sorted(scores, reverse=True), "rows not sorted by score desc"
