@@ -8,6 +8,7 @@ filter/sort/paginate pipeline applies unchanged.
 from __future__ import annotations
 
 from itertools import islice
+from typing import Annotated, Any
 
 import os
 
