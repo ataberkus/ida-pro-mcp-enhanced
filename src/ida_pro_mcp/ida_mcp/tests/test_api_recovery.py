@@ -126,15 +126,76 @@ def test_recovery_classes_shape_or_skip():
 
 
 @test()
-def test_recovery_signatures_placeholder_c3():
-    """C3 fills collect_signature_files / apply_flirt; this placeholder tracks the contract."""
-    skip_test("C3: FLIRT listing not implemented")
+def test_recovery_signatures_list_nonempty():
+    """entity_query(kind="signatures") lists processor .sig files with applied flags."""
+    page = entity_query({"kind": "signatures", "count": 0})[0]
+    assert page["error"] is None, f"signatures query failed: {page['error']}"
+    rows = page["data"]
+    assert_is_list(rows, min_length=1)
+    for row in rows:
+        assert_has_keys(row, "addr", "name", "path", "description", "applied")
+        assert row["addr"] == "0x0", f"bad addr: {row['addr']!r}"
+        assert row["name"], f"empty sig name: {row!r}"
+        assert str(row["path"]).lower().endswith(".sig"), f"bad sig path: {row['path']!r}"
+        assert isinstance(row["applied"], bool), f"bad applied flag: {row!r}"
 
 
 @test()
-def test_recovery_type_libraries_placeholder_c3():
-    """C3 fills collect_type_libraries / load_til; this placeholder tracks the contract."""
-    skip_test("C3: TIL listing not implemented")
+def test_recovery_type_libraries_list_and_load_roundtrip():
+    """type_libraries rows carry loaded flags; load one unloaded TIL via preview/commit/rollback."""
+    from ida_pro_mcp.vnext.contracts import VNextError
+
+    from ..api_vnext import mutation_commit, mutation_preview, mutation_rollback
+    from ..rpc import configure_tool_policy, get_active_scopes
+    from ida_pro_mcp.vnext.contracts import SafetyScope
+
+    page = entity_query({"kind": "type_libraries", "count": 0})[0]
+    assert page["error"] is None, f"type_libraries query failed: {page['error']}"
+    rows = page["data"]
+    assert_is_list(rows, min_length=1)
+    for row in rows:
+        assert_has_keys(row, "addr", "name", "path", "description", "loaded")
+        assert row["addr"] == "0x0", f"bad addr: {row['addr']!r}"
+        assert row["name"], f"empty til name: {row!r}"
+        assert str(row["path"]).lower().endswith(".til"), f"bad til path: {row['path']!r}"
+        assert isinstance(row["loaded"], bool), f"bad loaded flag: {row!r}"
+    candidates = [row for row in rows if not row["loaded"]]
+    if not candidates:
+        skip_test("no unloaded TIL on this IDA install")
+
+    previous_scopes = get_active_scopes()
+    configure_tool_policy(scopes=set(SafetyScope), legacy_tools=True)
+    try:
+        # Most listed TILs target other platforms and fail add_til; try each
+        # in order until one commits, skipping when none is loadable here.
+        committed = None
+        failures = 0
+        for target in candidates:
+            preview = mutation_preview([{"kind": "load_til", "name": target["name"]}])
+            tid = preview.get("transaction_id")
+            assert tid, f"preview failed: {preview}"
+            try:
+                receipt = mutation_commit(tid)
+            except VNextError as exc:
+                if "Failed to load type library" in str(exc):
+                    failures += 1
+                    continue
+                raise
+            assert receipt.get("status") == "committed", f"commit failed: {receipt}"
+            committed = (tid, target)
+            break
+        if committed is None:
+            skip_test(f"no loadable TIL on this IDA install ({failures} incompatible)")
+        tid, target = committed
+        again = entity_query({"kind": "type_libraries", "filter": target["name"]})[0]
+        assert again["error"] is None, f"re-query failed: {again['error']}"
+        match = [row for row in again["data"] if row["name"] == target["name"]]
+        assert match, f"TIL vanished after load: {target['name']!r}"
+        assert all(row["loaded"] for row in match), f"TIL not loaded after commit: {match!r}"
+        rolled = mutation_rollback(tid)
+        assert rolled.get("status") == "rolled_back", f"rollback failed: {rolled}"
+    finally:
+        configure_tool_policy(scopes=previous_scopes, legacy_tools=True)
 
 
 @test()

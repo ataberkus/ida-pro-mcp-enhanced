@@ -1,24 +1,26 @@
-"""Switch-table, patch, and RTTI/class enumeration (Phase C base module).
+"""Switch-table, patch, RTTI/class, and FLIRT/TIL enumeration (Phase C module).
 
 Pure collectors called on the IDA main thread via ``entity_query``'s
 existing ``@idasync`` path. Rows carry an ``"addr"`` hex-string key so the
 filter/sort/paginate pipeline applies unchanged.
 
-Remaining collectors (``collect_signature_files``,
-``collect_type_libraries``, ``similar_functions``, ``apply_flirt``,
-``load_til``) are stubs until tasks C3-C4 fill them.
+Remaining stub: ``similar_functions`` (task C4).
 """
 
 from __future__ import annotations
 
+import os
 from typing import Annotated, Any
 
+import ida_auto
 import ida_bytes
 import ida_funcs
+import ida_idp
 import ida_loader
 import ida_name
 import ida_nalt
 import ida_segment
+import ida_typeinf
 import ida_xref
 import idaapi
 import idautils
@@ -28,7 +30,7 @@ from ida_pro_mcp.vnext.contracts import ErrorCode, VNextError
 from . import compat
 from .rpc import tool, unsafe
 from .sync import idasync
-from .utils import parse_address, resolve_address_or_name
+from .utils import normalize_dict_list, parse_address, resolve_address_or_name
 
 
 def _not_supported(what: str) -> VNextError:
@@ -527,33 +529,196 @@ def collect_classes() -> list[dict]:
     return rows
 
 
-def _stub_collect_signature_files() -> list[dict]:
-    raise _not_supported("collect_signature_files")
+def _processor_subdir(base: str) -> str:
+    """Resolve the current processor's subdir of an IDA resource dir (sig/til)."""
+    candidates: list[str] = []
+    for getter in (ida_idp.get_idp_name, idaapi.inf_get_procname):
+        try:
+            value = str(getter() or "").strip().lower()
+        except Exception:
+            continue
+        if value and value not in candidates:
+            candidates.append(value)
+    for candidate in candidates:
+        sub = os.path.join(base, candidate)
+        try:
+            if os.path.isdir(sub):
+                return sub
+        except Exception:
+            continue
+    return base
 
 
-def _stub_collect_type_libraries() -> list[dict]:
-    raise _not_supported("collect_type_libraries")
+def _sig_key(name: str) -> str:
+    stem = os.path.basename(str(name or "").strip())
+    if stem.lower().endswith(".sig"):
+        stem = stem[:-4]
+    return stem.lower()
+
+
+def _applied_sig_names() -> set[str]:
+    """Short names of planned/applied FLIRT signatures (extension-insensitive)."""
+    try:
+        qty = int(ida_funcs.get_idasgn_qty())
+    except Exception:
+        return set()
+    planned = getattr(ida_funcs, "IDASGN_PLANNED", 4)
+    names: set[str] = set()
+    for index in range(max(0, qty)):
+        desc = None
+        try:
+            desc = ida_funcs.get_idasgn_desc_with_matches(index)
+        except Exception:
+            desc = None
+        if desc is None:
+            try:
+                desc = ida_funcs.get_idasgn_desc(index)
+            except Exception:
+                continue
+        if not desc:
+            continue
+        try:
+            state = int(ida_funcs.calc_idasgn_state(index))
+        except Exception:
+            state = -1
+        if state == planned:
+            continue
+        names.add(_sig_key(str(desc[0])))
+    return names
+
+
+def _loaded_til_names() -> set[str]:
+    """Names of TILs in the local base chain (case-insensitive)."""
+    try:
+        til = ida_typeinf.get_idati()
+    except Exception:
+        return set()
+    if not til:
+        return set()
+    names: set[str] = set()
+    try:
+        count = int(til.nbases)
+    except Exception:
+        return set()
+    for index in range(max(0, count)):
+        try:
+            base = til.base(index)
+            names.add(str(base.name or "").strip().lower())
+        except Exception:
+            continue
+    return names
+
+
+def collect_signature_files() -> list[dict]:
+    """List FLIRT .sig files for the current processor with applied flags."""
+    try:
+        directory = _processor_subdir(idaapi.idadir("sig"))
+        files = sorted(f for f in os.listdir(directory) if f.lower().endswith(".sig"))
+    except Exception:
+        return []
+    applied = _applied_sig_names()
+    rows: list[dict] = []
+    for filename in files:
+        stem = os.path.splitext(filename)[0]
+        try:
+            description = str(ida_funcs.get_idasgn_title(stem) or "")
+        except Exception:
+            description = ""
+        rows.append(
+            {
+                "addr": "0x0",
+                "name": stem,
+                "path": os.path.join(directory, filename),
+                "description": description,
+                "applied": _sig_key(stem) in applied,
+            }
+        )
+    return rows
+
+
+def collect_type_libraries() -> list[dict]:
+    """List .til files for the current processor with loaded flags."""
+    try:
+        directory = _processor_subdir(idaapi.idadir("til"))
+        files = sorted(f for f in os.listdir(directory) if f.lower().endswith(".til"))
+    except Exception:
+        return []
+    loaded = _loaded_til_names()
+    rows: list[dict] = []
+    for filename in files:
+        stem = os.path.splitext(filename)[0]
+        try:
+            header = ida_typeinf.load_til_header(directory, stem)
+            description = str(header.desc or "") if header else ""
+        except Exception:
+            description = ""
+        rows.append(
+            {
+                "addr": "0x0",
+                "name": stem,
+                "path": os.path.join(directory, filename),
+                "description": description,
+                "loaded": stem.lower() in loaded,
+            }
+        )
+    return rows
 
 
 def _stub_similar_functions(ea: int, limit: int, min_score: float) -> list[dict]:
     raise _not_supported("similar_functions")
 
 
-def _stub_apply_flirt(name: str) -> dict:
-    raise _not_supported("apply_flirt")
+def apply_flirt(name: str) -> dict:
+    """Plan a FLIRT signature file, wait for analysis, report renamed count."""
+    short = os.path.basename(str(name or "").strip())
+    if not short:
+        raise VNextError(ErrorCode.INVALID_OPERATION, "FLIRT apply is missing a signature name")
+    before = {ea: ida_funcs.get_func_name(ea) for ea in idautils.Functions()}
+    planned = 0
+    try:
+        planned = int(ida_funcs.plan_to_apply_idasgn(short))
+    except Exception:
+        planned = 0
+    if not planned and not short.lower().endswith(".sig"):
+        try:
+            planned = int(ida_funcs.plan_to_apply_idasgn(short + ".sig"))
+        except Exception:
+            planned = 0
+    if not planned:
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"Unknown FLIRT signature: {name}")
+    ida_auto.auto_wait()
+    renamed = 0
+    try:
+        for ea, old in before.items():
+            try:
+                if ida_funcs.get_func_name(ea) != old:
+                    renamed += 1
+            except Exception:
+                continue
+    except Exception:
+        return {"name": short}
+    return {"name": short, "renamed": renamed}
 
 
-def _stub_load_til(name: str) -> dict:
-    raise _not_supported("load_til")
+def load_til(name: str) -> dict:
+    """Load a type library into the database; raises INVALID_OPERATION on failure."""
+    short = os.path.basename(str(name or "").strip())
+    if short.lower().endswith(".til"):
+        short = short[:-4]
+    if not short:
+        raise VNextError(ErrorCode.INVALID_OPERATION, "TIL load is missing a library name")
+    try:
+        result = int(ida_typeinf.add_til(short, ida_typeinf.ADDTIL_DEFAULT))
+    except Exception as exc:
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"Failed to load type library {short!r}: {exc}") from exc
+    if result not in (ida_typeinf.ADDTIL_OK, ida_typeinf.ADDTIL_COMP):
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"Failed to load type library {short!r} (result {result})")
+    return {"name": short, "loaded": True}
 
 
-# Canonical collector names reserved for C3-C4. The module-level aliases
-# keep one public spelling so later tasks fill implementations in place.
-collect_signature_files = _stub_collect_signature_files
-collect_type_libraries = _stub_collect_type_libraries
+# Canonical collector name reserved for C4. The module-level alias keeps one
+# public spelling so the later task fills the implementation in place.
 similar_functions = _stub_similar_functions
-apply_flirt = _stub_apply_flirt
-load_til = _stub_load_til
 
 
 @tool
@@ -565,9 +730,19 @@ def apply_flirt_signature(
     """Prefer mutation_preview(kind="apply_flirt", ...).
 
     WHEN: stage a FLIRT signature application through the transaction flow.
-    RETURNS: [{name, ok, error}] per item.
-    LIMITS: stub until C3 implements FLIRT apply; raises NOT_SUPPORTED."""
-    raise _not_supported("apply_flirt_signature")
+    RETURNS: [{name, renamed, ok, error}] per item.
+    LIMITS: unknown signature names return error entries; apply waits for auto-analysis."""
+    results = []
+    for item in normalize_dict_list(items, lambda s: {"name": s}):
+        entry = str(item.get("name", "") or "")
+        try:
+            outcome = apply_flirt(entry)
+            results.append({"name": entry, "renamed": outcome.get("renamed", 0), "ok": True, "error": None})
+        except VNextError as exc:
+            results.append({"name": entry, "ok": False, "error": str(exc)})
+        except Exception as exc:
+            results.append({"name": entry, "ok": False, "error": str(exc)})
+    return results
 
 
 @tool
@@ -579,9 +754,19 @@ def load_type_library(
     """Prefer mutation_preview(kind="load_til", ...).
 
     WHEN: stage a type-library load through the transaction flow.
-    RETURNS: [{name, ok, error}] per item.
-    LIMITS: stub until C3 implements TIL loading; raises NOT_SUPPORTED."""
-    raise _not_supported("load_type_library")
+    RETURNS: [{name, loaded, ok, error}] per item.
+    LIMITS: unknown or incompatible library names return error entries."""
+    results = []
+    for item in normalize_dict_list(items, lambda s: {"name": s}):
+        entry = str(item.get("name", "") or "")
+        try:
+            load_til(entry)
+            results.append({"name": entry, "loaded": True, "ok": True, "error": None})
+        except VNextError as exc:
+            results.append({"name": entry, "loaded": False, "ok": False, "error": str(exc)})
+        except Exception as exc:
+            results.append({"name": entry, "loaded": False, "ok": False, "error": str(exc)})
+    return results
 
 
 def resolve_switch_targets(query: dict[str, Any]) -> list[int] | None:
