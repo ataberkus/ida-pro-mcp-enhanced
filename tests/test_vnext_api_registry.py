@@ -209,6 +209,12 @@ def test_instruction_search_maps_to_broad_insn_query(monkeypatch):
     assert result["next_cursor"] == api_vnext._encode_cursor(17)
 
 
+def test_analysis_run_rejects_unknown_mode_with_allowed_list():
+    _rpc, api_vnext = _load_vnext_api()
+    with pytest.raises(VNextError, match="Allowed:"):
+        api_vnext._analysis_sync("nope", [], {})
+
+
 def test_instruction_search_resumes_after_scan_budget(monkeypatch):
     _rpc, api_vnext = _load_vnext_api()
     calls = []

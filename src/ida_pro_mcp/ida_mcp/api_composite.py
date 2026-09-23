@@ -174,13 +174,10 @@ def analyze_function(
     addr: Annotated[str, "Function address or name"],
     include_asm: Annotated[bool, "Include full disassembly (default: false, saves tokens)"] = False,
 ) -> dict:
-    """Get a compact analysis of a single function: decompiled pseudocode (capped
-    at 100 lines), top 10 strings as values, top 10 non-trivial constants, caller
-    and callee names, cross-references, and basic block metrics. Disassembly is
-    excluded by default to save context tokens — set include_asm=true only when
-    you need raw instructions (crypto analysis, shellcode, decompiler failure).
-    Use this instead of calling decompile, disasm, callees, xref_query, stack_frame,
-    and basic_blocks separately."""
+    """Prefer analysis_run(mode="function", targets=[addr], ...) for canonical single-function analysis.
+    WHEN: compact single-function brief (capped pseudocode, top strings/constants, callers/callees, xrefs, block metrics).
+    RETURNS: {addr, name?, prototype?, size?, decompile?, strings?, constants?, callers?, callees?, xrefs?, blocks?, error?}.
+    LIMITS: decompile capped at 100 lines; pass include_asm=true only for raw instructions (crypto/shellcode/decompiler failure)."""
 
     try:
         ea = _resolve_addr(addr)
@@ -201,13 +198,10 @@ def analyze_function(
 def analyze_component(
     addrs: Annotated[list[str] | str, "Function addresses (comma-separated or list)"],
 ) -> dict:
-    """Analyze a group of related functions as one logical unit. Returns a COMPACT
-    summary of each function (name, prototype, size, callee names, top 5 strings,
-    block count) plus relationship data: internal call graph, shared globals,
-    interface vs internal classification, and strings used by multiple functions.
-    Use analyze_function on individual addresses if you need full decompilation.
-    Use this when you see a cluster of sub_* functions called from the same parent
-    or when callees/callers overlap suggests a module."""
+    """Prefer analysis_run(mode="component", targets=[...], ...) for canonical component analysis.
+    WHEN: compact briefs for a cluster of related functions plus internal call graph, shared globals, interface classification.
+    RETURNS: {functions[{addr, name, prototype, size, callees, strings, basic_blocks, complexity}], nodes?, edges?, shared_globals?, error?}.
+    LIMITS: per-function summaries are compact (no full decompile); unresolvable inputs return an error entry."""
 
     import idaapi
     import idautils
@@ -376,14 +370,10 @@ def trace_data_flow(
     direction: Annotated[str, "'forward' (xrefs from) or 'backward' (xrefs to)"] = "forward",
     max_depth: Annotated[int, "Maximum traversal depth"] = 5,
 ) -> dict:
-    """Follow cross-references from or to an address, automatically traversing
-    multiple hops. Use 'forward' to see where data flows TO (xrefs-from), or
-    'backward' to see where data flows FROM (xrefs-to). At each node in the
-    traversal, returns the function name, instruction, and whether it's code or
-    data. Use this when you find an interesting string, constant, or global and
-    want to understand every code path that touches it without manually chaining
-    xref_query calls. Do not use for call graph traversal — use callgraph for that.
-    max_depth controls how many hops to follow (default 5, max 20)."""
+    """Prefer dataflow_trace(addr, direction=..., max_depth=...) for canonical ref-flow traces.
+    WHEN: multi-hop xref BFS from an address (forward=xrefs-from, backward=xrefs-to) with per-node func/instruction/type.
+    RETURNS: {start, direction, depth_reached, nodes[{addr, func, instruction, type, name, depth}], edges[{from, to, type}], truncated, error?}.
+    LIMITS: max_depth max 20; 200 nodes / 500 edges max (truncated set); bad direction returns an error dict. Keep .lower() normalization."""
 
     import idaapi
     import idautils

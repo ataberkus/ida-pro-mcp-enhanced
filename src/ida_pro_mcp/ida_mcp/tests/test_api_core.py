@@ -368,3 +368,12 @@ def test_imports_query():
     if page["data"]:
         assert_has_keys(page["data"][0], "addr", "imported_name", "module")
 
+
+
+@test()
+def test_entity_query_invalid_kind_lists_allowed():
+    """entity_query reports unsupported kinds with the Allowed value list."""
+    page = entity_query({"kind": "not_a_kind"})[0]
+    assert page["data"] == []
+    assert "not_a_kind" in str(page["error"])
+    assert "Allowed:" in str(page["error"])

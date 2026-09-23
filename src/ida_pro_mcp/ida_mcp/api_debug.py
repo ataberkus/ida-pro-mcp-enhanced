@@ -164,7 +164,10 @@ def list_breakpoints():
 @tool
 @idasync
 def dbg_status() -> DebugControlResult:
-    """Return debugger lifecycle state and current IP if suspended."""
+    """Prefer debug_session(action="status") for canonical debugger lifecycle.
+    WHEN: read lifecycle state + current IP when suspended (no execution change).
+    RETURNS: {state(running|suspended|not_running...), ip?, error?}.
+    LIMITS: DEBUG scope; raises when no session state is readable."""
     return _get_debug_state_result()
 
 
@@ -173,12 +176,10 @@ def dbg_status() -> DebugControlResult:
 @tool
 @idasync
 def dbg_start():
-    """Start debugger session for current target.
-
-    When no breakpoints exist, entry-point breakpoints are added automatically
-    so the debugger suspends instead of running to completion. Returns
-    auto_breakpoints listing any breakpoints this call added.
-    """
+    """Prefer debug_session(action="start") for canonical debugger start.
+    WHEN: start the debuggee; adds entry-point breakpoints when none exist so it suspends.
+    RETURNS: {ip?, auto_breakpoints[]}.
+    LIMITS: DEBUG scope, UNSAFE; raises when the debugger fails to start."""
     auto_breakpoints: list[str] = []
     if len(list_breakpoints()) == 0:
         for i in range(ida_entry.get_entry_qty()):
@@ -200,7 +201,10 @@ def dbg_start():
 @tool
 @idasync
 def dbg_exit():
-    """Terminate active debugger session."""
+    """Prefer debug_session(action="terminate") for canonical debugger exit.
+    WHEN: terminate the active debugger session.
+    RETURNS: None on success.
+    LIMITS: DEBUG scope, UNSAFE; raises when no debugger is running or exit fails."""
     dbg_ensure_running()
     if idaapi.exit_process():
         return
@@ -212,7 +216,10 @@ def dbg_exit():
 @tool
 @idasync
 def dbg_detach():
-    """Detach the debugger without terminating the process."""
+    """Prefer debug_session(action="detach") for canonical debugger detach.
+    WHEN: detach from the debuggee without terminating it.
+    RETURNS: None on success.
+    LIMITS: DEBUG scope, UNSAFE; raises when the backend lacks detach or detach fails."""
     dbg_ensure_running()
     detach = getattr(ida_dbg, "detach_process", None) or getattr(idaapi, "detach_process", None)
     if detach is None:
@@ -227,7 +234,10 @@ def dbg_detach():
 @tool
 @idasync
 def dbg_continue() -> str:
-    """Resume execution in active debugger session."""
+    """Prefer debug_control(action="continue") for canonical resume.
+    WHEN: resume execution in the active session.
+    RETURNS: current IP hex string after resume.
+    LIMITS: DEBUG scope, UNSAFE; raises when no session is active or continue fails."""
     dbg_ensure_running()
     if idaapi.continue_process():
         ip = ida_dbg.get_ip_val()
@@ -243,7 +253,10 @@ def dbg_continue() -> str:
 def dbg_run_to(
     addr: Annotated[str, "Target execution address (hex or decimal)"],
 ):
-    """Run debuggee until target address is reached."""
+    """Prefer debug_control(action="run_to", addr=...) for canonical run-to.
+    WHEN: run the debuggee until addr is reached.
+    RETURNS: current IP hex string.
+    LIMITS: DEBUG scope, UNSAFE; raises on unresolvable addr or failed run-to."""
     dbg_ensure_running()
     ea = parse_address(addr)
     if idaapi.run_to(ea):
@@ -258,7 +271,10 @@ def dbg_run_to(
 @tool
 @idasync
 def dbg_step_into():
-    """Execute one instruction, stepping into calls."""
+    """Prefer debug_control(action="step_into") for canonical step-into.
+    WHEN: execute one instruction, stepping into calls.
+    RETURNS: current IP hex string.
+    LIMITS: DEBUG scope, UNSAFE; raises when stepping fails."""
     dbg_ensure_running()
     if idaapi.step_into():
         ip = ida_dbg.get_ip_val()
@@ -272,7 +288,10 @@ def dbg_step_into():
 @tool
 @idasync
 def dbg_step_over():
-    """Execute one instruction, stepping over calls."""
+    """Prefer debug_control(action="step_over") for canonical step-over.
+    WHEN: execute one instruction, stepping over calls.
+    RETURNS: current IP hex string.
+    LIMITS: DEBUG scope, UNSAFE; raises when stepping fails."""
     dbg_ensure_running()
     if idaapi.step_over():
         ip = ida_dbg.get_ip_val()
@@ -291,7 +310,10 @@ def dbg_step_over():
 @tool
 @idasync
 def dbg_bps():
-    """List breakpoints with address and enabled status."""
+    """Prefer debug_breakpoints(action="list") for canonical breakpoint listing.
+    WHEN: list breakpoints with address + enabled status.
+    RETURNS: [{addr, enabled, ...}].
+    LIMITS: DEBUG scope; empty list when no breakpoints exist."""
     return list_breakpoints()
 
 
@@ -302,7 +324,10 @@ def dbg_bps():
 def dbg_add_bp(
     addrs: Annotated[list[str] | str, "Address(es) to add breakpoints at"],
 ) -> list[dict]:
-    """Add breakpoints at one or more addresses."""
+    """Prefer debug_breakpoints(action="add", items=...) for canonical breakpoint add.
+    WHEN: add soft breakpoints at addresses.
+    RETURNS: [{addr, ok, error?}] per address.
+    LIMITS: DEBUG scope, UNSAFE; existing breakpoints report ok; bad addresses error."""
     addrs = normalize_list_input(addrs)
     results = []
 
@@ -332,7 +357,10 @@ def dbg_add_bp(
 def dbg_delete_bp(
     addrs: Annotated[list[str] | str, "Address(es) to delete breakpoints from"],
 ) -> list[dict]:
-    """Delete breakpoints at one or more addresses."""
+    """Prefer debug_breakpoints(action="delete", items=...) for canonical breakpoint delete.
+    WHEN: delete breakpoints at addresses.
+    RETURNS: [{addr, ok, error?}] per address.
+    LIMITS: DEBUG scope, UNSAFE; missing breakpoints report error entries."""
     addrs = normalize_list_input(addrs)
     results = []
 
@@ -354,7 +382,10 @@ def dbg_delete_bp(
 @tool
 @idasync
 def dbg_toggle_bp(items: list[BreakpointOp] | BreakpointOp) -> list[dict]:
-    """Enable or disable existing breakpoints in batch."""
+    """Prefer debug_breakpoints(action="toggle", items=...) for canonical breakpoint toggle.
+    WHEN: enable/disable existing breakpoints in batch ({addr, enabled}).
+    RETURNS: [{addr, ok, error?}] per item.
+    LIMITS: DEBUG scope, UNSAFE; unknown addresses report error entries."""
 
     items = normalize_dict_list(items)
 
@@ -393,7 +424,10 @@ def dbg_regs(
     thread: Annotated[int | None, "Thread ID (default: current thread)"] = None,
     names: Annotated[list[str] | None, "Register names to return (default: all)"] = None,
 ) -> ThreadRegisters:
-    """Return registers for a debugger thread, optionally only the named ones."""
+    """Prefer debug_state(include=["registers"], ...) for canonical register reads.
+    WHEN: read registers for a thread, optionally only named ones.
+    RETURNS: {registers[{name, value}], ...}.
+    LIMITS: DEBUG scope; unknown thread raises; unknown names return an error entry."""
     dbg = dbg_ensure_running()
     if thread is None:
         thread = ida_dbg.get_current_thread()
@@ -414,7 +448,10 @@ def dbg_regs(
 @tool
 @idasync
 def dbg_stacktrace() -> list[dict[str, str]]:
-    """Return current call stack with module and symbol context."""
+    """Prefer debug_state(include=["stack"], ...) for canonical call stacks.
+    WHEN: read the current call stack with module/symbol context.
+    RETURNS: [{addr, module, symbol, ...}].
+    LIMITS: DEBUG scope; raises when no debugger is running."""
     dbg_ensure_running()
     callstack = []
     try:
@@ -471,7 +508,10 @@ MAX_DBG_WRITE = 65536
 @tool
 @idasync
 def dbg_read(regions: list[MemoryRead] | MemoryRead) -> list[dict]:
-    """Read debuggee memory from one or more regions."""
+    """Prefer debug_memory(action="read", regions=...) for canonical live-memory reads.
+    WHEN: read live debuggee memory regions ({addr, size}).
+    RETURNS: [{addr, size, data(hex), error}] per region.
+    LIMITS: DEBUG scope; size max 65536; requires a running debugger; failures are error entries."""
 
     regions = normalize_dict_list(regions)
     dbg_ensure_running()
@@ -525,7 +565,10 @@ def dbg_read(regions: list[MemoryRead] | MemoryRead) -> list[dict]:
 @tool
 @idasync
 def dbg_write(regions: list[MemoryPatch] | MemoryPatch) -> list[dict]:
-    """Write bytes to debuggee memory regions."""
+    """Prefer debug_memory(action="write", regions=..., confirm_nonrollbackable=true).
+    WHEN: write bytes to live debuggee memory (non-rollbackable; needs explicit confirm).
+    RETURNS: [{addr, size, ok, error}] per region.
+    LIMITS: DEBUG scope, UNSAFE; data max 65536 bytes; empty data and failed writes error."""
 
     regions = normalize_dict_list(regions)
     dbg_ensure_running()

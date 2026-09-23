@@ -301,7 +301,10 @@ def _build_health_payload() -> dict:
 @tool
 @idasync
 def server_health() -> dict:
-    """Health/ready probe for MCP server and current IDB state."""
+    """Legacy health probe (no canonical equivalent; server_capabilities covers runtime caps).
+    WHEN: check MCP server liveness and current IDB/analysis state.
+    RETURNS: {ok?, auto_analysis_ready?, idb path/arch/functions?...} health payload.
+    LIMITS: point-in-time snapshot; auto-analysis may still be running after ok."""
     return _build_health_payload()
 
 
@@ -312,7 +315,10 @@ def server_warmup(
     build_caches: Annotated[bool, "Build core caches (currently strings)"] = True,
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler plugin"] = True,
 ) -> dict:
-    """Warm up IDA subsystems to reduce first-call latency and transient failures."""
+    """Legacy warmup (no canonical equivalent).
+    WHEN: reduce first-call latency by waiting auto-analysis, building caches, initing Hex-Rays.
+    RETURNS: {ok, steps[{step, ok, ms, error?}], health}.
+    LIMITS: may take seconds; init_hexrays reports ok=false when Hex-Rays is unavailable."""
     steps = []
 
     if wait_auto_analysis:
@@ -349,7 +355,10 @@ def server_warmup(
 def lookup_funcs(
     queries: Annotated[list[str] | str, "Address(es) or name(s)"],
 ) -> list[dict]:
-    """Get functions by address or name (auto-detects)"""
+    """Prefer entity_query(kind="functions", ...) for filtered/paginated lookup.
+    WHEN: resolve exact addresses/names to function records (auto-detects; "*" lists all).
+    RETURNS: [{query, fn, error}] per query.
+    LIMITS: "*" caps at 1000 functions; non-function addresses report "Not a function"/"Not found"."""
     queries = normalize_list_input(queries)
 
     # Treat empty/"*" as "all functions" - but add limit
@@ -394,7 +403,10 @@ def int_convert(
         "Convert numbers to various formats (hex, decimal, binary, ascii)",
     ],
 ) -> list[dict]:
-    """Convert numbers to different formats"""
+    """Canonical number conversion (listed in CANONICAL_TOOLS).
+    WHEN: render numbers as decimal/hex/bytes/ascii/binary (string form means {"text": s, size 64}).
+    RETURNS: [{input, result{decimal, hexadecimal, bytes, ascii, binary}, error}] per input.
+    LIMITS: unparsable text and values too big for size return error entries, result None."""
     inputs = normalize_dict_list(inputs, lambda s: {"text": s, "size": 64})
 
     results = []
@@ -458,7 +470,10 @@ def list_globals(
         "List global variables with optional filtering and pagination",
     ],
 ) -> list[Page[Global]]:
-    """List globals with optional filtering and offset/count pagination."""
+    """Prefer entity_query(kind="globals", ...) for filtered/paginated listing.
+    WHEN: list data globals (non-function named addresses) with glob filter + offset/count.
+    RETURNS: [{data, next_offset, total, ...}] page per query.
+    LIMITS: default count 50 (query count defaults 100); empty/"*" filter means all names."""
     queries = normalize_dict_list(
         queries, lambda s: {"offset": 0, "count": 50, "filter": s}
     )
@@ -491,7 +506,10 @@ def entity_query(
         "Generic entity query with filtering, projection, and pagination",
     ],
 ) -> list[dict]:
-    """Query IDB entities with typed filters, projection, and pagination."""
+    """Canonical entity search (listed in CANONICAL_TOOLS).
+    WHEN: filtered/paginated listing of functions|globals|imports|strings|names with glob/regex filter, projection, sorting.
+    RETURNS: [{kind, data[rows], next_offset, total, error}] per query.
+    LIMITS: count max 5000; bad kind returns an error entry listing Allowed values; regex errors surface in error, not raises."""
     queries = normalize_dict_list(
         queries,
         lambda s: {"kind": s, "offset": 0, "count": 100, "sort_by": "addr"},
@@ -500,14 +518,15 @@ def entity_query(
 
     for query in queries:
         kind = str(query.get("kind", "functions") or "functions").lower()
-        if kind not in {"functions", "globals", "imports", "strings", "names"}:
+        allowed_entity_kinds = ("functions", "globals", "imports", "strings", "names")
+        if kind not in set(allowed_entity_kinds):
             results.append(
                 {
                     "kind": kind,
                     "data": [],
                     "next_offset": None,
                     "total": 0,
-                    "error": f"Unsupported kind: {kind}",
+                    "error": f"Unsupported kind: {kind}. Allowed: {', '.join(allowed_entity_kinds)}",
                 }
             )
             continue
@@ -619,7 +638,10 @@ def imports(
     offset: Annotated[int, "Starting pagination index (default: 0)"],
     count: Annotated[int, "Maximum rows (0 returns all imports)"],
 ) -> Page[Import]:
-    """List imports with module names using offset/count pagination."""
+    """Prefer entity_query(kind="imports", ...) for filtered/paginated import listing.
+    WHEN: page the whole import table by offset/count with no filtering.
+    RETURNS: {data[Import], next_offset, total, ...} page.
+    LIMITS: count=0 returns all imports; no name/module filter (use imports_query/entity_query)."""
     return _query_imports([{"offset": offset, "count": count}])[0]
 
 
@@ -631,7 +653,10 @@ def imports_query(
         "Import query with import/module filters and pagination",
     ],
 ) -> list[dict]:
-    """Query imports with richer filtering than imports(offset,count)."""
+    """Prefer entity_query(kind="imports", filter=..., module=...) for unified entity search.
+    WHEN: query imports with name/module filters plus offset/count pagination.
+    RETURNS: [{data[Import], next_offset, total, ...}] page per query.
+    LIMITS: filter/module are glob patterns; string form means {"filter": s, offset 0, count 100}."""
     return _query_imports(
         normalize_dict_list(queries, lambda s: {"filter": s, "offset": 0, "count": 100})
     )
@@ -643,7 +668,10 @@ def imports_query(
 def idb_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
 ) -> dict:
-    """Save active IDB to disk, optionally to a provided path."""
+    """Prefer mutation_preview(kind="save_database", ...) to stage a save through transactions.
+    WHEN: save the active IDB now, optionally to another path (FILESYSTEM scope, immediate).
+    RETURNS: {ok, path, error}.
+    LIMITS: empty path saves to the current IDB path; destructive overwrite of the target path."""
     try:
         save_path = path.strip() if path else ""
         if not save_path:
@@ -754,13 +782,10 @@ def search_text(
     include: Annotated[str, "'disasm' | 'comments' | 'all' (default: all)"] = "all",
     code_only: Annotated[bool, "Restrict search to executable segments (default: true)"] = True,
 ) -> SearchTextResult:
-    """Search the rendered listing for `pattern` over [start, end).
-
-    Iterates `idautils.Heads()` and matches each head via
-    `ida_lines.generate_disasm_line()` plus comment getters. Per-head
-    work is cheap and yields between heads. Each page has a bounded time
-    budget and returns a continuation cursor before common MCP client timeouts.
-    """
+    """Prefer search(kind="text", targets=[pattern], ...) for unified search with opaque cursor.
+    WHEN: full-listing substring/regex search over disasm+comments within [start, end).
+    RETURNS: {n, hits[{addr, function, segment, matches[{kind, text}]}], cursor, error?, partial?, reason?}.
+    LIMITS: limit max 500; each page has a time budget (partial+reason set; continue via cursor); code_only skips data segments."""
     if limit <= 0:
         limit = 30
     if limit > 500:

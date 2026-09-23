@@ -180,7 +180,10 @@ def _append_comment(ea: int, comment: str, item: dict) -> dict:
 @idasync
 @unsafe
 def set_comments(items: list[CommentOp] | CommentOp):
-    """Set comments at addresses (both disassembly and decompiler views)"""
+    """Prefer mutation_preview(kind="comment", ...).
+    WHEN: overwrite comments at addresses directly (UNSAFE; preview stages the same set instead).
+    RETURNS: [{addr, ok, error, decompiler_comment?, warning?}] per item.
+    LIMITS: sets the disassembly comment; decompiler comment only lands when the addr maps to pseudocode."""
     return _comment_batch(items, append=False)
 
 
@@ -188,7 +191,10 @@ def set_comments(items: list[CommentOp] | CommentOp):
 @idasync
 @unsafe
 def append_comments(items: list[CommentAppendOp] | CommentAppendOp):
-    """Append comments at addresses, deduping exact text by default."""
+    """Prefer mutation_preview(kind="append_comment", ...).
+    WHEN: append a comment line at addresses directly (UNSAFE; dedupes exact text; preview stages it).
+    RETURNS: [{addr, ok, scope(func|line), appended?, skipped?, error}] per item.
+    LIMITS: scope auto|func|line (bad scope is an error entry); dedupe skips exact-text repeats."""
     return _comment_batch(items, append=True)
 
 
@@ -210,7 +216,10 @@ def _append_comment_text(current: str, new_text: str, *, dedupe: bool) -> tuple[
 @idasync
 @unsafe
 def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
-    """Patch assembly instructions at addresses"""
+    """Prefer mutation_preview(kind="patch_asm", ...).
+    WHEN: assemble and patch instructions at addresses directly (UNSAFE; preview stages it instead).
+    RETURNS: [{addr, ok, error}] per item.
+    LIMITS: ";" separates statements; unassemblable lines and unmapped ranges return error entries."""
     if isinstance(items, dict):
         items = [items]
 
@@ -255,7 +264,10 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
 @idasync
 @unsafe
 def rename(batch: RenameBatch | dict) -> dict:
-    """Batch-rename funcs/globals/locals/stack vars with dry-run options."""
+    """Prefer mutation_preview(kind="rename", ...).
+    WHEN: rename funcs/globals/locals/stack vars directly (UNSAFE; preview stages it with dry-run support).
+    RETURNS: {func[], data[], local[], stack[], summary{total, ok, failed, dry_run, stopped, stopped_at}}.
+    LIMITS: stop_on_error halts later groups (stopped_at names the group); dry_run reports without writing."""
 
     if not isinstance(batch, dict):
         return {"error": "batch must be a dict"}
@@ -707,7 +719,10 @@ def rename(batch: RenameBatch | dict) -> dict:
 @idasync
 @unsafe
 def define_func(items: list[DefineOp] | DefineOp) -> list[dict]:
-    """Define functions; IDA infers bounds unless end is provided."""
+    """Prefer mutation_preview(kind="define_function", ...).
+    WHEN: define a function at addr directly (UNSAFE; IDA infers bounds unless end given; preview stages it).
+    RETURNS: [{addr, start, end?, ok, error}] per item.
+    LIMITS: existing function at addr returns an error entry; add_func failure reports "define_func failed"."""
     if isinstance(items, dict):
         items = [items]
 
@@ -761,7 +776,10 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[dict]:
 @idasync
 @unsafe
 def define_code(items: list[DefineOp] | DefineOp) -> list[dict]:
-    """Convert bytes to code instruction(s) at address(es)."""
+    """Prefer mutation_preview(kind="define_code", ...).
+    WHEN: convert bytes to code instruction(s) at addresses directly (UNSAFE; preview stages it instead).
+    RETURNS: [{addr, ea, length, ok, error}] per item.
+    LIMITS: length<=0 returns "Failed to create instruction"; one instruction per item."""
     if isinstance(items, dict):
         items = [items]
 
@@ -794,7 +812,10 @@ def define_code(items: list[DefineOp] | DefineOp) -> list[dict]:
 @idasync
 @unsafe
 def undefine(items: list[UndefineOp] | UndefineOp) -> list[dict]:
-    """Undefine item(s) at address(es), converting back to raw bytes."""
+    """Prefer mutation_preview(kind="undefine", ...).
+    WHEN: convert items back to raw bytes directly (UNSAFE; preview stages it instead).
+    RETURNS: [{addr, start, size, ok, error}] per item.
+    LIMITS: size from end or size (default 1 item); del_items failure reports "undefine failed"."""
     if isinstance(items, dict):
         items = [items]
 
@@ -852,7 +873,10 @@ def add_bookmark(
         "Optional title prefix. Defaults to 'idaMCP: '; pass '' for no prefix.",
     ] = BOOKMARK_PREFIX,
 ) -> BookmarkResult:
-    """Add or replace the IDA bookmark at an address. Set prefix="" for no prefix."""
+    """Prefer mutation_preview(kind="bookmark", ...).
+    WHEN: place an IDA bookmark at addr directly (UNSAFE; preview stages it instead).
+    RETURNS: {addr, ea, slot, title, prefix, ok, error?}.
+    LIMITS: MAX_BOOKMARK_SLOTS slots; full slots return "No free bookmark slot"; same-ea reuses its slot."""
     ea = parse_address(addr)
     title = f"{prefix}{name}"
     free_slot: int | None = None
@@ -899,14 +923,10 @@ def set_op_type(
         "Operand-typing ops. Equivalent to GUI 'Y' (struct offset) or 'O' (offset) operations.",
     ],
 ) -> list[SetOpTypeResult]:
-    """Set the type of an instruction operand. GUI 'Y' / 'O' / '#' equivalent.
-
-    `kind` values:
-    - `"stroff"`: struct-offset reference. Requires `struct`, optional `delta`.
-    - `"offset"`: absolute offset / pointer. Optional `target_addr`.
-    - `"hex" | "dec" | "char" | "binary" | "octal"`: numeric format.
-    - `"stkvar"`: stack-variable reference (function-local).
-    """
+    """Prefer mutation_preview(kind="set_operand_type", ...).
+    WHEN: retype an instruction operand directly (UNSAFE; GUI Y/O/# equivalent; preview stages it).
+    RETURNS: [{addr, op_n, kind, ok, error}] per item.
+    LIMITS: kind stroff|offset|stkvar|hex|dec|char|binary|octal; stroff needs struct, bad kind is an error entry."""
     if isinstance(items, dict):
         items = [items]
 
@@ -980,7 +1000,10 @@ def make_data(
         "Data-creation ops. Each {addr, type, name?} replaces existing data items at addr.",
     ],
 ) -> list[MakeDataResult]:
-    """Create a typed data symbol at an address, replacing any prior items."""
+    """Prefer mutation_preview(kind="make_data", ...).
+    WHEN: create a typed data symbol at addr directly (UNSAFE; replaces prior items; preview stages it).
+    RETURNS: [{addr, ok, error}] per item.
+    LIMITS: type declaration must parse to a non-zero size; empty type returns an error entry."""
     if isinstance(items, dict):
         items = [items]
 

@@ -172,7 +172,10 @@ def _eval_code(code: str) -> str | None:
 def py_eval(
     code: Annotated[str, "Python code"],
 ) -> dict:
-    """Execute Python in IDA context and return result/stdout/stderr."""
+    """Prefer python_execute(mode="eval", code=...) (delegates here; requires isolated python scope).
+    WHEN: evaluate Python statements/expression in the IDA context with stdout/stderr captured.
+    RETURNS: {result?, stdout, stderr, error?}.
+    LIMITS: UNSAFE; output text capped (truncated marker); exceptions surface as error entries, not raises."""
     return _run_captured(lambda: _eval_code(code))
 
 
@@ -194,12 +197,10 @@ def _exec_file(file_path: str) -> str | None:
 def py_exec_file(
     file_path: Annotated[str, "Absolute path to a Python script to execute"],
 ) -> dict:
-    """Execute a Python script file in IDA context and return stdout/stderr.
-
-    Unlike py_eval, this runs the entire file with exec() using a single shared
-    globals dict (no locals split), so top-level definitions are visible to all
-    code in the script.
-    """
+    """Prefer python_execute(mode="file", path=...) (delegates here; requires isolated python scope).
+    WHEN: run a whole script file in the IDA context (single shared globals dict) with stdout/stderr captured.
+    RETURNS: {result?, stdout, stderr, error?}.
+    LIMITS: UNSAFE; missing file returns error entries; top-level definitions visible to all script code."""
     if not os.path.isfile(file_path):
         error = f"File not found: {file_path}"
         return {"result": "", "stdout": "", "stderr": error, "error": error}

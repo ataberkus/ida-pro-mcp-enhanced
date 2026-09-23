@@ -41,7 +41,10 @@ from . import compat
 def declare_type(
     decls: Annotated[list[str] | str, "C type declarations"],
 ) -> list[dict]:
-    """Declare C type definitions in local type library."""
+    """Prefer mutation_preview(kind="declare_type", ...).
+    WHEN: add C type declarations to the local type library (UNSAFE/ANNOTATE; preview stages it).
+    RETURNS: [{decl, ok, error}] per declaration.
+    LIMITS: declaration must parse; failures return error entries, nothing is declared."""
     decls = normalize_list_input(decls)
     results = []
 
@@ -72,7 +75,10 @@ def enum_upsert(
         "Create enums if missing and upsert enum members without destructive replacement",
     ],
 ) -> list[dict]:
-    """Create or extend local enums in an idempotent way."""
+    """Legacy enum upsert (no canonical equivalent; mutation_preview has no enum kind).
+    WHEN: create a local enum if missing and add members without destructive replacement.
+    RETURNS: [{name, enum_id, ok, created, bitfield, members[], summary{created, skipped, conflicts}}] per enum.
+    LIMITS: name/member conflicts and bitfield mismatch return error entries, never overwrite."""
     queries = normalize_dict_list(queries)
     results = []
 
@@ -218,7 +224,10 @@ def _parse_enum_value(value: int | str | None) -> int:
 @tool
 @idasync
 def read_struct(queries: list[StructRead] | StructRead) -> list[dict]:
-    """Read struct fields from memory at address; auto-detect type when possible."""
+    """Legacy struct-field reader (no canonical equivalent).
+    WHEN: read typed struct fields at an address, auto-detecting the type when no struct is given.
+    RETURNS: [{addr, struct, members[{name, offset, type, value}], error}] per query.
+    LIMITS: unknown struct or unreadable member returns an error entry; values truncated to member size."""
 
     queries = normalize_dict_list(queries)
 
@@ -447,7 +456,10 @@ def type_query(
         "Type catalog query with filtering, pagination, and optional relationships",
     ],
 ) -> list[dict]:
-    """Query local types with structured filters/projection-friendly output."""
+    """Canonical type catalog (listed in CANONICAL_TOOLS).
+    WHEN: filtered/paginated listing of local types by kind with optional declarations, members, relationships.
+    RETURNS: [{kind, data[{ordinal, name, size, kind, declaration?, members?}], next_offset, total, error}] per query.
+    LIMITS: count max 5000, max_members max 4096; bad kind returns an error entry listing Allowed values."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -619,7 +631,10 @@ def type_inspect(
         "Inspect named types and optionally include member layout",
     ],
 ) -> list[dict]:
-    """Inspect named types (size/kind/declaration/members)."""
+    """Canonical type inspector (listed in CANONICAL_TOOLS).
+    WHEN: inspect named types for size/kind/declaration, optionally with UDT member layout.
+    RETURNS: [{name, exists, declaration, size, is_func/is_ptr/is_enum/is_udt, members, member_count, error}] per query.
+    LIMITS: max_members capped at 4096; unknown names return exists=false with an error."""
     queries = normalize_dict_list(
         queries,
         lambda s: {"name": s, "include_members": False, "max_members": 128},
@@ -895,7 +910,10 @@ def _apply_type_edit(edit: dict) -> dict:
 @idasync
 @unsafe
 def set_type(edits: list[TypeEdit] | TypeEdit) -> list[dict]:
-    """Apply types (function/global/local/stack)"""
+    """Prefer mutation_preview(kind="set_type", ...).
+    WHEN: apply a function/global/local/stack type edit directly (UNSAFE; preview stages it instead).
+    RETURNS: [{addr?, kind, ok, error}] per edit.
+    LIMITS: edit type text must parse; "addr:typename" shorthand supported (never splits C++ "A::B")."""
     normalized_edits = normalize_dict_list(edits, _parse_addr_type_shorthand)
     return [_apply_type_edit(edit) for edit in normalized_edits]
 
@@ -905,7 +923,10 @@ def set_type(edits: list[TypeEdit] | TypeEdit) -> list[dict]:
 def infer_types(
     addrs: Annotated[list[str] | str, "Addresses to infer types for"],
 ) -> list[dict]:
-    """Infer and apply likely types at target addresses."""
+    """Legacy type inference (no canonical equivalent).
+    WHEN: guess and report the likely type at each address (Hex-Rays guess, existing tinfo, then size-based).
+    RETURNS: [{addr, inferred_type, method(hexrays|existing|size_based), confidence(high|low|none), error?}].
+    LIMITS: reports only; applies nothing. Low-confidence guesses are size-based (uint8_t/uint16_t/...)."""
     addrs = normalize_list_input(addrs)
     results = []
 

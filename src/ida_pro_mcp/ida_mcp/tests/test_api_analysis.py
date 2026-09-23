@@ -426,10 +426,11 @@ def test_find_code_ref_to_check_pw():
 
 @test()
 def test_find_invalid_type():
-    """find reports an unknown search type as an error."""
+    """find reports an unknown search type as an error with the Allowed list."""
     result = find("invalid_type", "test")
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="Unknown search type")
+    assert_error(result[0], contains="Allowed:")
 
 
 @test()

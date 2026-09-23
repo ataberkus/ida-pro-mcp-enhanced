@@ -275,7 +275,10 @@ def _profile_function(
 def decompile(
     addr: Annotated[str, "Function address or name to decompile"],
 ) -> dict:
-    """Decompile function(s) at address(es); returns pseudocode and per-item errors."""
+    """Canonical decompiler (listed in CANONICAL_TOOLS).
+    WHEN: decompile one function to pseudocode with detailed error reporting and disassembly fallback.
+    RETURNS: {addr, function_addr?, function_name?, code?, error?, details?, fallback{tool:"disassemble", addr}?}.
+    LIMITS: non-function addresses return function_not_defined + fallback; Hex-Rays failures include details + diagnostic logs."""
     try:
         try:
             start = parse_address(addr)
@@ -382,7 +385,10 @@ def disasm(
         bool, "Compute total instruction count (default: false)"
     ] = False,
 ) -> dict:
-    """Disassemble function with offset/max_instructions pagination and optional total count."""
+    """Prefer disassemble(addr, ...) for canonical disassembly.
+    WHEN: disassemble from addr with offset/max_instructions paging and optional total count.
+    RETURNS: {addr, asm{name, start_ea, lines, stack_frame?, return_type?, arguments?}, instruction_count, total_instructions?, cursor}.
+    LIMITS: max_instructions max 50000; without include_total, total_instructions is None; continue via cursor.next."""
 
     # Enforce max limit
     if max_instructions <= 0:
@@ -534,7 +540,10 @@ def func_profile(
         "Function profiling query (supports name/address filters + pagination)",
     ],
 ) -> list[dict]:
-    """Profile functions with summary metrics and optional sampled details."""
+    """Prefer analysis_run(mode="batch", ...) for canonical per-function metrics.
+    WHEN: profile function sets (metrics + optional sampled callers/callees/strings/constants/prototype).
+    RETURNS: [{query, data[profile{metrics, lists?}], next_offset, error}] per query.
+    LIMITS: count max 1000, max_items max 1000; "*" scans all functions; sampled lists capped per query."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -644,7 +653,10 @@ def analyze_batch(
         "Comprehensive per-function analysis with selectable sections",
     ],
 ) -> list[dict]:
-    """Run comprehensive analysis over one or more target functions."""
+    """Prefer analysis_run(mode="batch", targets=..., options=...) for canonical batch analysis.
+    WHEN: comprehensive per-function analysis with selectable sections (decompile/disasm/xrefs/callers/callees/strings/constants/blocks/proto).
+    RETURNS: [{query, addr, name, analysis{sections...}, error}] per query.
+    LIMITS: per-section max_* caps apply (disasm 50000, strings/callees 5000, constants/blocks 10000); missing query is an error entry."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -850,7 +862,10 @@ def xref_query(
         "Generic xref query with direction/type filters and pagination",
     ],
 ) -> list[dict]:
-    """Query xrefs with direction/type filters and pagination."""
+    """Prefer graph_query(kind="xrefs"|"xrefs_from"|"xrefs_both", ...) for canonical xref traversal.
+    WHEN: typed xref listing around one address with direction/type filters and offset/count paging.
+    RETURNS: [{query, resolved_addr, direction, xref_type, data[{direction, addr, from, to, type, fn?}], next_offset, total, error}].
+    LIMITS: bad direction/xref_type fall back to both/any; count max 5000; rows deduplicated by (direction, from, to, type)."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -981,7 +996,10 @@ def xrefs_to_field(
     queries: list[StructFieldQuery] | StructFieldQuery,
     limit: Annotated[int, "Max xrefs per query (default: 100, max: 1000)"] = 100,
 ) -> list[dict]:
-    """Get cross-references to structure fields"""
+    """Legacy struct-field xref lookup (no canonical equivalent).
+    WHEN: find code/data xrefs to {struct, field} members across the IDB.
+    RETURNS: [{struct, field, xrefs[{addr, ...}], more, error}] per query.
+    LIMITS: limit max 1000; missing type library returns error entries; unqualified field names may match multiple structs."""
     if isinstance(queries, dict):
         queries = [queries]
     if limit <= 0 or limit > 1000:
@@ -1087,7 +1105,10 @@ def callees(
     addrs: Annotated[list[str] | str, "Function addresses to get callees for"],
     limit: Annotated[int, "Max callees per function (default: 200, max: 500)"] = 200,
 ) -> list[dict]:
-    """Return unique callees per function, capped by limit."""
+    """Prefer graph_query(kind="calls", targets=...) for canonical call-graph traversal.
+    WHEN: list unique direct callees per function (call_only) with per-function cap.
+    RETURNS: [{addr, callees[{addr, name?}], more, error}] per function.
+    LIMITS: limit max 500; non-function addresses return error entries; one hop only (use callgraph/graph_query for depth)."""
     addrs = normalize_list_input(addrs)
 
     if limit <= 0 or limit > 500:
@@ -1127,7 +1148,10 @@ def find_bytes(
     limit: Annotated[int, "Max matches per pattern (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[dict]:
-    """Search byte patterns (supports ??) with offset/limit pagination."""
+    """Prefer search(kind="bytes", targets=...) for unified search with opaque cursor.
+    WHEN: scan the whole IDB for byte patterns ("48 8B ??") with offset/limit paging.
+    RETURNS: [{pattern, matches[hex], n, cursor, error}] per pattern.
+    LIMITS: limit max 10000; invalid patterns return build_err error entries; continue via cursor.next."""
     patterns = normalize_list_input(patterns)
 
     # Enforce max limit
@@ -1207,7 +1231,10 @@ def basic_blocks(
     ] = 1000,
     offset: Annotated[int, "Skip first N blocks (default: 0)"] = 0,
 ) -> list[dict]:
-    """Return function CFG blocks with offset/max_blocks pagination."""
+    """Prefer graph_query(kind="cfg", targets=...) for canonical CFG blocks.
+    WHEN: list CFG blocks per function with offset/max_blocks paging.
+    RETURNS: [{addr, blocks[{start, end, type?, succs, preds}], count, total_blocks, cursor, error}].
+    LIMITS: max_blocks max 10000; unresolved/non-function addresses return error entries; continue via cursor.next."""
     addrs = normalize_list_input(addrs)
 
     # Enforce max limit
@@ -1284,10 +1311,12 @@ def find(
     limit: Annotated[int, "Max matches per target (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[dict]:
-    """Search strings/immediates/refs for targets with offset/limit pagination."""
+    """Prefer search(kind="constant", targets=...) for immediates; search(kind="text") for strings.
+    WHEN: search by type string|immediate|data_ref|code_ref with offset/limit paging.
+    RETURNS: [{query, matches[hex], count, cursor, error}] per target.
+    LIMITS: limit max 10000; unknown type string returns an error entry listing Allowed values."""
     if not isinstance(targets, list):
         targets = [targets]
-
     # Enforce max limit to prevent token overflow
     if limit <= 0 or limit > 10000:
         limit = 10000
@@ -1484,13 +1513,14 @@ def find(
                 )
 
     else:
+        allowed_find_types = ("string", "immediate", "data_ref", "code_ref")
         results.append(
             {
                 "query": None,
                 "matches": [],
                 "count": 0,
                 "cursor": {"done": True},
-                "error": f"Unknown search type: {type}",
+                "error": f"Unknown search type: {type}. Allowed: {', '.join(allowed_find_types)}",
             }
         )
 
@@ -1652,7 +1682,10 @@ def insn_query(
         "Instruction query with mnemonic/operand filters and scoped scan",
     ],
 ) -> list[dict]:
-    """Query instructions with mnemonic/operand filters and scoped scans."""
+    """Prefer search(kind="instruction", targets=[mnem], ...) for unified instruction search.
+    WHEN: mnemonic/operand-filtered scan scoped by func/segment/start/end with offset/count paging.
+    RETURNS: [{query, ranges[{start, end}], matches[{addr, disasm?, fn?}], count, cursor, scanned, truncated, next_start, error}].
+    LIMITS: count max 5000, max_scan_insns max 2000000; unscoped scans need allow_broad or they error."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -1781,7 +1814,10 @@ def export_funcs(
         str, "Export format: json (default), c_header, or prototypes"
     ] = "json",
 ) -> dict:
-    """Export function data for addresses in json/c_header/prototypes formats."""
+    """Legacy function exporter (no canonical equivalent).
+    WHEN: dump function records (name, prototype, size, comments; json adds asm+decompile+xrefs).
+    RETURNS: {format, functions[] | content(c_header) | functions[{name, prototype}](prototypes)}.
+    LIMITS: format json|c_header|prototypes (default json); unknown functions return error entries."""
     addrs = normalize_list_input(addrs)
     results = []
 
@@ -1858,7 +1894,10 @@ def callgraph(
         int, "Max edges per function (default: 200, max: 5000)"
     ] = 200,
 ) -> list[dict]:
-    """Build bounded callgraph from roots with depth/node/edge limits."""
+    """Prefer graph_query(kind="calls", targets=..., max_depth=...) for canonical call graphs.
+    WHEN: bounded multi-hop call-graph traversal from root functions with node/edge budgets.
+    RETURNS: [{root, nodes[{addr, name, depth}], edges[{from, to, type}], truncated, limit_reason?, per_func_capped, error}].
+    LIMITS: depth max 20, nodes max 100000, edges max 200000, per-func edges max 5000; truncated signals budget hit."""
     roots = normalize_list_input(roots)
     if max_depth < 0:
         max_depth = 0

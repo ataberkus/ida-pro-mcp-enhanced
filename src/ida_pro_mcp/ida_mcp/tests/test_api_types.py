@@ -498,3 +498,12 @@ def test_infer_types_invalid_text_address_errors_cleanly():
     result = infer_types("InvalidAddressName123")
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="Failed to parse address")
+
+
+@test()
+def test_type_query_invalid_kind_lists_allowed():
+    """type_query reports unsupported kinds with the Allowed value list."""
+    page = type_query({"kind": "not_a_kind"})[0]
+    assert page["data"] == []
+    assert "not_a_kind" in str(page["error"])
+    assert "Allowed:" in str(page["error"])

@@ -181,7 +181,10 @@ class ListQuery(TypedDict, total=False):
 class EntityQuery(TypedDict, total=False):
     """Generic IDB entity query with filtering, projection, and pagination"""
 
-    kind: Annotated[str, "Entity kind: functions|globals|imports|strings|names"]
+    kind: Annotated[
+        Literal["functions", "globals", "imports", "strings", "names"],
+        "Entity kind: functions|globals|imports|strings|names",
+    ]
     filter: Annotated[str, "Optional glob/regex filter (name/text depending on kind)"]
     regex: Annotated[str, "Optional regex applied to the primary text field"]
     min_addr: Annotated[str, "Optional minimum address bound (hex/decimal)"]
@@ -266,7 +269,7 @@ class TypeQuery(TypedDict, total=False):
 
     filter: Annotated[str, "Optional type name glob/regex filter"]
     kind: Annotated[
-        str,
+        Literal["any", "struct", "union", "enum", "typedef", "func", "ptr", "udt"],
         "any|struct|union|enum|typedef|func|ptr|udt (default: any)",
     ]
     offset: Annotated[int, "Starting index (default: 0)"]

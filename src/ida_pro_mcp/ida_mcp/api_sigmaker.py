@@ -153,10 +153,10 @@ def make_signature(
         "Maximum signature length in bytes before giving up (default: 1000)",
     ] = 1000,
 ) -> list[MakeSigResult]:
-    """Create unique byte signatures for addresses. Generates the shortest
-    unique signature starting at each address by walking instructions and
-    wildcarding operands. Useful for finding stable patterns that survive
-    recompilation."""
+    """Prefer signature_create(addrs, ...) for canonical signatures.
+    WHEN: shortest unique signature at each exact address, walking instructions with wildcarded operands.
+    RETURNS: [{query, addr, signature, format, unique, error}] per address.
+    LIMITS: format ida|x64dbg|mask|bitmask (bad format errors); max_length caps walk before giving up."""
     return _make_signatures(addrs, "exact", format, wildcard_operands, max_length)
 
 
@@ -181,7 +181,8 @@ def make_signature_for_function(
         "Maximum signature length in bytes before giving up (default: 1000)",
     ] = 1000,
 ) -> list[MakeSigForFunctionResult]:
-    """Create unique byte signatures for function entry points. Resolves each
-    name/address to a function, then generates the shortest unique signature
-    starting at the function start."""
+    """Prefer signature_create(addrs, ...) (delegates to this function-anchored form).
+    WHEN: shortest unique signature at each function's start (names/addresses resolve to function starts).
+    RETURNS: [{query, addr(function start), name, signature, format, unique, error}] per function.
+    LIMITS: non-function addresses error; same format/max_length limits as make_signature."""
     return _make_signatures(addrs, "function", format, wildcard_operands, max_length)
