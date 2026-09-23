@@ -291,8 +291,12 @@ def decompile(
                     "error": f"Function not found: {addr!r}",
                 }
             start = ea
-        function = ida_funcs.get_func(start)
-        if function is None:
+        if compat.IDA_VERSION >= (9, 2, 0):
+            function_start = ida_funcs.get_func_start(start)
+        else:
+            function = ida_funcs.get_func(start)
+            function_start = function.start_ea if function else idaapi.BADADDR
+        if function_start == idaapi.BADADDR:
             details = {
                 "input": addr,
                 "resolved_addr": hex(start),
@@ -312,7 +316,6 @@ def decompile(
                 "fallback": {"tool": "disassemble", "addr": hex(start)},
             }
 
-        function_start = int(function.start_ea)
         function_name = ida_funcs.get_func_name(function_start) or None
         try:
             code = decompile_function_detailed(function_start)

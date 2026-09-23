@@ -52,6 +52,28 @@ def test_decompile_valid_function():
     assert_non_empty(result["code"])
 
 
+@test()
+def test_decompile_without_deprecation_warning():
+    """Decompilation should not warn about deprecated IDA function lookups."""
+    import warnings
+
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always", DeprecationWarning)
+        result = decompile(fn_addr)
+
+    assert_ok(result, "code")
+    deprecated_here = [
+        warning for warning in captured
+        if issubclass(warning.category, DeprecationWarning)
+        and warning.filename.endswith("api_analysis.py")
+    ]
+    assert not deprecated_here, deprecated_here
+
+
 @test(binary="crackme03.elf")
 def test_decompile_main_contains_expected_logic():
     """decompile(main) exposes the core crackme logic in pseudocode."""
