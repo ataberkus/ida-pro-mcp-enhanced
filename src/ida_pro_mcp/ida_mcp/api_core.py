@@ -169,7 +169,7 @@ def _primary_text_key(kind: str) -> str:
     return "name"
 
 
-def _collect_entities(kind: str) -> list[dict]:
+def _collect_entities(kind: str, query: dict | None = None) -> list[dict]:
     if kind == "functions":
         rows: list[dict] = []
         for ea in idautils.Functions():
@@ -251,7 +251,18 @@ def _collect_entities(kind: str) -> list[dict]:
             )
         return rows
 
-    return []
+    if kind in {"switches", "patches", "classes", "vtables", "signatures", "type_libraries"}:
+        from . import api_recovery
+
+        if kind == "switches":
+            return api_recovery.collect_switches(api_recovery.resolve_switch_targets(query or {}))
+        if kind == "patches":
+            return api_recovery.collect_patches()
+        if kind in {"classes", "vtables"}:
+            return api_recovery.collect_classes()
+        if kind == "signatures":
+            return api_recovery.collect_signature_files()
+        return api_recovery.collect_type_libraries()
 
 
 def _apply_projection(items: list[dict], fields: list[str] | None) -> list[dict]:
@@ -507,7 +518,7 @@ def entity_query(
     ],
 ) -> list[dict]:
     """Canonical entity search (listed in CANONICAL_TOOLS).
-    WHEN: filtered/paginated listing of functions|globals|imports|strings|names with glob/regex filter, projection, sorting.
+    WHEN: filtered/paginated listing of functions|globals|imports|strings|names|switches|patches|classes|vtables|signatures|type_libraries with glob/regex filter, projection, sorting.
     RETURNS: [{kind, data[rows], next_offset, total, error}] per query.
     LIMITS: count max 5000; bad kind returns an error entry listing Allowed values; regex errors surface in error, not raises."""
     queries = normalize_dict_list(
@@ -518,7 +529,7 @@ def entity_query(
 
     for query in queries:
         kind = str(query.get("kind", "functions") or "functions").lower()
-        allowed_entity_kinds = ("functions", "globals", "imports", "strings", "names")
+        allowed_entity_kinds = ("functions", "globals", "imports", "strings", "names", "switches", "patches", "classes", "vtables", "signatures", "type_libraries")
         if kind not in set(allowed_entity_kinds):
             results.append(
                 {
@@ -531,7 +542,7 @@ def entity_query(
             )
             continue
 
-        rows = _collect_entities(kind)
+        rows = _collect_entities(kind, query)
         primary_key = _primary_text_key(kind)
         filter_pattern = str(query.get("filter", "") or "")
         if filter_pattern:

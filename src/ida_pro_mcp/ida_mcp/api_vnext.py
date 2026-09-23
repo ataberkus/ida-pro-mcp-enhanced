@@ -749,6 +749,10 @@ def memory_read(
         "global": ("get_global_value", "queries"),
     }
     normalized_kind = str(kind).lower()
+    if normalized_kind == "patch_diff":
+        from . import api_recovery
+
+        return ToolEnvelope({"text": api_recovery.patch_diff_text()}, provenance={"legacy_tool": "visit_patched_bytes"}).to_dict()
     if normalized_kind not in mapping:
         _unsupported("memory read kind", kind, get_args(MemoryReadKind))
     name, argument_name = mapping[normalized_kind]
@@ -801,6 +805,17 @@ def _analysis_sync(mode: str, targets: list[str], options: dict[str, Any]) -> An
         return _legacy_call("analyze_component", {"addrs": targets})
     if mode == "batch":
         return _legacy_call("analyze_batch", {"queries": [{"addr": target} for target in targets]})
+    if mode == "similar":
+        from . import api_recovery
+        from .utils import resolve_address_or_name
+
+        if len(targets) != 1:
+            raise VNextError(ErrorCode.INVALID_OPERATION, "Similar analysis requires one target")
+        return api_recovery.similar_functions(
+            resolve_address_or_name(targets[0]),
+            int(options.get("limit", 20) or 20),
+            float(options.get("min_score", 0.3) or 0.3),
+        )
     _unsupported("analysis mode", mode, get_args(AnalysisMode))
 
 
@@ -1212,6 +1227,8 @@ _OPERATION_TARGETS: dict[str, tuple[str, str, SafetyScope]] = {
     "make_data": ("make_data", "items", SafetyScope.MODIFY),
     "declare_stack": ("declare_stack", "items", SafetyScope.ANNOTATE),
     "delete_stack": ("delete_stack", "items", SafetyScope.ANNOTATE),
+    "apply_flirt": ("apply_flirt_signature", "items", SafetyScope.MODIFY),
+    "load_til": ("load_type_library", "items", SafetyScope.MODIFY),
     "save_database": ("idb_save", "path", SafetyScope.FILESYSTEM),
 }
 

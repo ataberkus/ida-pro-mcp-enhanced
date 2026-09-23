@@ -182,8 +182,8 @@ class EntityQuery(TypedDict, total=False):
     """Generic IDB entity query with filtering, projection, and pagination"""
 
     kind: Annotated[
-        Literal["functions", "globals", "imports", "strings", "names"],
-        "Entity kind: functions|globals|imports|strings|names",
+        Literal["functions", "globals", "imports", "strings", "names", "switches", "patches", "classes", "vtables", "signatures", "type_libraries"],
+        "Entity kind: functions|globals|imports|strings|names|switches|patches|classes|vtables|signatures|type_libraries",
     ]
     filter: Annotated[str, "Optional glob/regex filter (name/text depending on kind)"]
     regex: Annotated[str, "Optional regex applied to the primary text field"]
@@ -201,6 +201,10 @@ class EntityQuery(TypedDict, total=False):
     ]
     case_sensitive: Annotated[
         NotRequired[bool], "Case-sensitive regex match (default: true)"
+    ]
+    targets: Annotated[
+        NotRequired[list[str]],
+        "Optional switch-target scope: function names/addresses (switches only)",
     ]
 
 

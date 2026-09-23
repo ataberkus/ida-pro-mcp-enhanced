@@ -156,6 +156,8 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
         "undefine",
         "set_op_type",
         "make_data",
+        "apply_flirt_signature",
+        "load_type_library",
     }:
         registry.set_scope(name, SafetyScope.MODIFY, replacement="mutation_preview")
 
