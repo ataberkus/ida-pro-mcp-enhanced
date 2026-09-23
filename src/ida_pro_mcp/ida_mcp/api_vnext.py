@@ -974,6 +974,7 @@ def dataflow_trace(
 def taint_analyze(
     sources: Annotated[list[str], "Source addresses or symbols"],
     sinks: Annotated[list[str], "Sink addresses or symbols"],
+    max_depth: Annotated[int, "Maximum propagation depth"] = 4,
     sanitizers: Annotated[list[str] | None, "Known sanitizer symbols"] = None,
     options: Annotated[TaintOptions | None, "Propagation domains and result budgets"] = None,
 ) -> dict[str, Any]:
@@ -981,6 +982,7 @@ def taint_analyze(
     RETURNS {engine, fidelity, hits, sanitizer_annotations, warnings, truncated} dict.
     LIMITS BFS over reference/microcode graphs capped by max_depth and options.max_paths (1-1000); domains filter register/stack/global/memory; large outputs use the rpc 50k download indirection. NEXT investigation_add_finding to record hits."""
     effective_sanitizers = list(sanitizers or [])
+    effective_options = dict(options or {})
     traces = [dataflow_trace(source, "forward", max_depth) for source in sources]
     include_traces = bool(effective_options.get("include_traces", False))
     max_paths = max(1, min(int(effective_options.get("max_paths", 100)), 1000))
@@ -1728,7 +1730,8 @@ def mutation_preview(
         "{kind: comment, arguments: {items: [{addr, comment}]}}. "
         "kind is one of: rename, comment, append_comment, bookmark, declare_type, "
         "set_type, patch_bytes, write_integer, patch_asm, define_function, define_code, "
-        "undefine, set_operand_type, make_data, declare_stack, delete_stack, save_database. "
+        "undefine, set_operand_type, make_data, declare_stack, delete_stack, apply_flirt, "
+        "load_til, save_database. "
         "Aliases set_name/rename_func map to rename.",
     ],
 ) -> dict[str, Any]:

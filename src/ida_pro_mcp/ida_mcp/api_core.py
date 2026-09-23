@@ -166,6 +166,10 @@ def _collect_imports() -> list[Import]:
 def _primary_text_key(kind: str) -> str:
     if kind == "strings":
         return "text"
+    if kind == "switches":
+        return "func"
+    if kind == "patches":
+        return "addr"
     return "name"
 
 

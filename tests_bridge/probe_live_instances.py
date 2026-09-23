@@ -67,8 +67,6 @@ def main() -> None:
         expect = inst.get("input_file", "?")
         print(f"===== PORT {port} (registry: {expect}, pid {inst['pid']}) =====")
         print("  server_health ->", call(port, "server_health", {})[:200])
-        funcs = call(port, "list_funcs", {"queries": {"count": 3}})
-        print("  list_funcs[count=3] ->", funcs[:400])
         print()
 
 

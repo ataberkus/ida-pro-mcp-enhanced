@@ -137,8 +137,6 @@ def collect_patches() -> list[dict]:
 def patch_diff_text() -> str:
     """Render patched bytes in IDA .dif text format."""
     try:
-        import ida_nalt
-
         filename = ida_nalt.get_root_filename() or "input"
     except Exception:
         filename = "input"
