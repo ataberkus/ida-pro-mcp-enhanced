@@ -11,7 +11,7 @@ import inspect
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
-from typing import Any, Callable, Union, Annotated, BinaryIO, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
+from typing import Any, Callable, Union, Annotated, BinaryIO, Literal, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
 from types import UnionType
 from urllib.parse import urlparse, parse_qs, urlunparse
 from io import BufferedIOBase
@@ -1293,6 +1293,11 @@ class McpServer:
         # NotRequired[T]
         if origin is NotRequired:
             return self._type_to_json_schema(get_args(py_type)[0])
+
+        # Literal["a", "b"] / Literal[1, 2]
+        if origin is Literal:
+            values = list(get_args(py_type))
+            return {"type": {bool: "boolean", int: "integer", float: "number"}.get(type(values[0]), "string"), "enum": values}
 
         # Union[Ts..], Optional[T] and T1 | T2
         if origin in (Union, UnionType):
