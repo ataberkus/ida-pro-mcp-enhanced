@@ -13,6 +13,8 @@ Instead of forcing an agent through hundreds of tiny read calls, vNext combines 
 - **Fewer round trips.** Batch-first queries, bounded responses, cached strings, and combined analysis results reduce tool-call churn on large databases.
 - **Search the analysis, not only the binary.** Deadline-aware listing search finds rendered instructions and analyst comments across selected ranges with resumable cursors.
 - **Safe autonomous editing.** Renames, types, comments, and other IDB changes use preview/commit transactions, revision checks, recovery checkpoints, and rollback support.
+- **Binary recovery built in.** RTTI class and vtable recovery (MSVC and Itanium), switch/jump-table enumeration, patched-byte diffs, FLIRT signatures, type libraries, and function similarity search are part of the canonical surface.
+- **Self-describing tools.** Fixed-choice parameters are advertised as JSON Schema enums and validated, invalid input returns actionable errors that list the allowed values, and every tool description follows a WHEN / LIMITS / NEXT format.
 - **Sharper IDB refinement.** Agents can add bookmarks, set operand display and structure-offset types, and create typed data through the transactional mutation path.
 - **Multiple IDA databases at once.** The stdio bridge discovers live IDA processes and routes each call to the right database.
 - **Real safety controls.** Read, annotate, modify, debugger, filesystem, and Python capabilities are independently scoped.
@@ -233,11 +235,13 @@ The advertised vNext API is deliberately focused:
 - `dataflow_trace` follows values forward or backward from an address or a symbol such as `main`.
 - `taint_analyze` traces source-to-sink influence with explicit bounds.
 - `decompile`, `disassemble`, `search`, `memory_read`, and `type_query` provide targeted evidence when deeper inspection is needed.
+- `entity_query` lists functions, globals, imports, strings, and names, plus recovered `switches`, `patches`, `classes`/`vtables`, available FLIRT `signatures`, and `type_libraries`.
+- `analysis_run` in `similar` mode ranks functions by mnemonic 3-gram similarity to a target; `memory_read` with kind `patch_diff` reports every patched byte range.
 - `search` now covers rendered disassembly and comments, while `memory_read` accepts agent-friendly address forms and produces bounded results.
 - Opt-in debugger and Python scopes include debugger-state inspection and execution of workspace-restricted analysis scripts.
-- Mutation tools preview a batch, validate the active database revision, create a checkpoint, and then commit atomically.
+- Mutation tools preview a batch, validate the active database revision, create a checkpoint, and then commit atomically. Operations include `apply_flirt` and `load_til` for applying FLIRT signatures and loading type libraries.
 
-Legacy tools are currently hidden from MCP clients so the vNext interface can be tested as a complete workflow. Their implementations remain available internally where vNext orchestration depends on them.
+Legacy tools are hidden from MCP clients. Dead code, duplicate helpers, and tools superseded by vNext have been removed; the remaining legacy implementations are kept only where vNext orchestration delegates to them.
 
 ## Safety profiles
 
@@ -263,8 +267,8 @@ A direct connection to `http://127.0.0.1:13337/mcp` still works, but it connects
 
 Current Windows/IDA 9.4 release checks:
 
-- Portable suite: **243 passed, 114 subtests passed**.
-- Multi-instance bridge suite: **17 passed**.
+- Portable suite: **294 passed, 116 subtests passed**.
+- Multi-instance bridge suite: **24 passed**.
 - Targeted Ruff checks, `compileall`, package build, isolated installation, and CLI smoke pass.
 - Live IDA 9.4 registration, resource reads, tool listing, function analysis, transactional mutation, and IDB save have been exercised.
 - The thread-safe Qt posted-event scheduler and immediate request chaining are live verified in IDA 9.4; search-page budgeting and late-callback abandonment are regression tested.
