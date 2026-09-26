@@ -82,21 +82,13 @@ class WorkspacePolicy:
         candidate = Path(value).expanduser().resolve(strict=must_exist)
         if not self.roots:
             return candidate
-        if any(_is_relative_to(candidate, root) for root in self.roots):
+        if any(candidate.is_relative_to(root) for root in self.roots):
             return candidate
         raise VNextError(
             ErrorCode.PROFILE_DENIED,
             "Path is outside configured workspace roots",
             details={"path": str(candidate), "roots": [str(root) for root in self.roots]},
         )
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
 
 
 def write_token_file(path: Path, token: str) -> None:

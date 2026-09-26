@@ -5,7 +5,6 @@ from ida_pro_mcp.vnext.function_review import (
     format_analysis_summary,
     local_rename_rows,
     lvar_names_from_decompiled,
-    parse_local_renames,
     selected_local_renames,
 )
 
@@ -49,9 +48,7 @@ def test_local_rows_prefer_decompiler_locals_over_regex():
     assert parsed == ["a1", "a2", "v3"]
 
 
-def test_parse_and_select_local_renames():
-    parsed = parse_local_renames("a1=argc\nv3 -> count\n# skip\nv3=count\nfoo=\n")
-    assert parsed == [{"old": "a1", "new": "argc"}, {"old": "v3", "new": "count"}]
+def test_select_local_renames():
     selected = selected_local_renames(
         [{"name": "a1", "new": "argc"}, {"name": "v3", "new": "v3"}, {"name": "a2", "new": ""}]
     )

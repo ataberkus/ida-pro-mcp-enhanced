@@ -13,7 +13,6 @@ from ida_pro_mcp.vnext.analysis import bounded_subgraph
 from ida_pro_mcp.vnext.contracts import AnalysisEngine, AnalysisGraph, ErrorCode, VNextError
 
 from .sync import IDAError, idasync, tool_timeout
-from .utils import parse_address
 
 
 def _location_text(location: Any) -> str:

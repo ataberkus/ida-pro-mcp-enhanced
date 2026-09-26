@@ -23,13 +23,7 @@ DEBUG_TOOLS = {
     "dbg_add_bp",
     "dbg_delete_bp",
     "dbg_toggle_bp",
-    "dbg_regs_all",
-    "dbg_regs_remote",
     "dbg_regs",
-    "dbg_gpregs_remote",
-    "dbg_gpregs",
-    "dbg_regs_named_remote",
-    "dbg_regs_named",
     "dbg_stacktrace",
     "dbg_read",
     "dbg_write",
@@ -65,11 +59,11 @@ def test_dbg_status_reports_not_running_without_debugger():
 def test_dbg_regs_require_running_debugger():
     """Register reads are rejected before touching the debugger."""
     try:
-        api_debug.dbg_regs_all()
+        api_debug.dbg_regs()
     except IDAError as exc:
         assert "not running" in str(exc), f"unexpected error: {exc}"
         return
-    raise AssertionError("dbg_regs_all did not raise without a debugger")
+    raise AssertionError("dbg_regs did not raise without a debugger")
 
 
 @test()

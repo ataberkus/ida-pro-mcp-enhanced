@@ -7,7 +7,7 @@ from typing import Annotated
 
 import ida_funcs
 
-from .rpc import tool, unsafe
+from .rpc import tool
 from .sync import idasync, tool_timeout, IDAError
 from .utils import (
     parse_address,
@@ -174,13 +174,10 @@ def analyze_function(
     addr: Annotated[str, "Function address or name"],
     include_asm: Annotated[bool, "Include full disassembly (default: false, saves tokens)"] = False,
 ) -> dict:
-    """Get a compact analysis of a single function: decompiled pseudocode (capped
-    at 100 lines), top 10 strings as values, top 10 non-trivial constants, caller
-    and callee names, cross-references, and basic block metrics. Disassembly is
-    excluded by default to save context tokens — set include_asm=true only when
-    you need raw instructions (crypto analysis, shellcode, decompiler failure).
-    Use this instead of calling decompile, disasm, callees, xrefs_to, stack_frame,
-    and basic_blocks separately."""
+    """Prefer analysis_run(mode="function", targets=[addr], ...) for canonical single-function analysis.
+    WHEN: compact single-function brief (capped pseudocode, top strings/constants, callers/callees, xrefs, block metrics).
+    RETURNS: {addr, name?, prototype?, size?, decompile?, strings?, constants?, callers?, callees?, xrefs?, blocks?, error?}.
+    LIMITS: decompile capped at 100 lines; pass include_asm=true only for raw instructions (crypto/shellcode/decompiler failure)."""
 
     try:
         ea = _resolve_addr(addr)
@@ -201,13 +198,10 @@ def analyze_function(
 def analyze_component(
     addrs: Annotated[list[str] | str, "Function addresses (comma-separated or list)"],
 ) -> dict:
-    """Analyze a group of related functions as one logical unit. Returns a COMPACT
-    summary of each function (name, prototype, size, callee names, top 5 strings,
-    block count) plus relationship data: internal call graph, shared globals,
-    interface vs internal classification, and strings used by multiple functions.
-    Use analyze_function on individual addresses if you need full decompilation.
-    Use this when you see a cluster of sub_* functions called from the same parent
-    or when callees/callers overlap suggests a module."""
+    """Prefer analysis_run(mode="component", targets=[...], ...) for canonical component analysis.
+    WHEN: compact briefs for a cluster of related functions plus internal call graph, shared globals, interface classification.
+    RETURNS: {functions[{addr, name, prototype, size, callees, strings, basic_blocks, complexity}], nodes?, edges?, shared_globals?, error?}.
+    LIMITS: per-function summaries are compact (no full decompile); unresolvable inputs return an error entry."""
 
     import idaapi
     import idautils
@@ -360,120 +354,7 @@ def analyze_component(
 
 
 # ---------------------------------------------------------------------------
-# Tool 3 — diff_before_after
-# ---------------------------------------------------------------------------
-
-_VALID_ACTIONS = frozenset({"rename_func", "set_type", "set_comment"})
-
-
-
-@tool
-@unsafe
-@idasync
-@tool_timeout(120.0)
-def diff_before_after(
-    addr: Annotated[str, "Function address"],
-    action: Annotated[str, "Action: 'rename_func', 'set_type', 'set_comment'"],
-    action_args: Annotated[dict, "Arguments for the action"],
-) -> dict:
-    """Preview a single change: applies it, captures the result, then restores the original state. The database is left unchanged."""
-
-    import ida_nalt
-    import ida_name
-    import idaapi
-    import ida_typeinf
-
-    if action not in _VALID_ACTIONS:
-        return {"error": f"Invalid action {action!r}. Must be one of: {', '.join(sorted(_VALID_ACTIONS))}"}
-
-    try:
-        ea = _resolve_addr(addr)
-    except IDAError as exc:
-        return {"error": str(exc)}
-
-    func = ida_funcs.get_func(ea)
-    if func is None:
-        return {"error": f"No function at {hex(ea)}"}
-
-    # --- Before state ---
-    before = decompile_function_safe(ea)
-    old_name = idaapi.get_name(ea) or ""
-    old_cmt = idaapi.get_cmt(ea, False) or ""
-    old_tif = ida_typeinf.tinfo_t()
-    had_type = bool(ida_nalt.get_tinfo(old_tif, ea))
-
-    # --- Apply action ---
-    applied: str
-    try:
-        if action == "rename_func":
-            name = action_args.get("name")
-            if not name:
-                return {"error": "action_args must contain 'name'"}
-            ok = idaapi.set_name(ea, name, idaapi.SN_CHECK)
-            if not ok:
-                return {"error": f"set_name failed for {name!r}"}
-            applied = f"Renamed to {name!r}"
-
-        elif action == "set_type":
-            type_str = action_args.get("type")
-            if not type_str:
-                return {"error": "action_args must contain 'type'"}
-            decl_str = type_str.strip()
-            if not decl_str.endswith(";"):
-                decl_str += ";"
-            tif = ida_typeinf.tinfo_t()
-            til = ida_typeinf.get_idati()
-            parsed = ida_typeinf.parse_decl(tif, til, decl_str, ida_typeinf.PT_SIL)
-            if parsed is None:
-                return {"error": f"Failed to parse type: {type_str!r}"}
-            ok = ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
-            if not ok:
-                return {"error": f"apply_tinfo failed for {type_str!r}"}
-            applied = f"Set type to {type_str!r}"
-
-        elif action == "set_comment":
-            comment = action_args.get("comment")
-            if comment is None:
-                return {"error": "action_args must contain 'comment'"}
-            idaapi.set_cmt(ea, comment, False)
-            applied = f"Set comment: {comment!r}"
-
-        else:
-            return {"error": f"Unhandled action {action!r}"}
-    except Exception as exc:
-        return {"error": f"Action {action!r} failed: {exc}"}
-
-    # --- After ---
-    after = decompile_function_safe(ea)
-
-    # --- Restore original state ---
-    restore_error = None
-    try:
-        ida_name.set_name(ea, old_name or "", ida_name.SN_CHECK | ida_name.SN_FORCE)
-        idaapi.set_cmt(ea, old_cmt or "", False)
-        if had_type:
-            ida_typeinf.apply_tinfo(ea, old_tif, ida_typeinf.TINFO_DEFINITE)
-        else:
-            ida_nalt.del_tinfo(ea)
-    except Exception as exc:
-        restore_error = str(exc)
-
-    reread = decompile_function_safe(ea)
-    restored = restore_error is None and reread == before
-    result: dict = {
-        "before": before,
-        "after": after,
-        "action_applied": applied,
-        "changes_detected": before != after,
-        "restored": restored,
-    }
-    if not restored:
-        result["restore_error"] = restore_error or "state differs after restore"
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Tool 4 — trace_data_flow
+# Tool 3 — trace_data_flow
 # ---------------------------------------------------------------------------
 
 _MAX_TRACE_NODES = 200
@@ -489,14 +370,10 @@ def trace_data_flow(
     direction: Annotated[str, "'forward' (xrefs from) or 'backward' (xrefs to)"] = "forward",
     max_depth: Annotated[int, "Maximum traversal depth"] = 5,
 ) -> dict:
-    """Follow cross-references from or to an address, automatically traversing
-    multiple hops. Use 'forward' to see where data flows TO (xrefs-from), or
-    'backward' to see where data flows FROM (xrefs-to). At each node in the
-    traversal, returns the function name, instruction, and whether it's code or
-    data. Use this when you find an interesting string, constant, or global and
-    want to understand every code path that touches it without manually chaining
-    xrefs_to calls. Do not use for call graph traversal — use callgraph for that.
-    max_depth controls how many hops to follow (default 5, max 20)."""
+    """Prefer dataflow_trace(addr, direction=..., max_depth=...) for canonical ref-flow traces.
+    WHEN: multi-hop xref BFS from an address (forward=xrefs-from, backward=xrefs-to) with per-node func/instruction/type.
+    RETURNS: {start, direction, depth_reached, nodes[{addr, func, instruction, type, name, depth}], edges[{from, to, type}], truncated, error?}.
+    LIMITS: max_depth max 20; 200 nodes / 500 edges max (truncated set); bad direction returns an error dict. Keep .lower() normalization."""
 
     import idaapi
     import idautils

@@ -5,7 +5,7 @@ import os
 import threading
 import time
 import traceback
-from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
+from typing import Any, Callable, Literal, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
 from types import UnionType
 
 JsonRpcId: TypeAlias = str | int | float | None
@@ -347,6 +347,16 @@ class JsonRpcRegistry:
                             param_name,
                             type(value).__name__
                         ))
+                    validated_params[param_name] = value
+                    continue
+
+                # Tools validate enum members after normalizing case; check Literal's value type here.
+                if origin is Literal:
+                    if not any(type(value) is type(choice) for choice in args):
+                        raise JsonRpcException(
+                            -32602,
+                            f"Invalid params: {param_name} has invalid type {type(value).__name__} for Literal",
+                        )
                     validated_params[param_name] = value
                     continue
 

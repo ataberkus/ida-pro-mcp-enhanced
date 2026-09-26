@@ -17,11 +17,9 @@ from ..api_types import (
     declare_type,
     enum_upsert,
     read_struct,
-    search_structs,
     type_query,
     type_inspect,
     set_type,
-    type_apply_batch,
     infer_types,
 )
 
@@ -38,10 +36,15 @@ TYPED_FIXTURE_INFER_FALLBACK = "0x1069fa4"
 TYPED_FIXTURE_LOCAL_NAME = "rhs_handle"
 
 
+def _find_udt(name: str) -> dict | None:
+    """Return the type_query row for an exact struct/union name, if present."""
+    page = type_query({"filter": name, "kind": "udt", "include_members": True, "count": 5000})[0]
+    return next((row for row in page["data"] if row["name"] == name), None)
+
+
 def create_test_struct(name: str = TEST_STRUCT_NAME) -> bool:
     """Create a deterministic test struct if it does not already exist."""
-    search_result = search_structs(name)
-    if search_result and any(s["name"] == name for s in search_result):
+    if _find_udt(name):
         return True
 
     struct_def = f"""
@@ -59,8 +62,7 @@ def create_test_struct(name: str = TEST_STRUCT_NAME) -> bool:
     if entry.get("ok"):
         return True
 
-    search_result = search_structs(name)
-    return bool(search_result and any(s["name"] == name for s in search_result))
+    return _find_udt(name) is not None
 
 
 def _require_any_function() -> str:
@@ -72,13 +74,11 @@ def _require_any_function() -> str:
 
 @test()
 def test_declare_type_creates_searchable_struct():
-    """declare_type creates a struct that can be found again via search_structs."""
+    """declare_type creates a struct that can be found again via type_query."""
     assert create_test_struct(TEST_STRUCT_NAME), "failed to declare test struct"
-    result = search_structs(TEST_STRUCT_NAME)
-    assert_is_list(result, min_length=1)
-    match = next((s for s in result if s["name"] == TEST_STRUCT_NAME), None)
+    match = _find_udt(TEST_STRUCT_NAME)
     assert match is not None
-    assert match["cardinality"] == 3
+    assert match["member_count"] == 3
     assert match["size"] >= 8
 
 
@@ -179,36 +179,6 @@ def test_read_struct_without_type_info_fails_cleanly():
     result = read_struct({"addr": "0x201f"})
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="could not auto-detect")
-
-
-@test()
-def test_search_structs_finds_declared_structs():
-    """search_structs returns the previously declared deterministic struct."""
-    if not create_test_struct(TEST_STRUCT_NAME):
-        skip_test("failed to declare test struct")
-
-    result = search_structs("__TestStruct__")
-    assert_is_list(result, min_length=1)
-    assert any(item["name"] == TEST_STRUCT_NAME for item in result)
-
-
-@test()
-def test_search_structs_pattern_no_match():
-    """search_structs returns an empty list for an unmatched substring."""
-    result = search_structs("VeryUnlikelyStructName123")
-    assert_is_list(result)
-    assert len(result) == 0
-
-
-@test(binary="typed_fixture.elf")
-def test_search_structs_exact_wrapper_match():
-    """search_structs finds the exact Wrapper struct in the typed fixture."""
-    result = search_structs("Wrapper")
-    assert_is_list(result, min_length=1)
-    wrapper = next((item for item in result if item["name"] == "Wrapper"), None)
-    assert wrapper is not None
-    assert wrapper["cardinality"] == 2
-    assert wrapper["size"] == 24
 
 
 @test()
@@ -357,18 +327,6 @@ def test_set_type_global_invalid_type_name():
     result = set_type({"addr": TYPED_FIXTURE_G_POINT, "ty": "NoSuchType", "kind": "global"})
     assert_is_list(result, min_length=1)
     assert_error(result[0])
-
-
-@test()
-def test_type_apply_batch():
-    """type_apply_batch applies edits and returns summary counters"""
-    result = type_apply_batch({"edits": [{"addr": _require_any_function(), "ty": TYPE_APPLY_SIGNATURE}]})
-    assert "ok" in result
-    assert "applied" in result
-    assert "failed" in result
-    assert "stopped" in result
-    assert "results" in result
-    assert_is_list(result["results"], min_length=1)
 
 
 @test()
@@ -540,3 +498,12 @@ def test_infer_types_invalid_text_address_errors_cleanly():
     result = infer_types("InvalidAddressName123")
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="Failed to parse address")
+
+
+@test()
+def test_type_query_invalid_kind_lists_allowed():
+    """type_query reports unsupported kinds with the Allowed value list."""
+    page = type_query({"kind": "not_a_kind"})[0]
+    assert page["data"] == []
+    assert "not_a_kind" in str(page["error"])
+    assert "Allowed:" in str(page["error"])

@@ -4,8 +4,7 @@ import logging
 import re
 import ida_netnode
 from urllib.parse import urlparse, parse_qs
-from typing import TypeVar, cast
-from http.server import HTTPServer
+from typing import TypeVar
 
 from .profile import dump_profile, parse_profile, parse_profile_scopes
 from .sync import idasync
@@ -21,10 +20,7 @@ from .rpc import (
 )
 from ida_pro_mcp.vnext.contracts import SafetyScope
 from ida_pro_mcp.vnext.policy import CANONICAL_TOOLS
-from ida_pro_mcp.vnext.profiles import (
-    default_profile_enabled,
-    quick_profile_selection,
-)
+from ida_pro_mcp.vnext.profiles import quick_profile_selection
 
 
 logger = logging.getLogger(__name__)
@@ -67,12 +63,7 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
     stored_tools = config_json_get(config_key, None)
     is_new_install = stored_tools is None
     enabled_tools = (
-        {
-            name: default_profile_enabled(name, MCP_POLICY)
-            for name in original_tools
-        }
-        if is_new_install
-        else dict(stored_tools)
+        dict.fromkeys(original_tools, True) if is_new_install else dict(stored_tools)
     )
     original_enabled_tools = enabled_tools.copy()
     new_tools = [name for name in original_tools if name not in enabled_tools]
@@ -83,9 +74,7 @@ def handle_enabled_tools(registry: McpRpcRegistry, config_key: str):
             enabled_tools.pop(name)
 
     if new_tools:
-        enabled_tools.update(
-            {name: default_profile_enabled(name, MCP_POLICY) for name in new_tools}
-        )
+        enabled_tools.update(dict.fromkeys(new_tools, True))
 
     if is_new_install or enabled_tools != original_enabled_tools:
         config_json_set(config_key, enabled_tools)
@@ -122,20 +111,6 @@ def _configure_scopes(
 
 DEFAULT_CORS_POLICY = "local"
 DEFAULT_RECOVERY_CHECKPOINTS = False
-# The enhanced checkout opts into IDB annotation and modification by default.
-# Filesystem, debugger, and Python scopes remain explicit opt-ins.
-def get_cors_policy(port: int) -> str:
-    """Retrieve the current CORS policy from configuration."""
-    match _current_cors_policy:
-        case "unrestricted":
-            return "*"
-        case "local":
-            return "127.0.0.1 localhost"
-        case "direct":
-            return f"http://127.0.0.1:{port} http://localhost:{port}"
-        case _:
-            return "*"
-
 
 ORIGINAL_TOOLS = handle_enabled_tools(MCP_SERVER.tools, "enabled_tools")
 _current_cors_policy = config_json_get("cors_policy", DEFAULT_CORS_POLICY)
@@ -176,7 +151,7 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
     def do_POST(self):
         """Handles POST requests."""
         if urlparse(self.path).path == "/config":
-            if not self._check_origin():
+            if not self._check_api_request():
                 return
             self._handle_config_post()
         else:
@@ -188,13 +163,13 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         path = parsed.path
 
         if path == "/config.html":
-            if not self._check_host():
+            if not self._check_api_request():
                 return
             self._handle_config_get()
             return
 
         if path == "/profile.txt":
-            if not self._check_host():
+            if not self._check_api_request():
                 return
             self._handle_profile_export()
             return
@@ -254,31 +229,6 @@ class IdaMcpHttpRequestHandler(McpHttpRequestHandler):
         )
         self.end_headers()
         self.wfile.write(body)
-
-    @property
-    def server_port(self) -> int:
-        return cast(HTTPServer, self.server).server_port
-
-    def _check_origin(self) -> bool:
-        """Validate Origin for config POST requests.
-
-        Delegates to the zeromcp ``_check_api_request`` which already
-        handles non-loopback bindings (LAN) and respects the configured
-        CORS policy.  When the server is bound to 0.0.0.0 the Host
-        check passes for any client; the Origin check still enforces
-        the CORS policy so ``unrestricted`` is needed for browser-based
-        LAN config access.
-        """
-        return self._check_api_request()
-
-    def _check_host(self) -> bool:
-        """Validate Host header for config page access.
-
-        Delegates to ``_check_api_request`` so the same rules apply as
-        for MCP API calls: loopback-bound servers only accept loopback
-        Host headers; non-loopback servers (0.0.0.0) accept any Host.
-        """
-        return self._check_api_request()
 
     def _send_html(self, status: int, text: str):
         """

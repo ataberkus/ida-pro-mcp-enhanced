@@ -1,9 +1,9 @@
 import functools
-import re
 import itertools
 import logging
 import os
 import queue
+import reprlib
 import sys
 import tempfile
 import threading
@@ -14,6 +14,7 @@ import idaapi
 import ida_kernwin
 import ida_pro
 import idc
+from .compat import IDA_VERSION
 from .rpc import McpToolError
 from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
 
@@ -21,12 +22,7 @@ from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
 # IDA Synchronization & Error Handling
 # ============================================================================
 
-def _parse_kernel_version(version: str) -> tuple[int, int]:
-    nums = [int(part) for part in re.findall(r"\d+", version)]
-    return (nums[0] if nums else 0, nums[1] if len(nums) > 1 else 0)
-
-
-ida_major, ida_minor = _parse_kernel_version(idaapi.get_kernel_version())
+ida_major, ida_minor = IDA_VERSION[:2]
 
 
 class IDAError(McpToolError):
@@ -78,59 +74,34 @@ def get_tool_deadline() -> float | None:
     return getattr(_deadline_state, "deadline", None)
 
 
-def _get_tool_timeout_seconds() -> float:
-    value = os.getenv(_TOOL_TIMEOUT_ENV, "").strip()
-    if value == "":
-        return _DEFAULT_TOOL_TIMEOUT_SEC
+def _get_env_seconds(name: str, default: float, maximum: float = float("inf")) -> float:
+    """Parse a positive finite seconds value from env, else default; cap at maximum."""
     try:
-        timeout = float(value)
+        value = float(os.getenv(name, ""))
     except ValueError:
-        return _DEFAULT_TOOL_TIMEOUT_SEC
-    if timeout <= 0 or timeout != timeout or timeout == float("inf"):
-        return _DEFAULT_TOOL_TIMEOUT_SEC
-    return timeout
-
-
-def _get_max_sync_queue_total_wait_seconds() -> float:
-    value = os.getenv(_MAX_SYNC_QUEUE_TOTAL_WAIT_ENV, "").strip()
-    if value == "":
-        return _MAX_SYNC_QUEUE_TOTAL_WAIT_SEC
-    try:
-        total = float(value)
-    except ValueError:
-        return _MAX_SYNC_QUEUE_TOTAL_WAIT_SEC
-    if total <= 0 or total != total or total == float("inf"):
-        return _MAX_SYNC_QUEUE_TOTAL_WAIT_SEC
-    return total
+        return default
+    if not 0 < value < float("inf"):
+        return default
+    return min(value, maximum)
 
 
 def get_search_page_budget_seconds(*, contended: bool = False) -> float:
     """Return a bounded search-page budget below common MCP client timeouts."""
-    value = os.getenv(_SEARCH_PAGE_BUDGET_ENV, "").strip()
-    if value == "":
-        budget = _DEFAULT_SEARCH_PAGE_BUDGET_SEC
-    else:
-        try:
-            budget = float(value)
-        except ValueError:
-            budget = _DEFAULT_SEARCH_PAGE_BUDGET_SEC
-    if budget <= 0:
-        budget = _DEFAULT_SEARCH_PAGE_BUDGET_SEC
-    budget = min(budget, _MAX_SEARCH_PAGE_BUDGET_SEC)
+    budget = _get_env_seconds(
+        _SEARCH_PAGE_BUDGET_ENV,
+        _DEFAULT_SEARCH_PAGE_BUDGET_SEC,
+        _MAX_SEARCH_PAGE_BUDGET_SEC,
+    )
     if not contended:
         return budget
-
-    contended_value = os.getenv(_CONTENDED_SEARCH_PAGE_BUDGET_ENV, "").strip()
-    if contended_value == "":
-        contended_budget = _DEFAULT_CONTENDED_SEARCH_PAGE_BUDGET_SEC
-    else:
-        try:
-            contended_budget = float(contended_value)
-        except ValueError:
-            contended_budget = _DEFAULT_CONTENDED_SEARCH_PAGE_BUDGET_SEC
-    if contended_budget <= 0:
-        contended_budget = _DEFAULT_CONTENDED_SEARCH_PAGE_BUDGET_SEC
-    return min(budget, contended_budget, _MAX_CONTENDED_SEARCH_PAGE_BUDGET_SEC)
+    return min(
+        budget,
+        _get_env_seconds(
+            _CONTENDED_SEARCH_PAGE_BUDGET_ENV,
+            _DEFAULT_CONTENDED_SEARCH_PAGE_BUDGET_SEC,
+            _MAX_CONTENDED_SEARCH_PAGE_BUDGET_SEC,
+        ),
+    )
 
 
 def get_pending_ui_request_count() -> int:
@@ -152,17 +123,6 @@ def get_active_ui_request_function() -> str | None:
         return None
     name = getattr(active, "_ida_mcp_function", None)
     return str(name) if name else "<active>"
-
-
-def _get_sync_queue_timeout_seconds() -> float:
-    value = os.getenv(_SYNC_QUEUE_TIMEOUT_ENV, "").strip()
-    if value == "":
-        return _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC
-    try:
-        timeout = float(value)
-    except ValueError:
-        return _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC
-    return timeout if timeout > 0 else _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC
 
 
 def _get_default_log_directory() -> str:
@@ -250,14 +210,9 @@ def _sync_diag(request_id: int, stage: str, **fields) -> None:
 
 def _bounded_repr(value, limit: int = 2000) -> str:
     """Return a single-line bounded representation suitable for diagnostics."""
-    try:
-        rendered = repr(value)
-    except BaseException as exc:
-        rendered = f"<unrepresentable {type(value).__name__}: {exc}>"
-    rendered = rendered.replace("\r", "\\r").replace("\n", "\\n")
-    if len(rendered) > limit:
-        rendered = rendered[: limit - 3] + "..."
-    return rendered
+    bounded = reprlib.Repr()
+    bounded.maxstring = bounded.maxother = limit
+    return bounded.repr(value).replace("\r", "\\r").replace("\n", "\\n")
 
 
 def log_tool_diagnostic(stage: str, **fields) -> None:
@@ -441,7 +396,7 @@ call_stack: list[str] = []
 _sync_diag(
     0,
     "module_loaded",
-    queue_timeout=_get_sync_queue_timeout_seconds(),
+    queue_timeout=_get_env_seconds(_SYNC_QUEUE_TIMEOUT_ENV, _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC),
     scheduler=_SYNC_SCHEDULER,
     log_path=_SYNC_LOG_PATH,
     error_log_path=_ERROR_LOG_PATH,
@@ -452,7 +407,7 @@ def _sync_wrapper(ff):
     """Run ff synchronously through IDA's Qt main-thread event queue."""
     request_id = next(_sync_request_ids)
     queued_at = time.monotonic()
-    queue_timeout = _get_sync_queue_timeout_seconds()
+    queue_timeout = _get_env_seconds(_SYNC_QUEUE_TIMEOUT_ENV, _DEFAULT_SYNC_QUEUE_TIMEOUT_SEC)
     res_container = queue.Queue(maxsize=1)
     started_event = threading.Event()
     state_lock = threading.Lock()
@@ -646,7 +601,7 @@ def _sync_wrapper(ff):
         # Wait for UI start. If another MCP tool is already running on the UI
         # thread (e.g. survey_binary for 20s+), keep extending the idle timer so
         # concurrent callers do not abandon and skip late callbacks.
-        max_total = _get_max_sync_queue_total_wait_seconds()
+        max_total = _get_env_seconds(_MAX_SYNC_QUEUE_TOTAL_WAIT_ENV, _MAX_SYNC_QUEUE_TOTAL_WAIT_SEC)
         total_deadline = queued_at + max(queue_timeout, max_total)
         idle_deadline = time.monotonic() + queue_timeout
         while not started_event.is_set():
@@ -745,7 +700,7 @@ def sync_wrapper(ff, timeout_override: float | None = None):
 
     timeout = timeout_override
     if timeout is None:
-        timeout = _get_tool_timeout_seconds()
+        timeout = _get_env_seconds(_TOOL_TIMEOUT_ENV, _DEFAULT_TOOL_TIMEOUT_SEC)
     if timeout > 0 or cancel_event is not None:
 
         def timed_ff():
@@ -850,21 +805,3 @@ def tool_timeout(seconds: float):
         return func
 
     return decorator
-
-
-def is_window_active():
-    """Returns whether IDA is currently active."""
-    if _HEADLESS:
-        return False
-    # Source: https://github.com/OALabs/hexcopy-ida/blob/8b0b2a3021d7dc9010c01821b65a80c47d491b61/hexcopy.py#L30
-    using_pyside6 = (ida_major > 9) or (ida_major == 9 and ida_minor >= 2)
-
-    if using_pyside6:
-        from PySide6 import QtWidgets
-    else:
-        from PyQt5 import QtWidgets
-
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        return False
-    return app.activeWindow() is not None

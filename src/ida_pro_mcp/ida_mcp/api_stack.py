@@ -30,7 +30,10 @@ from .utils import (
 @tool
 @idasync
 def stack_frame(addrs: Annotated[list[str] | str, "Address(es)"]) -> list[dict]:
-    """Return stack variables for function address(es)."""
+    """Legacy stack reader (no canonical equivalent; mutation_preview only writes stack vars).
+    WHEN: list stack-frame variables (name, offset, size, type) for function addresses.
+    RETURNS: [{addr, vars[{name, offset, size, type}], error}] per address.
+    LIMITS: non-function or frameless addresses return error entries."""
     addrs = normalize_list_input(addrs)
     results = []
 
@@ -53,7 +56,10 @@ def stack_frame(addrs: Annotated[list[str] | str, "Address(es)"]) -> list[dict]:
 def declare_stack(
     items: list[StackVarDecl] | StackVarDecl,
 ):
-    """Create stack variables from typed stack declarations."""
+    """Prefer mutation_preview(kind="declare_stack", ...).
+    WHEN: create typed stack variables directly (UNSAFE; preview stages the same declare instead).
+    RETURNS: [{addr, name, ok, error}] per item.
+    LIMITS: function must have a frame; offset is a signed frame offset (e.g. -8), not an address."""
     items = normalize_dict_list(items)
     results = []
     for item in items:
@@ -100,7 +106,10 @@ def declare_stack(
 def delete_stack(
     items: list[StackVarDelete] | StackVarDelete,
 ):
-    """Delete stack variables by name or offset."""
+    """Prefer mutation_preview(kind="delete_stack", ...).
+    WHEN: delete stack variables by name directly (UNSAFE; preview stages the same delete instead).
+    RETURNS: [{addr, name, ok, error}] per item.
+    LIMITS: special frame members and function arguments are refused with an error entry."""
 
     items = normalize_dict_list(items)
     results = []

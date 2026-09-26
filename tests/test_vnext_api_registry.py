@@ -47,7 +47,6 @@ def test_vnext_prompts_and_resources_are_registered():
         "explain_function",
         "trace_input_to_sink",
         "deobfuscate_component",
-        "compare_binaries",
         "review_patch",
         "generate_report",
     }
@@ -208,6 +207,12 @@ def test_instruction_search_maps_to_broad_insn_query(monkeypatch):
     ]
     assert result["provenance"]["legacy_tool"] == "insn_query"
     assert result["next_cursor"] == api_vnext._encode_cursor(17)
+
+
+def test_analysis_run_rejects_unknown_mode_with_allowed_list():
+    _rpc, api_vnext = _load_vnext_api()
+    with pytest.raises(VNextError, match="Allowed:"):
+        api_vnext._analysis_sync("nope", [], {})
 
 
 def test_instruction_search_resumes_after_scan_budget(monkeypatch):
@@ -548,6 +553,9 @@ def _load_sync_module(
     monkeypatch.setitem(sys.modules, "ida_kernwin", ida_kernwin)
     monkeypatch.setitem(sys.modules, "ida_pro", ida_pro)
     monkeypatch.setitem(sys.modules, "idc", idc)
+    compat = types.ModuleType("_test_stub_ida_mcp.compat")
+    compat.IDA_VERSION = (9, 4, 0)
+    monkeypatch.setitem(sys.modules, "_test_stub_ida_mcp.compat", compat)
 
     if single_shot is None:
 

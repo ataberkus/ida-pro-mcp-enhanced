@@ -2,19 +2,15 @@ from itertools import islice
 import struct
 import traceback
 from typing import Annotated, Optional
-import ida_lines
 import ida_funcs
 import idaapi
 import idautils
 import ida_typeinf
 import ida_nalt
 import ida_bytes
-import ida_segment
 import ida_idaapi
 import ida_xref
 import ida_ua
-import ida_name
-import ida_idp
 from .rpc import tool
 from .sync import (
     idasync,
@@ -37,11 +33,13 @@ from .utils import (
     DecompilationError,
     decompile_function_detailed,
     decompile_function_safe,
+    disasm_text,
     get_assembly_lines,
     get_all_xrefs,
     get_all_comments,
-    get_callers,
-    get_callees,
+    _collect_callees,
+    _collect_callers,
+    _segments,
     extract_function_strings,
     extract_function_constants,
     Argument,
@@ -57,27 +55,12 @@ from .utils import (
 from . import compat
 
 
-def _segment_perm(segment) -> int:
-    """Read permissions from either modern segment_info_t or legacy segment_t."""
-    getter = getattr(segment, "get_perm", None)
-    return int(getter() if getter is not None else segment.perm)
-
 # ============================================================================
 # Instruction Helpers
 # ============================================================================
 
 _IMM_SCAN_BACK_MAX = 15
-
-
-def _raw_bin_search(
-    ea: int, max_ea: int, data: bytes, mask: bytes, flags: int = 0
-) -> int:
-    """Search for raw bytes with mask, compatible across IDA versions.
-
-    Returns the match address, or idaapi.BADADDR if not found.
-    """
-    search_flags = flags or (ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW)
-    return compat.raw_bin_search(ea, max_ea, data, mask, search_flags)
+_BIN_SEARCH_FLAGS = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW
 
 
 def _decode_insn_at(ea: int) -> ida_ua.insn_t | None:
@@ -85,10 +68,6 @@ def _decode_insn_at(ea: int) -> ida_ua.insn_t | None:
     if ida_ua.decode_insn(insn, ea) == 0:
         return None
     return insn
-
-
-def _next_head(ea: int, end_ea: int) -> int:
-    return ida_bytes.next_head(ea, end_ea)
 
 
 def _operand_value(insn: ida_ua.insn_t, i: int) -> int | None:
@@ -100,37 +79,11 @@ def _operand_value(insn: ida_ua.insn_t, i: int) -> int | None:
     return op.value
 
 
-def _operand_type(insn: ida_ua.insn_t, i: int) -> int:
-    return insn.ops[i].type
-
-
 def _insn_mnem(insn: ida_ua.insn_t) -> str:
     try:
         return insn.get_canon_mnem().lower()
     except Exception:
         return ""
-
-
-def _value_to_le_bytes(value: int) -> tuple[bytes, int, int] | None:
-    if value < 0:
-        if value >= -0x80000000:
-            size = 4
-            value &= 0xFFFFFFFF
-        elif value >= -0x8000000000000000:
-            size = 8
-            value &= 0xFFFFFFFFFFFFFFFF
-        else:
-            return None
-    else:
-        if value <= 0xFFFFFFFF:
-            size = 4
-        elif value <= 0xFFFFFFFFFFFFFFFF:
-            size = 8
-        else:
-            return None
-
-    fmt = "<I" if size == 4 else "<Q"
-    return struct.pack(fmt, value), size, value
 
 
 def _value_candidates_for_immediate(value: int) -> list[tuple[int, int, bytes]]:
@@ -169,7 +122,7 @@ def _resolve_immediate_insn_start(
         if not (start <= match_ea < end_ea):
             continue
         for i in range(8):
-            op_type = _operand_type(insn, i)
+            op_type = insn.ops[i].type
             if op_type == ida_ua.o_void:
                 break
             if op_type != ida_ua.o_imm:
@@ -183,18 +136,6 @@ def _resolve_immediate_insn_start(
                     continue
                 return start
     return None
-
-
-def clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
-    try:
-        i = int(value)
-    except Exception:
-        i = default
-    if i < minimum:
-        return minimum
-    if i > maximum:
-        return maximum
-    return i
 
 
 def _parse_optional_int(value: object, field: str) -> int | None:
@@ -240,78 +181,54 @@ def _limit_items(items: list, limit: int) -> tuple[list, bool]:
     return items[:limit], True
 
 
-def _disasm_lines_limited(func: ida_funcs.func_t, max_insns: int) -> tuple[list[str], bool]:
-    lines: list[str] = []
-    truncated = False
-    for item_ea in idautils.FuncItems(func.start_ea):
-        if len(lines) >= max_insns:
-            truncated = True
-            break
-        line = ida_lines.generate_disasm_line(item_ea, 0)
-        instruction = ida_lines.tag_remove(line) if line else ""
-        lines.append(f"{item_ea:x}  {instruction}")
-    return lines, truncated
+def _capped(name: str, count_key: str, items: list, limit: int) -> dict:
+    """List section: first *limit* items, total count, truncation flag."""
+    limited, truncated = _limit_items(items, limit)
+    return {name: limited, count_key: len(items), f"{name}_truncated": truncated}
 
 
-def _collect_basic_blocks_limited(
-    func: ida_funcs.func_t, max_blocks: int
-) -> tuple[list[BasicBlock], bool]:
-    blocks: list[BasicBlock] = []
-    truncated = False
-    for block in idaapi.FlowChart(func):
-        if len(blocks) >= max_blocks:
-            truncated = True
-            break
-        blocks.append(
-            BasicBlock(
-                start=hex(block.start_ea),
-                end=hex(block.end_ea),
-                size=block.end_ea - block.start_ea,
-                type=block.type,
-                successors=[hex(s.start_ea) for s in block.succs()],
-                predecessors=[hex(p.start_ea) for p in block.preds()],
-            )
+def _basic_blocks(
+    func: ida_funcs.func_t, limit: int, offset: int = 0
+) -> tuple[list[BasicBlock], int]:
+    """CFG blocks [offset, offset+limit) and the function's total block count."""
+    chart = idaapi.FlowChart(func)
+    blocks = [
+        BasicBlock(
+            start=hex(block.start_ea),
+            end=hex(block.end_ea),
+            size=block.end_ea - block.start_ea,
+            type=block.type,
+            successors=[hex(s.start_ea) for s in block.succs()],
+            predecessors=[hex(p.start_ea) for p in block.preds()],
         )
-    return blocks, truncated
+        for block in islice(chart, offset, offset + limit)
+    ]
+    return blocks, chart.size
 
 
-def _collect_callees_for_function(func: ida_funcs.func_t) -> list[dict]:
-    callees: dict[int, dict] = {}
-    for item_ea in idautils.FuncItems(func.start_ea):
-        for target in idautils.CodeRefsFrom(item_ea, 0):
-            callee = ida_funcs.get_func(target)
-            if not callee:
-                continue
-            callee_start = callee.start_ea
-            if callee_start in callees:
-                continue
-            callees[callee_start] = {
-                "addr": hex(callee_start),
-                "name": ida_funcs.get_func_name(callee_start) or "<unnamed>",
-            }
-    return list(callees.values())
+def _decompile_section(func: ida_funcs.func_t) -> tuple[str | None, str | None, dict | None]:
+    """(code, error, error_details) for a function."""
+    failure: dict = {}
+    code = decompile_function_safe(func.start_ea, error_out=failure)
+    if code is not None:
+        return code, None, None
+    error = failure.pop("message", "Decompilation failed without diagnostic details")
+    return None, error, failure or None
 
 
-def _collect_callers_for_function(func: ida_funcs.func_t) -> list[dict]:
-    callers: dict[int, dict] = {}
-    for caller_site in idautils.CodeRefsTo(func.start_ea, 0):
-        caller = ida_funcs.get_func(caller_site)
-        if not caller:
-            continue
-        caller_start = caller.start_ea
-        if caller_start in callers:
-            continue
-
-        insn = idaapi.insn_t()
-        idaapi.decode_insn(insn, caller_site)
-        if insn.itype not in [idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni]:
-            continue
-
-        callers[caller_start] = {
-            "addr": hex(caller_start),
-            "name": ida_funcs.get_func_name(caller_start) or "<unnamed>",
-        }
-    return list(callers.values())
+def _xrefs_section(ea: int) -> dict:
+    """Xrefs to/from *ea*, each side capped at 200."""
+    xrefs = get_all_xrefs(ea)
+    to_xrefs, to_truncated = _limit_items(xrefs["to"], 200)
+    from_xrefs, from_truncated = _limit_items(xrefs["from"], 200)
+    return {
+        "to": to_xrefs,
+        "from": from_xrefs,
+        "to_truncated": to_truncated,
+        "from_truncated": from_truncated,
+        "to_count": len(xrefs["to"]),
+        "from_count": len(xrefs["from"]),
+    }
 
 
 def _profile_function(
@@ -324,51 +241,26 @@ def _profile_function(
     if not func:
         return {"addr": hex(start_ea), "error": "Function not found"}
 
-    name = ida_funcs.get_func_name(func.start_ea) or "<unnamed>"
-    size_int = func.end_ea - func.start_ea
-    has_type = ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), func.start_ea)
-
-    instruction_count = sum(1 for _ in idautils.FuncItems(func.start_ea))
-    basic_block_count = sum(1 for _ in idaapi.FlowChart(func))
-    callers = _collect_callers_for_function(func)
-    callees = _collect_callees_for_function(func)
-    strings = extract_function_strings(func.start_ea)
-    constants = extract_function_constants(func.start_ea)
-
     out = {
         "addr": hex(func.start_ea),
-        "name": name,
-        "size": hex(size_int),
-        "size_int": size_int,
-        "instruction_count": instruction_count,
-        "basic_block_count": basic_block_count,
-        "caller_count": len(callers),
-        "callee_count": len(callees),
-        "string_ref_count": len(strings),
-        "constant_count": len(constants),
-        "has_type": has_type,
-        "prototype": None,
+        "name": ida_funcs.get_func_name(func.start_ea) or "<unnamed>",
+        "size": hex(func.end_ea - func.start_ea),
+        "instruction_count": sum(1 for _ in idautils.FuncItems(func.start_ea)),
+        "basic_block_count": _basic_blocks(func, 0)[1],
+        "has_type": ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), func.start_ea),
+        "prototype": get_prototype(func) if include_prototype else None,
         "error": None,
     }
-
-    if include_prototype:
-        out["prototype"] = get_prototype(func)
-
-    if include_lists:
-        callers_limited, callers_truncated = _limit_items(callers, max_items)
-        callees_limited, callees_truncated = _limit_items(callees, max_items)
-        strings_limited, strings_truncated = _limit_items(strings, max_items)
-        constants_limited, constants_truncated = _limit_items(constants, max_items)
-
-        out["callers"] = callers_limited
-        out["callers_truncated"] = callers_truncated
-        out["callees"] = callees_limited
-        out["callees_truncated"] = callees_truncated
-        out["strings"] = strings_limited
-        out["strings_truncated"] = strings_truncated
-        out["constants"] = constants_limited
-        out["constants_truncated"] = constants_truncated
-
+    for section in (
+        _capped("callers", "caller_count", _collect_callers(func), max_items),
+        _capped("callees", "callee_count", _collect_callees(func, call_only=False), max_items),
+        _capped("strings", "string_ref_count", extract_function_strings(func.start_ea), max_items),
+        _capped("constants", "constant_count", extract_function_constants(func.start_ea), max_items),
+    ):
+        if include_lists:
+            out.update(section)
+        else:
+            out.update((k, v) for k, v in section.items() if k.endswith("_count"))
     return out
 
 
@@ -383,7 +275,10 @@ def _profile_function(
 def decompile(
     addr: Annotated[str, "Function address or name to decompile"],
 ) -> dict:
-    """Decompile function(s) at address(es); returns pseudocode and per-item errors."""
+    """Canonical decompiler (listed in CANONICAL_TOOLS).
+    WHEN: decompile one function to pseudocode with detailed error reporting and disassembly fallback.
+    RETURNS: {addr, function_addr?, function_name?, code?, error?, details?, fallback{tool:"disassemble", addr}?}.
+    LIMITS: non-function addresses return function_not_defined + fallback; Hex-Rays failures include details + diagnostic logs."""
     try:
         try:
             start = parse_address(addr)
@@ -396,8 +291,12 @@ def decompile(
                     "error": f"Function not found: {addr!r}",
                 }
             start = ea
-        function = ida_funcs.get_func(start)
-        if function is None:
+        if compat.IDA_VERSION >= (9, 2, 0):
+            function_start = ida_funcs.get_func_start(start)
+        else:
+            function = ida_funcs.get_func(start)
+            function_start = function.start_ea if function else idaapi.BADADDR
+        if function_start == idaapi.BADADDR:
             details = {
                 "input": addr,
                 "resolved_addr": hex(start),
@@ -417,7 +316,6 @@ def decompile(
                 "fallback": {"tool": "disassemble", "addr": hex(start)},
             }
 
-        function_start = int(function.start_ea)
         function_name = ida_funcs.get_func_name(function_start) or None
         try:
             code = decompile_function_detailed(function_start)
@@ -490,7 +388,10 @@ def disasm(
         bool, "Compute total instruction count (default: false)"
     ] = False,
 ) -> dict:
-    """Disassemble function with offset/max_instructions pagination and optional total count."""
+    """Prefer disassemble(addr, ...) for canonical disassembly.
+    WHEN: disassemble from addr with offset/max_instructions paging and optional total count.
+    RETURNS: {addr, asm{name, start_ea, lines, stack_frame?, return_type?, arguments?}, instruction_count, total_instructions?, cursor}.
+    LIMITS: max_instructions max 50000; without include_total, total_instructions is None; continue via cursor.next."""
 
     # Enforce max limit
     if max_instructions <= 0:
@@ -549,9 +450,7 @@ def disasm(
                 seen += 1
                 return True
             if len(lines) < max_instructions:
-                line = ida_lines.generate_disasm_line(ea, 0)
-                instruction = ida_lines.tag_remove(line) if line else ""
-                lines.append(f"{ea:x}  {instruction}")
+                lines.append(f"{ea:x}  {disasm_text(ea)}")
                 seen += 1
                 return True
             more = True
@@ -575,7 +474,7 @@ def disasm(
                     break
                 if not _maybe_add(ea):
                     break
-                ea = _next_head(ea, seg.end_ea)
+                ea = ida_bytes.next_head(ea, seg.end_ea)
                 if ea == idaapi.BADADDR:
                     break
 
@@ -644,7 +543,10 @@ def func_profile(
         "Function profiling query (supports name/address filters + pagination)",
     ],
 ) -> list[dict]:
-    """Profile functions with summary metrics and optional sampled details."""
+    """Prefer analysis_run(mode="batch", ...) for canonical per-function metrics.
+    WHEN: profile function sets (metrics + optional sampled callers/callees/strings/constants/prototype).
+    RETURNS: [{query, data[profile{metrics, lists?}], next_offset, error}] per query.
+    LIMITS: count max 1000, max_items max 1000; "*" scans all functions; sampled lists capped per query."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -733,9 +635,6 @@ def func_profile(
                 )
             )
 
-        for item in profiled:
-            item.pop("size_int", None)
-
         results.append(
             {
                 "query": q,
@@ -757,7 +656,10 @@ def analyze_batch(
         "Comprehensive per-function analysis with selectable sections",
     ],
 ) -> list[dict]:
-    """Run comprehensive analysis over one or more target functions."""
+    """Prefer analysis_run(mode="batch", targets=..., options=...) for canonical batch analysis.
+    WHEN: comprehensive per-function analysis with selectable sections (decompile/disasm/xrefs/callers/callees/strings/constants/blocks/proto).
+    RETURNS: [{query, addr, name, analysis{sections...}, error}] per query.
+    LIMITS: per-section max_* caps apply (disasm 50000, strings/callees 5000, constants/blocks 10000); missing query is an error entry."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -866,19 +768,17 @@ def analyze_batch(
                 analysis["prototype"] = get_prototype(fn)
 
             if include_decompile:
-                decompile_failure: dict = {}
-                code = decompile_function_safe(
-                    fn.start_ea, error_out=decompile_failure
-                )
-                analysis["decompile"] = code
-                if code is None:
-                    analysis["decompile_error"] = decompile_failure.pop(
-                        "message", "Decompilation failed without diagnostic details"
-                    )
-                    analysis["decompile_error_details"] = decompile_failure or None
+                (
+                    analysis["decompile"],
+                    analysis["decompile_error"],
+                    analysis["decompile_error_details"],
+                ) = _decompile_section(fn)
 
             if include_disasm:
-                lines, disasm_truncated = _disasm_lines_limited(fn, max_disasm_insns)
+                items = islice(idautils.FuncItems(fn.start_ea), max_disasm_insns + 1)
+                lines, disasm_truncated = _limit_items(
+                    [f"{ea:x}  {disasm_text(ea)}" for ea in items], max_disasm_insns
+                )
                 analysis["disasm"] = {
                     "lines": lines,
                     "instruction_count": len(lines),
@@ -886,56 +786,48 @@ def analyze_batch(
                 }
 
             if include_xrefs:
-                xrefs = get_all_xrefs(fn.start_ea)
-                xrefs_to = list(xrefs.get("to", []))
-                xrefs_from = list(xrefs.get("from", []))
-                xrefs_to, xto_trunc = _limit_items(xrefs_to, 200)
-                xrefs_from, xfrom_trunc = _limit_items(xrefs_from, 200)
-                analysis["xrefs"] = {
-                    "to": xrefs_to,
-                    "from": xrefs_from,
-                    "to_truncated": xto_trunc,
-                    "from_truncated": xfrom_trunc,
-                    "to_count": len(xrefs.get("to", [])),
-                    "from_count": len(xrefs.get("from", [])),
-                }
+                analysis["xrefs"] = _xrefs_section(fn.start_ea)
 
             if include_callers:
-                callers = get_callers(hex(fn.start_ea), limit=max_callers)
-                analysis["caller_count"] = len(callers)
-                analysis["callers"] = callers
-                analysis["callers_truncated"] = (
-                    max_callers > 0 and len(callers) >= max_callers
+                analysis.update(
+                    _capped("callers", "caller_count", _collect_callers(fn), max_callers)
                 )
 
             if include_callees:
-                all_callees = get_callees(hex(fn.start_ea))
-                limited_callees, callees_truncated = _limit_items(all_callees, max_callees)
-                analysis["callee_count"] = len(all_callees)
-                analysis["callees"] = limited_callees
-                analysis["callees_truncated"] = callees_truncated
+                analysis.update(
+                    _capped(
+                        "callees",
+                        "callee_count",
+                        _collect_callees(fn, call_only=True),
+                        max_callees,
+                    )
+                )
 
             if include_strings:
-                all_strings = extract_function_strings(fn.start_ea)
-                limited_strings, strings_truncated = _limit_items(all_strings, max_strings)
-                analysis["string_ref_count"] = len(all_strings)
-                analysis["strings"] = limited_strings
-                analysis["strings_truncated"] = strings_truncated
+                analysis.update(
+                    _capped(
+                        "strings",
+                        "string_ref_count",
+                        extract_function_strings(fn.start_ea),
+                        max_strings,
+                    )
+                )
 
             if include_constants:
-                all_constants = extract_function_constants(fn.start_ea)
-                limited_constants, constants_truncated = _limit_items(
-                    all_constants, max_constants
+                analysis.update(
+                    _capped(
+                        "constants",
+                        "constant_count",
+                        extract_function_constants(fn.start_ea),
+                        max_constants,
+                    )
                 )
-                analysis["constant_count"] = len(all_constants)
-                analysis["constants"] = limited_constants
-                analysis["constants_truncated"] = constants_truncated
 
             if include_basic_blocks:
-                blocks, blocks_truncated = _collect_basic_blocks_limited(fn, max_blocks)
-                analysis["basic_block_count"] = len(blocks)
+                blocks, total_blocks = _basic_blocks(fn, max_blocks)
+                analysis["basic_block_count"] = total_blocks
                 analysis["basic_blocks"] = blocks
-                analysis["basic_blocks_truncated"] = blocks_truncated
+                analysis["basic_blocks_truncated"] = total_blocks > len(blocks)
 
             results.append(
                 {
@@ -967,49 +859,16 @@ def analyze_batch(
 
 @tool
 @idasync
-def xrefs_to(
-    addrs: Annotated[list[str] | str, "Addresses to find cross-references to"],
-    limit: Annotated[int, "Max xrefs per address (default: 100, max: 1000)"] = 100,
-) -> list[dict]:
-    """Return xrefs to address(es), capped per target with truncation flag."""
-    addrs = normalize_list_input(addrs)
-
-    if limit <= 0 or limit > 1000:
-        limit = 1000
-
-    results = []
-
-    for addr in addrs:
-        try:
-            xrefs = []
-            more = False
-            for xref in idautils.XrefsTo(parse_address(addr)):
-                if len(xrefs) >= limit:
-                    more = True
-                    break
-                xrefs.append(
-                    Xref(
-                        addr=hex(xref.frm),
-                        type="code" if xref.iscode else "data",
-                        fn=get_function(xref.frm, raise_error=False),
-                    )
-                )
-            results.append({"addr": addr, "xrefs": xrefs, "more": more})
-        except Exception as e:
-            results.append({"addr": addr, "xrefs": None, "error": str(e)})
-
-    return results
-
-
-@tool
-@idasync
 def xref_query(
     queries: Annotated[
         list[XrefQuery] | XrefQuery | str,
         "Generic xref query with direction/type filters and pagination",
     ],
 ) -> list[dict]:
-    """Query xrefs with direction/type filters and pagination."""
+    """Prefer graph_query(kind="xrefs"|"xrefs_from"|"xrefs_both", ...) for canonical xref traversal.
+    WHEN: typed xref listing around one address with direction/type filters and offset/count paging.
+    RETURNS: [{query, resolved_addr, direction, xref_type, data[{direction, addr, from, to, type, fn?}], next_offset, total, error}].
+    LIMITS: bad direction/xref_type fall back to both/any; count max 5000; rows deduplicated by (direction, from, to, type)."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -1140,7 +999,10 @@ def xrefs_to_field(
     queries: list[StructFieldQuery] | StructFieldQuery,
     limit: Annotated[int, "Max xrefs per query (default: 100, max: 1000)"] = 100,
 ) -> list[dict]:
-    """Get cross-references to structure fields"""
+    """Legacy struct-field xref lookup (no canonical equivalent).
+    WHEN: find code/data xrefs to {struct, field} members across the IDB.
+    RETURNS: [{struct, field, xrefs[{addr, ...}], more, error}] per query.
+    LIMITS: limit max 1000; missing type library returns error entries; unqualified field names may match multiple structs."""
     if isinstance(queries, dict):
         queries = [queries]
     if limit <= 0 or limit > 1000:
@@ -1246,7 +1108,10 @@ def callees(
     addrs: Annotated[list[str] | str, "Function addresses to get callees for"],
     limit: Annotated[int, "Max callees per function (default: 200, max: 500)"] = 200,
 ) -> list[dict]:
-    """Return unique callees per function, capped by limit."""
+    """Prefer graph_query(kind="calls", targets=...) for canonical call-graph traversal.
+    WHEN: list unique direct callees per function (call_only) with per-function cap.
+    RETURNS: [{addr, callees[{addr, name?}], more, error}] per function.
+    LIMITS: limit max 500; non-function addresses return error entries; one hop only (use callgraph/graph_query for depth)."""
     addrs = normalize_list_input(addrs)
 
     if limit <= 0 or limit > 500:
@@ -1256,61 +1121,15 @@ def callees(
 
     for fn_addr in addrs:
         try:
-            func_start = parse_address(fn_addr)
-            func = ida_funcs.get_func(func_start)
+            func = ida_funcs.get_func(parse_address(fn_addr))
             if not func:
                 results.append(
                     {"addr": fn_addr, "callees": None, "error": "No function found"}
                 )
                 continue
-            func_start = int(func.start_ea)
-            func_end = func.end_ea
-            callees_dict = {}
-            more = False
-            current_ea = func_start
-            while current_ea < func_end:
-                if len(callees_dict) >= limit:
-                    more = True
-                    break
-                insn = _decode_insn_at(current_ea)
-                if insn is None:
-                    next_ea = _next_head(current_ea, func_end)
-                    if next_ea == idaapi.BADADDR:
-                        break
-                    current_ea = next_ea
-                    continue
-                if insn.itype in [idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni]:
-                    op0 = insn.ops[0]
-                    if op0.type in (ida_ua.o_mem, ida_ua.o_near, ida_ua.o_far):
-                        target = op0.addr
-                    elif op0.type == ida_ua.o_imm:
-                        target = op0.value
-                    else:
-                        target = None
-                    if target is not None and target not in callees_dict:
-                        func_type = (
-                            "internal"
-                            if ida_funcs.get_func(target) is not None
-                            else "external"
-                        )
-                        func_name = ida_name.get_name(target)
-                        if func_name is not None:
-                            callees_dict[target] = {
-                                "addr": hex(target),
-                                "name": func_name,
-                                "type": func_type,
-                            }
-                next_ea = _next_head(current_ea, func_end)
-                if next_ea == idaapi.BADADDR:
-                    break
-                current_ea = next_ea
-
+            found = _collect_callees(func, call_only=True)
             results.append(
-                {
-                    "addr": fn_addr,
-                    "callees": list(callees_dict.values()),
-                    "more": more,
-                }
+                {"addr": fn_addr, "callees": found[:limit], "more": len(found) > limit}
             )
         except Exception as e:
             results.append({"addr": fn_addr, "callees": None, "error": str(e)})
@@ -1332,20 +1151,15 @@ def find_bytes(
     limit: Annotated[int, "Max matches per pattern (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[dict]:
-    """Search byte patterns (supports ??) with offset/limit pagination."""
+    """Prefer search(kind="bytes", targets=...) for unified search with opaque cursor.
+    WHEN: scan the whole IDB for byte patterns ("48 8B ??") with offset/limit paging.
+    RETURNS: [{pattern, matches[hex], n, cursor, error}] per pattern.
+    LIMITS: limit max 10000; invalid patterns return build_err error entries; continue via cursor.next."""
     patterns = normalize_list_input(patterns)
 
     # Enforce max limit
     if limit <= 0 or limit > 10000:
         limit = 10000
-
-    # Build a reusable search closure based on available IDA API
-    def _make_searcher(pattern: str):
-        """Return a (searcher_fn, error_str|None) for the given pattern.
-
-        searcher_fn(ea, max_ea) -> ea_t  (BADADDR if not found)
-        """
-        return compat.make_bytes_searcher(pattern)
 
     results = []
     for pattern in patterns:
@@ -1353,7 +1167,7 @@ def find_bytes(
         skipped = 0
         more = False
         try:
-            searcher, build_err = _make_searcher(pattern)
+            searcher, build_err = compat.make_bytes_searcher(pattern)
             if build_err is not None:
                 results.append(
                     {
@@ -1420,7 +1234,10 @@ def basic_blocks(
     ] = 1000,
     offset: Annotated[int, "Skip first N blocks (default: 0)"] = 0,
 ) -> list[dict]:
-    """Return function CFG blocks with offset/max_blocks pagination."""
+    """Prefer graph_query(kind="cfg", targets=...) for canonical CFG blocks.
+    WHEN: list CFG blocks per function with offset/max_blocks paging.
+    RETURNS: [{addr, blocks[{start, end, type?, succs, preds}], count, total_blocks, cursor, error}].
+    LIMITS: max_blocks max 10000; unresolved/non-function addresses return error entries; continue via cursor.next."""
     addrs = normalize_list_input(addrs)
 
     # Enforce max limit
@@ -1453,24 +1270,7 @@ def basic_blocks(
                 )
                 continue
 
-            flowchart = idaapi.FlowChart(func)
-            all_blocks = []
-
-            for block in flowchart:
-                all_blocks.append(
-                    BasicBlock(
-                        start=hex(block.start_ea),
-                        end=hex(block.end_ea),
-                        size=block.end_ea - block.start_ea,
-                        type=block.type,
-                        successors=[hex(succ.start_ea) for succ in block.succs()],
-                        predecessors=[hex(pred.start_ea) for pred in block.preds()],
-                    )
-                )
-
-            # Apply pagination
-            total_blocks = len(all_blocks)
-            blocks = all_blocks[offset : offset + max_blocks]
+            blocks, total_blocks = _basic_blocks(func, max_blocks, max(0, offset))
             more = offset + max_blocks < total_blocks
 
             results.append(
@@ -1514,10 +1314,12 @@ def find(
     limit: Annotated[int, "Max matches per target (default: 1000, max: 10000)"] = 1000,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> list[dict]:
-    """Search strings/immediates/refs for targets with offset/limit pagination."""
+    """Prefer search(kind="constant", targets=...) for immediates; search(kind="text") for strings.
+    WHEN: search by type string|immediate|data_ref|code_ref with offset/limit paging.
+    RETURNS: [{query, matches[hex], count, cursor, error}] per target.
+    LIMITS: limit max 10000; unknown type string returns an error entry listing Allowed values."""
     if not isinstance(targets, list):
         targets = [targets]
-
     # Enforce max limit to prevent token overflow
     if limit <= 0 or limit > 10000:
         limit = 10000
@@ -1549,15 +1351,15 @@ def find(
                 max_ea = compat.inf_get_max_ea()
                 mask = b"\xff" * len(pattern_bytes)
                 while ea != idaapi.BADADDR:
-                    ea = _raw_bin_search(ea, max_ea, pattern_bytes, mask)
+                    ea = compat.raw_bin_search(ea, max_ea, pattern_bytes, mask, _BIN_SEARCH_FLAGS)
                     if ea != idaapi.BADADDR:
                         if skipped < offset:
                             skipped += 1
                         else:
                             matches.append(hex(ea))
                             if len(matches) >= limit:
-                                next_ea = _raw_bin_search(
-                                    ea + 1, max_ea, pattern_bytes, mask
+                                next_ea = compat.raw_bin_search(
+                                    ea + 1, max_ea, pattern_bytes, mask, _BIN_SEARCH_FLAGS
                                 )
                                 more = next_ea != idaapi.BADADDR
                                 break
@@ -1602,21 +1404,18 @@ def find(
                     continue
 
                 seen_insn = set()
-                for seg_ea in idautils.Segments():
-                    seg = compat.get_segment_info(seg_ea)
-                    if not seg or not (_segment_perm(seg) & ida_segment.SEGPERM_EXEC):
-                        continue
+                for seg_start, seg_end in _segments(exec_only=True):
                     for normalized, size, pattern_bytes in candidates:
-                        ea = seg.start_ea
-                        while ea != idaapi.BADADDR and ea < seg.end_ea:
-                            ea = _raw_bin_search(
-                                ea, seg.end_ea, pattern_bytes, b"\xff" * size
+                        ea = seg_start
+                        while ea != idaapi.BADADDR and ea < seg_end:
+                            ea = compat.raw_bin_search(
+                                ea, seg_end, pattern_bytes, b"\xff" * size, _BIN_SEARCH_FLAGS
                             )
                             if ea == idaapi.BADADDR:
                                 break
 
                             insn_start = _resolve_immediate_insn_start(
-                                ea, value, seg.start_ea, normalized
+                                ea, value, seg_start, normalized
                             )
                             if insn_start is not None and insn_start not in seen_insn:
                                 seen_insn.add(insn_start)
@@ -1717,13 +1516,14 @@ def find(
                 )
 
     else:
+        allowed_find_types = ("string", "immediate", "data_ref", "code_ref")
         results.append(
             {
                 "query": None,
                 "matches": [],
                 "count": 0,
                 "cursor": {"done": True},
-                "error": f"Unknown search type: {type}",
+                "error": f"Unknown search type: {type}. Allowed: {', '.join(allowed_find_types)}",
             }
         )
 
@@ -1738,11 +1538,7 @@ def _resolve_insn_scan_ranges(
     start_s = pattern.get("start")
     end_s = pattern.get("end")
 
-    exec_segments = []
-    for seg_ea in idautils.Segments():
-        seg = compat.get_segment_info(seg_ea)
-        if seg and (_segment_perm(seg) & ida_segment.SEGPERM_EXEC):
-            exec_segments.append(seg)
+    exec_segments = _segments(exec_only=True)
 
     if func_addr is not None:
         try:
@@ -1755,9 +1551,9 @@ def _resolve_insn_scan_ranges(
             return [], str(e)
 
     if segment_name is not None:
-        for seg in exec_segments:
-            if compat.get_segment_name(seg.start_ea) == segment_name:
-                return [(seg.start_ea, seg.end_ea)], None
+        for seg_start, seg_end in exec_segments:
+            if compat.get_segment_name(seg_start) == segment_name:
+                return [(seg_start, seg_end)], None
         return [], f"Executable segment not found: {segment_name}"
 
     if start_s is not None or end_s is not None:
@@ -1773,18 +1569,17 @@ def _resolve_insn_scan_ranges(
             return [], "No executable segments found"
 
         if end_ea is None:
-            seg = compat.get_segment_info(start_ea)
-            if not seg or not (_segment_perm(seg) & ida_segment.SEGPERM_EXEC):
+            end_ea = next((e for s, e in exec_segments if s <= start_ea < e), None)
+            if end_ea is None:
                 return [], "start address not in executable segment"
-            end_ea = seg.end_ea
 
         if end_ea <= start_ea:
             return [], "end must be greater than start"
 
         ranges = []
-        for seg in exec_segments:
-            seg_start = max(seg.start_ea, start_ea)
-            seg_end = min(seg.end_ea, end_ea)
+        for seg_start, seg_end in exec_segments:
+            seg_start = max(seg_start, start_ea)
+            seg_end = min(seg_end, end_ea)
             if seg_end > seg_start:
                 ranges.append((seg_start, seg_end))
 
@@ -1799,7 +1594,7 @@ def _resolve_insn_scan_ranges(
     if not exec_segments:
         return [], "No executable segments found"
 
-    return [(seg.start_ea, seg.end_ea) for seg in exec_segments], None
+    return exec_segments, None
 
 
 def _scan_insn_ranges(
@@ -1832,13 +1627,13 @@ def _scan_insn_ranges(
 
             insn = _decode_insn_at(ea)
             if insn is None:
-                ea = _next_head(ea, end_ea)
+                ea = ida_bytes.next_head(ea, end_ea)
                 if ea == idaapi.BADADDR:
                     break
                 continue
 
             if mnem and _insn_mnem(insn) != mnem:
-                ea = _next_head(ea, end_ea)
+                ea = ida_bytes.next_head(ea, end_ea)
                 if ea == idaapi.BADADDR:
                     break
                 continue
@@ -1854,7 +1649,7 @@ def _scan_insn_ranges(
             if any_val is not None and match:
                 found_any = False
                 for i in range(8):
-                    if _operand_type(insn, i) == ida_ua.o_void:
+                    if insn.ops[i].type == ida_ua.o_void:
                         break
                     if _operand_value(insn, i) == any_val:
                         found_any = True
@@ -1872,7 +1667,7 @@ def _scan_insn_ranges(
                         matches = matches[:limit]
                         break
 
-            ea = _next_head(ea, end_ea)
+            ea = ida_bytes.next_head(ea, end_ea)
             if ea == idaapi.BADADDR:
                 break
 
@@ -1890,7 +1685,10 @@ def insn_query(
         "Instruction query with mnemonic/operand filters and scoped scan",
     ],
 ) -> list[dict]:
-    """Query instructions with mnemonic/operand filters and scoped scans."""
+    """Prefer search(kind="instruction", targets=[mnem], ...) for unified instruction search.
+    WHEN: mnemonic/operand-filtered scan scoped by func/segment/start/end with offset/count paging.
+    RETURNS: [{query, ranges[{start, end}], matches[{addr, disasm?, fn?}], count, cursor, scanned, truncated, next_start, error}].
+    LIMITS: count max 5000, max_scan_insns max 2000000; unscoped scans need allow_broad or they error."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -1962,8 +1760,7 @@ def insn_query(
                 ea = int(addr_s, 16)
                 row = {"addr": addr_s}
                 if include_disasm:
-                    line = ida_lines.generate_disasm_line(ea, 0)
-                    row["disasm"] = ida_lines.tag_remove(line) if line else ""
+                    row["disasm"] = disasm_text(ea)
                 if include_fn:
                     row["fn"] = get_function(ea, raise_error=False)
                 rows.append(row)
@@ -2020,7 +1817,10 @@ def export_funcs(
         str, "Export format: json (default), c_header, or prototypes"
     ] = "json",
 ) -> dict:
-    """Export function data for addresses in json/c_header/prototypes formats."""
+    """Legacy function exporter (no canonical equivalent).
+    WHEN: dump function records (name, prototype, size, comments; json adds asm+decompile+xrefs).
+    RETURNS: {format, functions[] | content(c_header) | functions[{name, prototype}](prototypes)}.
+    LIMITS: format json|c_header|prototypes (default json); unknown functions return error entries."""
     addrs = normalize_list_input(addrs)
     results = []
 
@@ -2042,16 +1842,12 @@ def export_funcs(
 
             if format == "json":
                 func_data["asm"] = get_assembly_lines(ea)
-                decompile_failure: dict = {}
-                func_data["code"] = decompile_function_safe(
-                    func.start_ea, error_out=decompile_failure
-                )
-                if func_data["code"] is None:
-                    func_data["decompile_error"] = decompile_failure.pop(
-                        "message", "Decompilation failed without diagnostic details"
-                    )
-                    func_data["decompile_error_details"] = decompile_failure or None
-                func_data["xrefs"] = get_all_xrefs(ea)
+                (
+                    func_data["code"],
+                    func_data["decompile_error"],
+                    func_data["decompile_error_details"],
+                ) = _decompile_section(func)
+                func_data["xrefs"] = _xrefs_section(func.start_ea)
 
             results.append(func_data)
 
@@ -2101,7 +1897,10 @@ def callgraph(
         int, "Max edges per function (default: 200, max: 5000)"
     ] = 200,
 ) -> list[dict]:
-    """Build bounded callgraph from roots with depth/node/edge limits."""
+    """Prefer graph_query(kind="calls", targets=..., max_depth=...) for canonical call graphs.
+    WHEN: bounded multi-hop call-graph traversal from root functions with node/edge budgets.
+    RETURNS: [{root, nodes[{addr, name, depth}], edges[{from, to, type}], truncated, limit_reason?, per_func_capped, error}].
+    LIMITS: depth max 20, nodes max 100000, edges max 200000, per-func edges max 5000; truncated signals budget hit."""
     roots = normalize_list_input(roots)
     if max_depth < 0:
         max_depth = 0
@@ -2182,42 +1981,28 @@ def callgraph(
                     return
 
                 edges_added = 0
-                for item_ea in idautils.FuncItems(f.start_ea):
+                for callee_info in _collect_callees(f, call_only=True):
                     if truncated:
                         break
-                    insn = ida_ua.insn_t()
-                    if not ida_ua.decode_insn(insn, item_ea) or not ida_idp.is_call_insn(insn):
+                    callee_func = ida_funcs.get_func(int(callee_info["addr"], 16))
+                    if not callee_func:
                         continue
-                    for xref in idautils.CodeRefsFrom(item_ea, 0):
-                        if truncated:
-                            break
-                        if edges_added >= max_edges_per_func:
-                            per_func_capped = True
-                            break
-                        callee_func = ida_funcs.get_func(xref)
-                        if not callee_func:
-                            continue
-                        callee = callee_func.start_ea
-                        edge_key = (addr, callee)
-                        if edge_key in edge_keys:
-                            continue
-                        if len(edges) >= max_edges:
-                            hit_limit("edges")
-                            break
-                        if not add_node(callee, depth + 1):
-                            break
-                        edge_keys.add(edge_key)
-                        edges.append(
-                            {
-                                "from": hex(addr),
-                                "to": hex(callee),
-                                "type": "call",
-                            }
-                        )
-                        edges_added += 1
-                        traverse(callee, depth + 1)
                     if edges_added >= max_edges_per_func:
+                        per_func_capped = True
                         break
+                    callee = callee_func.start_ea
+                    edge_key = (addr, callee)
+                    if edge_key in edge_keys:
+                        continue
+                    if len(edges) >= max_edges:
+                        hit_limit("edges")
+                        break
+                    if not add_node(callee, depth + 1):
+                        break
+                    edge_keys.add(edge_key)
+                    edges.append({"from": hex(addr), "to": hex(callee), "type": "call"})
+                    edges_added += 1
+                    traverse(callee, depth + 1)
 
             traverse(ea, 0)
 

@@ -41,4 +41,4 @@ def _isolated_instance_dir(tmp_path_factory):
 
 @pytest.fixture(scope="session")
 def discovery():
-    return _load_module("ida_mcp_discovery", IDA_MCP_DIR / "bridge_discovery.py")
+    return _load_module("ida_mcp_discovery", IDA_MCP_DIR / "discovery.py")

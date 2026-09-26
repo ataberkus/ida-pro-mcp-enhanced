@@ -1,4 +1,5 @@
 import glob
+import importlib.util
 import json
 import os
 import re
@@ -7,7 +8,6 @@ import sys
 import tempfile
 import tomllib
 import tomli_w
-from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 try:
@@ -60,6 +60,14 @@ if not os.path.exists(IDA_VNEXT_PKG):
     raise RuntimeError(
         f"IDA vNext support package not found at {IDA_VNEXT_PKG} (did you move it?)"
     )
+
+# The ida_mcp package __init__ needs idaapi, so load discovery.py by path.
+_discovery_spec = importlib.util.spec_from_file_location(
+    "ida_mcp_installer_discovery", os.path.join(IDA_PLUGIN_PKG, "discovery.py")
+)
+_discovery = importlib.util.module_from_spec(_discovery_spec)
+_discovery_spec.loader.exec_module(_discovery)
+_get_ida_user_dir = _discovery._get_ida_user_dir
 
 
 def set_ida_rpc(host: str, port: int) -> None:
@@ -534,16 +542,6 @@ def install_mcp_servers(
             "No MCP servers installed. For unsupported MCP clients, use the following config:\n"
         )
         print_mcp_config(host, port)
-
-
-def _get_ida_user_dir() -> str:
-    if sys.platform == "win32":
-        return os.path.join(
-            os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming"),
-            "Hex-Rays",
-            "IDA Pro",
-        )
-    return os.path.join(os.path.expanduser("~"), ".idapro")
 
 
 def _remove_path(path: str) -> None:

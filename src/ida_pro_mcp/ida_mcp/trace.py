@@ -33,10 +33,6 @@ from .rpc import MCP_SERVER
 from .sync import idasync
 
 
-_TAG_META = TAG_META
-_TAG_INDEX = TAG_INDEX
-_TAG_DATA = TAG_DATA
-_CHUNK = CHUNK_SIZE  # MAXSPECSIZE: one netnode supval
 _FORMAT_VERSION = 1
 
 _META_VERSION = 0
@@ -88,26 +84,26 @@ def _netnode_flush_segment(payload: bytes, record_count: int) -> None:
 
     node = ida_netnode.netnode(IDB_NETNODE_NAME, 0, True)
 
-    if node.altval(_META_VERSION, _TAG_META) == 0:
-        node.altset(_META_VERSION, _FORMAT_VERSION, _TAG_META)
+    if node.altval(_META_VERSION, TAG_META) == 0:
+        node.altset(_META_VERSION, _FORMAT_VERSION, TAG_META)
 
-    start = node.altval(_META_NEXT_CHUNK, _TAG_META)
-    seg_id = node.altval(_META_NEXT_SEG_ID, _TAG_META)
+    start = node.altval(_META_NEXT_CHUNK, TAG_META)
+    seg_id = node.altval(_META_NEXT_SEG_ID, TAG_META)
 
-    if not node.setblob(payload, start, _TAG_DATA):
+    if not node.setblob(payload, start, TAG_DATA):
         raise RuntimeError(f"setblob failed at index {start}")
 
-    node.altset(seg_id, start, _TAG_INDEX)
+    node.altset(seg_id, start, TAG_INDEX)
 
-    used_chunks = (len(payload) + _CHUNK - 1) // _CHUNK
+    used_chunks = (len(payload) + CHUNK_SIZE - 1) // CHUNK_SIZE
     new_start = start + used_chunks + 1  # +1: empty supval that terminates getblob
     new_seg_id = seg_id + 1
 
-    node.altset(_META_NEXT_CHUNK, new_start, _TAG_META)
-    node.altset(_META_NEXT_SEG_ID, new_seg_id, _TAG_META)
+    node.altset(_META_NEXT_CHUNK, new_start, TAG_META)
+    node.altset(_META_NEXT_SEG_ID, new_seg_id, TAG_META)
 
-    cur_total = node.altval(_META_TOTAL_RECORDS, _TAG_META)
-    node.altset(_META_TOTAL_RECORDS, cur_total + record_count, _TAG_META)
+    cur_total = node.altval(_META_TOTAL_RECORDS, TAG_META)
+    node.altset(_META_TOTAL_RECORDS, cur_total + record_count, TAG_META)
 
 
 @idasync

@@ -78,8 +78,7 @@ def _load_helper(mod_name: str, filename: str):
     return module
 
 
-_discovery = _load_helper("ida_mcp_bridge_discovery", "bridge_discovery.py")
-_gui_discovery = _load_helper("ida_mcp_gui_discovery", "discovery.py")
+_discovery = _load_helper("ida_mcp_gui_discovery", "discovery.py")
 
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
@@ -197,10 +196,12 @@ def _refresh_tool_table(*, force: bool = False):
             and time.monotonic() - _tool_table_fetched_at < _TOOL_TABLE_TTL_SEC
         ):
             return _tool_table
-        instances = _discovery.read_registry_dir(_gui_discovery.get_instances_dir())
+        instances = _discovery.read_registry_dir(_discovery.get_instances_dir())
         prefixes = _discovery.assign_prefixes(instances)
         targets = [
-            _discovery.InstanceTarget(id=i.id, host=i.host, port=i.port, prefix=prefixes[i.id])
+            _discovery.InstanceTarget(
+                id=f"port{i['port']}", host=i["host"], port=int(i["port"]), prefix=prefixes[i["port"]]
+            )
             for i in instances
         ]
         signature = tuple(sorted((t.id, t.port, t.prefix) for t in targets))

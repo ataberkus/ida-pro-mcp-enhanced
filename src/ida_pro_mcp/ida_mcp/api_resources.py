@@ -4,25 +4,16 @@ Resources represent browsable state (read-only data) following MCP's philosophy.
 Use tools for actions that modify state or perform expensive computations.
 """
 
-from typing import Annotated
-
 import ida_nalt
-import ida_segment
-import ida_typeinf
 import idaapi
-import idautils
 import idc
 
 from .rpc import resource
-from .sync import IDAError, idasync
+from .sync import idasync
 from .utils import (
     Metadata,
-    Segment,
-    StructureDefinition,
-    StructureMember,
     get_image_size,
     hash_input_file,
-    parse_address,
 )
 from . import compat
 
@@ -58,35 +49,6 @@ def idb_metadata_resource() -> Metadata:
         crc32=crc32,
         filesize=filesize,
     )
-
-
-@resource("ida://idb/segments")
-@idasync
-def idb_segments_resource() -> list[Segment]:
-    """Get all memory segments with permissions"""
-    segments = []
-    for seg_ea in idautils.Segments():
-        seg = compat.get_segment_info(seg_ea)
-        if seg:
-            perm = seg.get_perm() if hasattr(seg, "get_perm") else seg.perm
-            perms = []
-            if perm & ida_segment.SEGPERM_READ:
-                perms.append("r")
-            if perm & ida_segment.SEGPERM_WRITE:
-                perms.append("w")
-            if perm & ida_segment.SEGPERM_EXEC:
-                perms.append("x")
-
-            segments.append(
-                Segment(
-                    name=compat.get_segment_name(seg_ea),
-                    start=hex(seg.start_ea),
-                    end=hex(seg.end_ea),
-                    size=hex(seg.end_ea - seg.start_ea),
-                    permissions="".join(perms) if perms else "---",
-                )
-            )
-    return segments
 
 
 @resource("ida://idb/entrypoints")
@@ -139,157 +101,3 @@ def selection_resource() -> dict:
     if start:
         return {"start": hex(start[0]), "end": hex(start[1]) if start[1] else None}
     return {"selection": None}
-
-
-# ============================================================================
-# Type Information
-# ============================================================================
-
-
-@resource("ida://types")
-@idasync
-def types_resource() -> list[dict]:
-    """Get all local types"""
-    types = []
-    for ordinal in range(1, compat.get_ordinal_limit(None)):
-        tif = ida_typeinf.tinfo_t()
-        if tif.get_numbered_type(None, ordinal):
-            name = tif.get_type_name()
-            types.append({"ordinal": ordinal, "name": name, "type": str(tif)})
-    return types
-
-
-@resource("ida://structs")
-@idasync
-def structs_resource() -> list[dict]:
-    """Get all structures/unions"""
-    structs = []
-    limit = compat.get_ordinal_limit()
-    for ordinal in range(1, limit):
-        tif = ida_typeinf.tinfo_t()
-        if tif.get_numbered_type(None, ordinal) and tif.is_udt():
-            udt_data = ida_typeinf.udt_type_data_t()
-            is_union = False
-            if tif.get_udt_details(udt_data):
-                is_union = udt_data.is_union
-            structs.append(
-                {
-                    "name": tif.get_type_name(),
-                    "size": hex(tif.get_size()),
-                    "is_union": is_union,
-                }
-            )
-    return structs
-
-
-@resource("ida://struct/{name}")
-@idasync
-def struct_name_resource(name: Annotated[str, "Structure name"]) -> dict:
-    """Get structure definition with fields"""
-    tif = ida_typeinf.tinfo_t()
-    if not tif.get_named_type(None, name):
-        raise IDAError(f"Structure not found: {name}")
-
-    if not tif.is_udt():
-        raise IDAError(f"'{name}' is not a structure/union")
-
-    udt_data = ida_typeinf.udt_type_data_t()
-    if not tif.get_udt_details(udt_data):
-        raise IDAError(f"Failed to get struct details for '{name}'")
-
-    members = []
-    for member in udt_data:
-        members.append(
-            StructureMember(
-                name=member.name,
-                offset=hex(member.offset // 8),
-                size=hex(member.size // 8),
-                type=str(member.type),
-                bit_offset=member.offset % 8,
-                bit_size=member.size % 8,
-            )
-        )
-
-    return StructureDefinition(name=name, size=hex(tif.get_size()), members=members)
-
-
-# ============================================================================
-# Import/Export Lookup by Name
-# ============================================================================
-
-
-@resource("ida://import/{name}")
-@idasync
-def import_name_resource(name: Annotated[str, "Import name"]) -> dict:
-    """Get specific import details by name"""
-    nimps = ida_nalt.get_import_module_qty()
-    for i in range(nimps):
-        module = ida_nalt.get_import_module_name(i)
-        result = {}
-
-        def callback(ea, imp_name, ordinal):
-            if imp_name == name or f"ord_{ordinal}" == name:
-                result.update(
-                    {
-                        "addr": hex(ea),
-                        "name": imp_name or f"ord_{ordinal}",
-                        "module": module,
-                        "ordinal": ordinal,
-                    }
-                )
-                return False  # Stop enumeration
-            return True
-
-        ida_nalt.enum_import_names(i, callback)
-        if result:
-            return result
-
-    raise IDAError(f"Import not found: {name}")
-
-
-@resource("ida://export/{name}")
-@idasync
-def export_name_resource(name: Annotated[str, "Export name"]) -> dict:
-    """Get specific export details by name"""
-    entry_count = compat.get_entry_qty()
-    for i in range(entry_count):
-        ordinal = compat.get_entry_ordinal(i)
-        ea = compat.get_entry(ordinal)
-        entry_name = compat.get_entry_name(ordinal)
-
-        if entry_name == name:
-            return {
-                "addr": hex(ea),
-                "name": entry_name,
-                "ordinal": ordinal,
-            }
-
-    raise IDAError(f"Export not found: {name}")
-
-
-# ============================================================================
-# Cross-references
-# ============================================================================
-
-
-_RESOURCE_XREF_LIMIT = 500
-
-
-@resource("ida://xrefs/from/{addr}")
-@idasync
-def xrefs_from_resource(addr: Annotated[str, "Source address"]) -> list[dict]:
-    """Get cross-references from address"""
-    from .utils import resolve_address_or_name
-
-    ea = resolve_address_or_name(addr)
-    xrefs = []
-    for xref in idautils.XrefsFrom(ea, 0):
-        xrefs.append(
-            {
-                "addr": hex(xref.to),
-                "type": "code" if xref.iscode else "data",
-            }
-        )
-        if len(xrefs) >= _RESOURCE_XREF_LIMIT:
-            break
-    return xrefs

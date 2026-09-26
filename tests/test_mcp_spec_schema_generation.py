@@ -5,7 +5,7 @@ validate against it."""
 import sys
 import pathlib
 import unittest
-from typing import Annotated, NotRequired, Optional, TypedDict
+from typing import Annotated, Literal, NotRequired, Optional, TypedDict
 
 from jsonschema import Draft202012Validator
 
@@ -317,8 +317,17 @@ class InputSchemaShapeTests(unittest.TestCase):
             """doc."""
             return 0
         sch = self._schema_of(f)
-        self.assertEqual(sch["type"], "object")
         self.assertIn("data", sch["properties"])
+        self.assertEqual(sch["type"], "object")
+
+    def test_literal_params_emit_enum(self):
+        def f(mode: Annotated[Literal["a", "b"], "desc"], n: Literal[1, 2] = 1) -> int:
+            """doc."""
+            return 0
+        sch = self._schema_of(f)
+        self.assertEqual(sch["properties"]["mode"], {"type": "string", "enum": ["a", "b"], "description": "desc"})
+        self.assertEqual(sch["properties"]["n"]["enum"], [1, 2])
+        self.assertEqual(sch["properties"]["n"]["type"], "integer")
 
 
 class RegisteredToolMatchesSpecTests(unittest.TestCase):

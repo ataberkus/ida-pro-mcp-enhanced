@@ -18,13 +18,22 @@ from ida_pro_mcp.ida_mcp import (
     configure_workspace_policy,
 )
 from ida_pro_mcp.ida_mcp.api_core import server_warmup
-from ida_pro_mcp.ida_mcp.discovery import register_instance, unregister_instance
+from ida_pro_mcp.ida_mcp.discovery import (
+    IDB_MANAGEMENT_TOOLS,
+    register_instance,
+    unregister_instance,
+)
 from ida_pro_mcp.ida_mcp.http import IdaMcpHttpRequestHandler
 from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile, load_profile_scopes
-from ida_pro_mcp.ida_mcp.rpc import LEGACY_TOOLS_ENABLED, set_download_base_url, tool
+from ida_pro_mcp.ida_mcp.rpc import (
+    LEGACY_TOOLS_ENABLED,
+    get_workspace_policy,
+    set_download_base_url,
+    tool,
+)
 from ida_pro_mcp.idalib_session_manager import get_session_manager
 from ida_pro_mcp.worker_lifecycle import WorkerLifecycle
-from ida_pro_mcp.vnext.auth import AuthPolicy, WorkspacePolicy, default_token_path, load_token_file
+from ida_pro_mcp.vnext.auth import AuthPolicy, default_token_path, load_token_file
 from ida_pro_mcp.vnext.contracts import SafetyScope, VNextError
 
 
@@ -58,18 +67,11 @@ class IdalibListResult(TypedDict, total=False):
 
 logger = logging.getLogger(__name__)
 
-IDB_MANAGEMENT_TOOLS = {
-    "idb_open",
-    "idb_list",
-}
-
-
 _LIFECYCLE = WorkerLifecycle()
 _STOP_INITIATED = threading.Event()
 _REGISTERED_PORT: int | None = None
 _BOUND_HOST: str = ""
 _BOUND_PORT: int = 0
-_WORKSPACE_POLICY = WorkspacePolicy()
 
 
 def _register_in_discovery(host: str, port: int, input_path: Path) -> None:
@@ -120,7 +122,7 @@ def idb_open(
 
     try:
         manager = get_session_manager()
-        resolved_path = _WORKSPACE_POLICY.resolve(input_path, must_exist=True)
+        resolved_path = get_workspace_policy().resolve(input_path, must_exist=True)
         load_started_at = time.monotonic()
         opened_session_id = manager.open_binary(
             resolved_path,
@@ -256,8 +258,6 @@ def main():
     if auth_policy.token_required or token:
         MCP_SERVER.http_authenticator = auth_policy.authorize_header
 
-    global _WORKSPACE_POLICY
-    _WORKSPACE_POLICY = WorkspacePolicy.from_values(args.workspace_root)
     configure_workspace_policy(args.workspace_root)
 
     scopes = {SafetyScope.READ}
@@ -291,7 +291,7 @@ def main():
             raise FileNotFoundError(f"Input file not found: {args.input_path}")
 
         logger.info("opening initial database: %s", args.input_path)
-        resolved = _WORKSPACE_POLICY.resolve(args.input_path, must_exist=True)
+        resolved = get_workspace_policy().resolve(args.input_path, must_exist=True)
         session_id = session_manager.open_binary(resolved, run_auto_analysis=True)
         logger.info("Initial session created: %s", session_id)
         _register_in_discovery(args.host, args.port, resolved)

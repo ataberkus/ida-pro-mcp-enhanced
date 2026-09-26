@@ -24,7 +24,6 @@ def test_unsafe_set_includes_all_expected_categories():
     """MCP_UNSAFE should contain python-exec, composite, and debugger tools."""
     assert "py_eval" in MCP_UNSAFE
     assert "py_exec_file" in MCP_UNSAFE
-    assert "diff_before_after" in MCP_UNSAFE
     dbg_tools = {n for n in MCP_UNSAFE if n.startswith("dbg_")}
     assert len(dbg_tools) >= 15, f"Expected ≥15 dbg_ unsafe tools, got {len(dbg_tools)}"
 
@@ -32,7 +31,7 @@ def test_unsafe_set_includes_all_expected_categories():
 @test()
 def test_unsafe_tools_are_disjoint_from_safe_core():
     """Core analysis tools must never be marked @unsafe."""
-    safe_core = {"decompile", "disasm", "list_funcs", "imports"}
+    safe_core = {"decompile", "disasm", "imports"}
     overlap = MCP_UNSAFE & safe_core
     assert not overlap, f"Core tools incorrectly marked unsafe: {overlap}"
 

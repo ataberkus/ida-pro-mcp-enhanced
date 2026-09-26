@@ -179,29 +179,6 @@ def build_cursor_prompt(analysis: dict[str, Any], *, database: str = "") -> str:
     )
 
 
-def parse_local_renames(text: str) -> list[dict[str, str]]:
-    """Parse `old=new` / `old -> new` lines into rename records."""
-    rows: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "->" in line:
-            old, new = line.split("->", 1)
-        elif "=" in line:
-            old, new = line.split("=", 1)
-        else:
-            continue
-        old_name = old.strip()
-        new_name = new.strip()
-        if not old_name or not new_name or old_name == new_name or old_name in seen:
-            continue
-        seen.add(old_name)
-        rows.append({"old": old_name, "new": new_name})
-    return rows
-
-
 def selected_local_renames(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
     """Keep rows whose new name is non-empty and different from the original."""
     selected: list[dict[str, str]] = []

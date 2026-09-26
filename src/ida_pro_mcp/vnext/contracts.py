@@ -194,7 +194,6 @@ class JobRecord:
     result: Any = None
     error: dict[str, Any] | None = None
     database: str | None = None
-    resumable: bool = False
     schema_version: str = API_SCHEMA_VERSION
 
     def to_dict(self, *, include_result: bool = True) -> dict[str, Any]:
@@ -244,7 +243,6 @@ class MutationPreview:
     changes: list[dict[str, Any]]
     warnings: list[str]
     expires_at: str
-    checkpoint_estimate_bytes: int | None = None
     schema_version: str = API_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:

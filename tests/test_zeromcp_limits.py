@@ -3,6 +3,7 @@
 import http.client
 import sys
 import unittest
+from typing import Literal
 
 sys.path.insert(0, "tests")
 from _mcp_spec_support import McpServer
@@ -42,6 +43,34 @@ class RedactedErrorsTests(unittest.TestCase):
         message = response["error"]["message"]
         self.assertEqual(message, "Internal Error: ValueError: boom")
         self.assertNotIn("Traceback", message)
+
+
+class LiteralArgumentTests(unittest.TestCase):
+    def test_literal_string_mode_reaches_case_insensitive_tool(self):
+        registry = JsonRpcRegistry()
+
+        def normalize(mode: Literal["triage", "deep"]) -> str:
+            return mode.lower()
+
+        registry.method(normalize)
+        for mode in ("triage", "TRIAGE"):
+            with self.subTest(mode=mode):
+                response = registry.dispatch({
+                    "jsonrpc": "2.0", "id": 1, "method": "normalize", "params": {"mode": mode},
+                })
+                self.assertEqual(response["result"], "triage")
+
+    def test_literal_rejects_wrong_type_as_invalid_params(self):
+        registry = JsonRpcRegistry()
+
+        def choose(level: Literal[1, 2]) -> int:
+            return level
+
+        registry.method(choose)
+        response = registry.dispatch({
+            "jsonrpc": "2.0", "id": 1, "method": "choose", "params": {"level": True},
+        })
+        self.assertEqual(response["error"]["code"], -32602)
 
 
 class PolicyAnnotationTests(unittest.TestCase):

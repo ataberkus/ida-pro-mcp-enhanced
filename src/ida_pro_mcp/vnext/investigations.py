@@ -135,10 +135,6 @@ class InvestigationManager:
             return _to_markdown(record)
         if normalized == "sarif":
             return json.dumps(_to_sarif(record), indent=2, sort_keys=True)
-        if normalized == "dot":
-            return _to_dot(record)
-        if normalized == "mermaid":
-            return _to_mermaid(record)
         raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported report format: {format}")
 
     def _persist_locked(self) -> None:
@@ -238,20 +234,3 @@ def _to_sarif(record: InvestigationRecord) -> dict[str, Any]:
         "version": "2.1.0",
         "runs": [{"tool": {"driver": {"name": "ida-pro-mcp"}}, "results": results}],
     }
-
-
-def _to_dot(record: InvestigationRecord) -> str:
-    lines = ["digraph investigation {"]
-    for index, finding in enumerate(sorted(record.findings, key=lambda item: item.finding_id)):
-        label = finding.title.replace('"', '\\"')
-        lines.append(f'  finding_{index} [label="{label}"];')
-    lines.append("}")
-    return "\n".join(lines) + "\n"
-
-
-def _to_mermaid(record: InvestigationRecord) -> str:
-    lines = ["graph TD"]
-    for index, finding in enumerate(sorted(record.findings, key=lambda item: item.finding_id)):
-        label = finding.title.replace("[", "(").replace("]", ")")
-        lines.append(f"  finding_{index}[{label}]")
-    return "\n".join(lines) + "\n"

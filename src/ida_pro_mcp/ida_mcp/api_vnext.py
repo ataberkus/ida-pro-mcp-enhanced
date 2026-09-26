@@ -8,14 +8,13 @@ while presenting a smaller and versioned public API.
 from __future__ import annotations
 
 import base64
-import functools
 import json
 import os
 import platform
 import sys
 from pathlib import Path
 from threading import RLock
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal, NoReturn, TypedDict, get_args
 from urllib.parse import quote, unquote
 from uuid import uuid4
 
@@ -51,11 +50,15 @@ from .rpc import (
     tool,
 )
 try:
-    from .sync import IDASyncError
+    from .sync import IDASyncError, idasync
     from .sync import CancelledError as SyncCancelledError
 except ImportError:  # IDA-free contexts (tests) stub these modules
     IDASyncError = None  # type: ignore[assignment,misc]
     SyncCancelledError = None  # type: ignore[assignment,misc]
+
+    def idasync(func):  # type: ignore[no-redef]
+        # ponytail: no IDA main thread in unit tests; helpers run inline there.
+        return func
 try:
     from .zeromcp.jsonrpc import RequestCancelledError
 except ImportError:
@@ -64,6 +67,60 @@ try:
     from .zeromcp.mcp import McpToolError
 except ImportError:
     McpToolError = None  # type: ignore[assignment,misc]
+
+
+# Closed vocabularies. Signatures use Literal so MCP clients get `enum`
+# constraints; bodies still `.lower()` for case-insensitive callers.
+SearchKind = Literal["text", "regex", "bytes", "constant", "instruction"]
+MemoryReadKind = Literal["bytes", "integer", "string", "global", "patch_diff"]
+AnalysisMode = Literal["triage", "function", "component", "batch", "similar", "deep"]
+GraphKind = Literal["xrefs", "xrefs_from", "xrefs_both", "calls", "cfg"]
+DataflowDirection = Literal["forward", "backward", "both"]
+SignatureFormat = Literal["ida", "x64dbg", "mask", "bitmask"]
+InvestigationExportFormat = Literal["json", "markdown", "sarif"]
+InvestigationSeverity = Literal["info", "low", "medium", "high", "critical"]
+PythonExecuteMode = Literal["eval", "file"]
+DebugSessionAction = Literal["start", "attach", "detach", "terminate", "status"]
+DebugControlAction = Literal["continue", "step_into", "step_over", "pause", "run_to"]
+DebugBreakpointAction = Literal["list", "add", "delete", "toggle", "watch"]
+DebugMemoryAction = Literal["read", "write", "snapshot", "diff"]
+DebugTraceAction = Literal["start", "status", "stop", "export"]
+
+
+class AnalysisOptions(TypedDict, total=False):
+    detail_level: Annotated[str, "triage verbosity: fast or full"]
+    include_asm: Annotated[bool, "function mode: include disassembly"]
+    max_depth: Annotated[int, "deep mode: reference-flow depth per target (1-20)"]
+    direction: Annotated[str, "deep mode: dataflow direction forward, backward, or both"]
+    limit: Annotated[int, "similar mode: maximum matches"]
+    min_score: Annotated[float, "similar mode: minimum similarity score 0-1"]
+
+
+class TaintOptions(TypedDict, total=False):
+    include_traces: Annotated[bool, "include per-source traces in the result"]
+    max_paths: Annotated[int, "maximum reported paths (1-1000)"]
+    domains: Annotated[list[str], "propagation domains subset of register, stack, global, memory"]
+
+
+class DebugTraceOptions(TypedDict, total=False):
+    kind: Annotated[str, "trace kind: instruction, function, basic_block, or step"]
+    clear: Annotated[bool, "clear the existing trace on start"]
+    max_events: Annotated[int, "trace buffer size (1-1000000)"]
+    offset: Annotated[int, "event listing offset"]
+    limit: Annotated[int, "maximum events listed (1-5000)"]
+    path: Annotated[str, "export destination path"]
+    description: Annotated[str, "export trace description"]
+
+
+class InvestigationBudgets(TypedDict, total=False):
+    detail_level: Annotated[str, "triage verbosity: fast or full"]
+    include_asm: Annotated[bool, "per-seed function analysis: include disassembly"]
+    max_depth: Annotated[int, "per-seed dataflow depth (1-20)"]
+    direction: Annotated[str, "per-seed dataflow direction forward, backward, or both"]
+
+
+def _unsupported(what: str, value: Any, allowed: tuple[str, ...] | list[str]) -> NoReturn:
+    raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported {what}: {value}. Allowed: {', '.join(allowed)}")
 
 
 def _legacy_passthrough_errors() -> tuple:
@@ -87,34 +144,6 @@ _TRANSACTIONS = TransactionManager(_REVISIONS)
 _REVISION_HOOK: Any = None
 _DEBUG_HOOK: Any = None
 _DEBUG_SNAPSHOTS: dict[str, dict[str, Any]] = {}
-
-
-def _ida_synchronized(func):
-    """Run *func* on the IDA main thread, lazily wrapping with idasync.
-
-    Direct-call when already on the IDA main thread so IDB hooks and nested
-    helpers do not re-enter the sync queue. Worker/job threads still dispatch.
-    """
-
-    synced = None
-
-    @functools.wraps(func)
-    def wrapped(*args, **kwargs):
-        nonlocal synced
-        try:
-            import ida_pro
-
-            if ida_pro.is_main_thread():
-                return func(*args, **kwargs)
-        except Exception:
-            pass
-        from .sync import idasync
-
-        if synced is None:
-            synced = idasync(func)
-        return synced(*args, **kwargs)
-
-    return wrapped
 
 
 def _load_idb_state(key: str) -> dict[str, Any]:
@@ -179,38 +208,19 @@ def _legacy_call(name: str, arguments: dict[str, Any] | None = None, *, check_pa
     # profile filtering does not break canonical analysis jobs.
     if check_paths:
         resolve_tool_paths(name, arguments or {})
-    implementation_methods = getattr(MCP_SERVER.tools, "_all_methods", None)
-    if isinstance(implementation_methods, dict):
-        implementation = implementation_methods.get(name)
-        if implementation is None:
-            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool is not registered: {name}")
-        try:
-            return implementation(**(arguments or {}))
-        except VNextError:
+    implementation = getattr(MCP_SERVER.tools, "_all_methods", {}).get(name)
+    if implementation is None:
+        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool is not registered: {name}")
+    try:
+        return implementation(**(arguments or {}))
+    except VNextError:
+        raise
+    except Exception as exc:
+        if isinstance(exc, _legacy_passthrough_errors()):
             raise
-        except Exception as exc:
-            if isinstance(exc, _legacy_passthrough_errors()):
-                raise
-            if isinstance(exc, (TypeError, ValueError, KeyError)):
-                raise VNextError(ErrorCode.INVALID_OPERATION, f"Legacy tool failed: {name}: {exc}") from exc
-            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool failed: {name}: {exc}") from exc
+        if isinstance(exc, (TypeError, ValueError, KeyError)):
             raise VNextError(ErrorCode.INVALID_OPERATION, f"Legacy tool failed: {name}: {exc}") from exc
-        except Exception as exc:
-            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool failed: {name}: {exc}") from exc
-
-    response = MCP_SERVER.tools.dispatch(
-        {"jsonrpc": "2.0", "method": name, "params": arguments or {}, "id": None}
-    )
-    if response and "error" in response:
-        error = response["error"]
-        data = error.get("data") or {}
-        raw_code = data.get("code", ErrorCode.NOT_SUPPORTED.value)
-        try:
-            code = ErrorCode(raw_code)
-        except ValueError:
-            code = ErrorCode.NOT_SUPPORTED
-        raise VNextError(code, error.get("message", f"Legacy tool failed: {name}"), details=data)
-    return response.get("result") if response else None
+        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Legacy tool failed: {name}: {exc}") from exc
 
 
 def _database_id_lookup() -> str:
@@ -234,7 +244,7 @@ def _database_id_lookup() -> str:
     return get_current_transport_session_id() or "active"
 
 
-_database_id_sync = _ida_synchronized(_database_id_lookup)
+_database_id_sync = idasync(_database_id_lookup)
 
 
 def _database_id() -> str:
@@ -455,7 +465,7 @@ def _ida_capabilities_impl() -> CapabilityManifest:
     )
 
 
-_ida_capabilities_sync = _ida_synchronized(_ida_capabilities_impl)
+_ida_capabilities_sync = idasync(_ida_capabilities_impl)
 
 
 def _encode_cursor_value(value: dict[str, Any]) -> str:
@@ -527,43 +537,54 @@ def _result_truncated(result: Any) -> bool:
     )
 
 
-def _instruction_cursor_states(
+def _per_target_cursor_states(
     cursor: str | None,
     target_count: int,
+    key: str,
 ) -> list[dict[str, Any] | None]:
+    """Decode one ``{offset[, start]}`` state per target (None = target exhausted)."""
     if not cursor:
         return [{"offset": 0} for _ in range(target_count)]
     value = _decode_cursor_value(cursor)
-    if "instruction" not in value:
-        try:
-            offset = max(0, int(value["offset"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid pagination cursor") from exc
-        return [{"offset": offset} for _ in range(target_count)]
-    states = value["instruction"]
+    if key not in value:
+        return [{"offset": _decode_cursor(cursor)} for _ in range(target_count)]
+    states = value[key]
     if not isinstance(states, list) or len(states) != target_count:
-        raise VNextError(ErrorCode.INVALID_OPERATION, "Instruction cursor does not match targets")
-    if any(state is not None and not isinstance(state, dict) for state in states):
-        raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid instruction cursor state")
-    return states
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"{key.title()} cursor does not match targets")
+    normalized: list[dict[str, Any] | None] = []
+    for state in states:
+        if state is None:
+            normalized.append(None)
+            continue
+        try:
+            entry: dict[str, Any] = {"offset": max(0, int(state["offset"]))}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid {key} cursor state") from exc
+        if state.get("start"):
+            entry["start"] = str(state["start"])
+        normalized.append(entry)
+    return normalized
 
 
-def _instruction_next_cursor(
+def _per_target_next_cursor(
     result: Any,
     pending: list[tuple[int, str, dict[str, Any]]],
     target_count: int,
+    key: str,
 ) -> str | None:
+    """Encode per-target continuation; collapses to a plain offset cursor when uniform."""
     if not isinstance(result, list):
         return None
     states: list[dict[str, Any] | None] = [None] * target_count
     for (target_index, _target, prior), item in zip(pending, result):
         if not isinstance(item, dict):
             continue
-        legacy_cursor = item.get("cursor")
         if item.get("truncated") and item.get("next_start"):
             states[target_index] = {"offset": 0, "start": str(item["next_start"])}
-        elif isinstance(legacy_cursor, dict) and legacy_cursor.get("next") is not None:
-            state = {"offset": max(0, int(legacy_cursor["next"]))}
+            continue
+        encoded = _search_next_cursor(item)
+        if encoded is not None:
+            state: dict[str, Any] = {"offset": _decode_cursor(encoded)}
             if prior.get("start"):
                 state["start"] = prior["start"]
             states[target_index] = state
@@ -573,61 +594,6 @@ def _instruction_next_cursor(
     if (
         len(active) == target_count
         and all(not state.get("start") for state in active)
-        and len({int(state["offset"]) for state in active}) == 1
-    ):
-        return _encode_cursor(int(active[0]["offset"]))
-    return _encode_cursor_value({"instruction": states})
-
-
-def _batch_cursor_states(
-    cursor: str | None,
-    target_count: int,
-    key: str,
-) -> list[dict[str, int] | None]:
-    if not cursor:
-        return [{"offset": 0} for _ in range(target_count)]
-    value = _decode_cursor_value(cursor)
-    if key not in value:
-        try:
-            offset = max(0, int(value["offset"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid pagination cursor") from exc
-        return [{"offset": offset} for _ in range(target_count)]
-    states = value[key]
-    if not isinstance(states, list) or len(states) != target_count:
-        raise VNextError(ErrorCode.INVALID_OPERATION, f"{key.title()} cursor does not match targets")
-    normalized: list[dict[str, int] | None] = []
-    for state in states:
-        if state is None:
-            normalized.append(None)
-            continue
-        if not isinstance(state, dict):
-            raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid {key} cursor state")
-        try:
-            normalized.append({"offset": max(0, int(state["offset"]))})
-        except (KeyError, TypeError, ValueError) as exc:
-            raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid {key} cursor state") from exc
-    return normalized
-
-
-def _batch_next_cursor(
-    result: Any,
-    pending: list[tuple[int, str, dict[str, int]]],
-    target_count: int,
-    key: str,
-) -> str | None:
-    if not isinstance(result, list):
-        return None
-    states: list[dict[str, int] | None] = [None] * target_count
-    for (target_index, _target, _prior), item in zip(pending, result):
-        encoded = _search_next_cursor(item)
-        if encoded is not None:
-            states[target_index] = {"offset": _decode_cursor(encoded)}
-    active = [state for state in states if state is not None]
-    if not active:
-        return None
-    if (
-        len(active) == target_count
         and len({state["offset"] for state in active}) == 1
     ):
         return _encode_cursor(active[0]["offset"])
@@ -636,24 +602,27 @@ def _batch_next_cursor(
 
 @tool
 def server_capabilities() -> dict[str, Any]:
-    """Return runtime, IDA, safety, analysis-engine, and schema capabilities."""
+    """WHEN choosing which tool fits, read this first; it gates debug/python/file tools.
+    RETURNS {runtime, ida, safety, engine, schema} capability manifest.
+    LIMITS snapshot of current backend (debugger/hexrays flags flip with the IDB). NEXT analysis_run/mutation_preview within the allowed scopes."""
 
     return _ida_capabilities().to_dict()
 
 
 @tool
 def search(
-    kind: Annotated[str, "text, regex, bytes, constant, or instruction"],
+    kind: Annotated[SearchKind, "text, regex, bytes, constant, or instruction"],
     targets: Annotated[list[str], "Search values or patterns"],
     limit: Annotated[int, "Maximum results"] = 100,
     cursor: Annotated[str | None, "Opaque continuation cursor"] = None,
 ) -> dict[str, Any]:
-    """Search text, regular expressions, bytes, constants, or instructions."""
-
-    normalized = kind.lower()
+    """WHEN exact-value lookup is enough, use memory_read/entity_query instead.
+    RETURNS {data, truncated, next_cursor} envelope; per-kind arity/pagination below.
+    LIMITS text/regex take exactly 1 target (offset cursor); bytes/constant take N targets (offset cursor); instruction takes N mnemonics (per-target {offset,start} cursor, legacy insn_query, max_scan_insns 200000). NEXT follow up with memory_read/disassemble/graph_query."""
+    normalized = str(kind).lower()
     legacy_tool = normalized
     if normalized == "instruction":
-        states = _instruction_cursor_states(cursor, len(targets))
+        states = _per_target_cursor_states(cursor, len(targets), "instruction")
         pending = [
             (index, target, state)
             for index, (target, state) in enumerate(zip(targets, states))
@@ -663,7 +632,7 @@ def search(
         for _index, target, state in pending:
             query = {
                 "mnem": target,
-                "offset": max(0, int(state.get("offset", 0))),
+                "offset": state["offset"],
                 "count": limit,
                 "max_scan_insns": 200000,
                 "allow_broad": True,
@@ -673,7 +642,7 @@ def search(
                 query["start"] = state["start"]
             queries.append(query)
         result = _legacy_call("insn_query", {"queries": queries}) if queries else []
-        next_cursor = _instruction_next_cursor(result, pending, len(targets))
+        next_cursor = _per_target_next_cursor(result, pending, len(targets), "instruction")
         legacy_tool = "insn_query"
     else:
         offset = _decode_cursor(cursor)
@@ -697,8 +666,11 @@ def search(
         elif normalized == "regex":
             if len(targets) != 1:
                 raise VNextError(ErrorCode.INVALID_OPERATION, "Regex search accepts one pattern")
-            result = _legacy_call("find_regex", {"pattern": targets[0], "limit": limit, "offset": offset})
-            legacy_tool = "find_regex"
+            result = _legacy_call(
+                "entity_query",
+                {"queries": {"kind": "strings", "regex": targets[0], "case_sensitive": False, "offset": offset, "count": limit}},
+            )
+            legacy_tool = "entity_query"
         elif normalized == "bytes":
             result = _legacy_call("find_bytes", {"patterns": targets, "limit": limit, "offset": offset})
             legacy_tool = "find_bytes"
@@ -714,7 +686,7 @@ def search(
             )
             legacy_tool = "find"
         else:
-            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported search kind: {kind}")
+            _unsupported("search kind", kind, get_args(SearchKind))
         next_cursor = _search_next_cursor(result)
     return ToolEnvelope(
         result,
@@ -758,14 +730,17 @@ def _normalize_memory_queries(kind: str, queries: list[dict[str, Any]] | list[st
 
 @tool
 def memory_read(
-    kind: Annotated[str, "bytes, integer, string, or global"],
+    kind: Annotated[MemoryReadKind, "bytes, integer, string, global, or patch_diff"],
     queries: Annotated[
-        list[dict[str, Any]] | list[str],
+        list[dict[str, Any]] | list[str] | None,
         "Address queries. bytes: '0x...' (size defaults to 16) or {addr,size}; "
-        "integer: {addr,ty} where ty is u8/u32/uint32/i16le/u64be/etc; string/global: address or name strings",
-    ],
+        "integer: {addr,ty} where ty is u8/u32/uint32/i16le/u64be/etc; string/global: address or name strings; "
+        "patch_diff: ignored (Phase C hook owns the IDA patched-bytes diff)",
+    ] = None,
 ) -> dict[str, Any]:
-    """Read static database bytes, integers, strings, or globals."""
+    """WHEN reading one static fact, use this; for live process memory use debug_memory.
+    RETURNS {data, truncated, next_cursor} envelope with per-kind rows below.
+    LIMITS bytes/integer/string/global delegate to one legacy read each (no pagination); patch_diff is reserved for the Phase C patched-bytes diff (queries ignored). NEXT disassemble/graph_query for code context."""
 
     mapping = {
         "bytes": ("get_bytes", "regions"),
@@ -773,10 +748,15 @@ def memory_read(
         "string": ("get_string", "addrs"),
         "global": ("get_global_value", "queries"),
     }
-    if kind not in mapping:
-        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported memory read kind: {kind}")
-    name, argument_name = mapping[kind]
-    normalized = _normalize_memory_queries(kind, queries)
+    normalized_kind = str(kind).lower()
+    if normalized_kind == "patch_diff":
+        from . import api_recovery
+
+        return ToolEnvelope({"text": api_recovery.patch_diff_text()}, provenance={"legacy_tool": "visit_patched_bytes"}).to_dict()
+    if normalized_kind not in mapping:
+        _unsupported("memory read kind", kind, get_args(MemoryReadKind))
+    name, argument_name = mapping[normalized_kind]
+    normalized = _normalize_memory_queries(normalized_kind, list(queries or []))
     return ToolEnvelope(
         _legacy_call(name, {argument_name: normalized}),
         provenance={"legacy_tool": name},
@@ -790,8 +770,9 @@ def disassemble(
     offset: Annotated[int, "Instruction offset"] = 0,
     include_total: Annotated[bool, "Include total instruction count"] = False,
 ) -> dict[str, Any]:
-    """Disassemble a function using canonical hexadecimal address output."""
-
+    """WHEN one function body is enough, use this instead of analysis_run(function).
+    RETURNS {data, truncated} envelope with canonical hex addresses.
+    LIMITS offset/max_instructions paginate one function; large functions hit the rpc 50k download indirection. NEXT graph_query(cfg) for blocks."""
     result = _legacy_call("disasm", {"addr": addr, "max_instructions": max_instructions, "offset": offset, "include_total": include_total})
     return ToolEnvelope(result, provenance={"legacy_tool": "disasm"}).to_dict()
 
@@ -799,13 +780,17 @@ def disassemble(
 @tool
 def signature_create(
     addrs: Annotated[list[str], "Functions or addresses to sign"],
-    format: Annotated[str, "Signature format"] = "ida",
+    format: Annotated[SignatureFormat, "ida, x64dbg, mask, or bitmask"] = "ida",
     wildcard_operands: Annotated[bool, "Wildcard relocatable operands"] = True,
     max_length: Annotated[int, "Maximum signature length"] = 250,
 ) -> dict[str, Any]:
-    """Create stable byte signatures for functions or address ranges."""
-
-    result = _legacy_call("make_signature_for_function", {"addrs": addrs, "format": format, "wildcard_operands": wildcard_operands, "max_length": max_length})
+    """WHEN matching this function elsewhere, use this; for callers/callees use graph_query.
+    RETURNS {data, truncated} envelope with one signature row per address.
+    LIMITS max_length caps signature bytes; wildcard_operands wildcards relocatable operands. NEXT search(bytes) to find matches."""
+    normalized_format = str(format).lower()
+    if normalized_format not in get_args(SignatureFormat):
+        _unsupported("signature format", format, get_args(SignatureFormat))
+    result = _legacy_call("make_signature_for_function", {"addrs": addrs, "format": normalized_format, "wildcard_operands": wildcard_operands, "max_length": max_length})
     return ToolEnvelope(result, provenance={"legacy_tool": "make_signature_for_function"}).to_dict()
 
 
@@ -820,32 +805,45 @@ def _analysis_sync(mode: str, targets: list[str], options: dict[str, Any]) -> An
         return _legacy_call("analyze_component", {"addrs": targets})
     if mode == "batch":
         return _legacy_call("analyze_batch", {"queries": [{"addr": target} for target in targets]})
-    if mode == "binary_diff":
-        raise VNextError(ErrorCode.NOT_SUPPORTED, "Binary diff requires supervisor-level access to two database sessions")
-    raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported analysis mode: {mode}")
+    if mode == "similar":
+        from . import api_recovery
+        from .utils import resolve_address_or_name
+
+        if len(targets) != 1:
+            raise VNextError(ErrorCode.INVALID_OPERATION, "Similar analysis requires one target")
+        return api_recovery.similar_functions(
+            resolve_address_or_name(targets[0]),
+            int(options.get("limit", 20) or 20),
+            float(options.get("min_score", 0.3) or 0.3),
+        )
+    _unsupported("analysis mode", mode, get_args(AnalysisMode))
 
 
 @tool
 def analysis_run(
-    mode: Annotated[str, "triage, function, component, batch, deep, or binary_diff"],
-    targets: Annotated[list[str], "Seed functions or addresses"] = [],
-    options: Annotated[dict[str, Any] | None, "Analysis budgets and mode options"] = None,
+    mode: Annotated[AnalysisMode, "triage, function, component, batch, similar, or deep"],
+    targets: Annotated[list[str] | None, "Seed functions or addresses"] = None,
+    options: Annotated[AnalysisOptions | None, "Analysis budgets and mode options"] = None,
 ) -> dict[str, Any]:
-    """Run a bounded analysis inline or as a cancellable deep-analysis job."""
-
-    normalized = mode.lower()
-    effective_options = options or {}
+    """WHEN choosing analysis depth, use this; for one disassembly use disassemble.
+    RETURNS inline {data,...} envelope, or a job record for deep. Per-mode arity below.
+    LIMITS triage takes no targets (detail_level fast/full); function/similar take 1 target (similar ranks mnemonic 3-gram matches, options limit/min_score); component/batch take N targets; deep submits a cancellable job (options max_depth 1-20, direction forward/backward/both) and large outputs use the rpc 50k download indirection. NEXT dataflow_trace/taint_analyze on the targets."""
+    normalized = str(mode).lower()
+    effective_options = dict(options or {})
+    if normalized not in get_args(AnalysisMode):
+        _unsupported("analysis mode", mode, get_args(AnalysisMode))
+    effective_targets = list(targets or [])
     if normalized != "deep":
-        return ToolEnvelope(_analysis_sync(normalized, targets, effective_options), provenance={"mode": normalized}).to_dict()
+        return ToolEnvelope(_analysis_sync(normalized, effective_targets, effective_options), provenance={"mode": normalized}).to_dict()
 
     def run(context: JobContext) -> dict[str, Any]:
         context.progress(0.05, "triage")
         triage = _analysis_sync("triage", [], effective_options)
         functions: list[dict[str, Any]] = []
-        total = max(1, len(targets))
+        total = max(1, len(effective_targets))
         depth = max(1, min(int(effective_options.get("max_depth", 3) or 3), 20))
         direction = str(effective_options.get("direction", "both") or "both")
-        for index, target in enumerate(targets):
+        for index, target in enumerate(effective_targets):
             context.check_cancelled()
             analysis = _analysis_sync("function", [target], effective_options)
             try:
@@ -860,27 +858,30 @@ def analysis_run(
             provenance={"mode": "deep", "database": _database_id()},
         ).to_dict()
 
-    return _jobs().submit("analysis.deep", run, database=_database_id(), resumable=True).to_dict(include_result=False)
+    return _jobs().submit("analysis.deep", run, database=_database_id()).to_dict(include_result=False)
 
 
 @tool
 def graph_query(
-    kind: Annotated[str, "xrefs, xrefs_from, xrefs_both, calls, or cfg"],
+    kind: Annotated[GraphKind, "xrefs, xrefs_from, xrefs_both, calls, or cfg"],
     targets: Annotated[list[str], "Root functions or addresses"],
     max_depth: Annotated[int, "Maximum traversal depth"] = 3,
     limit: Annotated[int, "Maximum nodes or blocks"] = 1000,
     cursor: Annotated[str | None, "Opaque continuation cursor"] = None,
 ) -> dict[str, Any]:
-    """Query xrefs, call graphs, or control-flow graphs."""
+    """WHEN code references matter, use this instead of raw xrefs/disassembly.
+    RETURNS {data, truncated, next_cursor} envelope; per-kind arity/pagination below.
+    LIMITS xrefs/xrefs_from/xrefs_both take N targets (per-target offset cursor, legacy xref_query); cfg takes N targets (per-target offset cursor, legacy basic_blocks, max_blocks=limit); calls takes N roots (no cursor, max_nodes=limit, max_edges=2*limit). NEXT dataflow_trace for value flow."""
+    normalized = str(kind).lower()
 
-    if kind in {"xrefs", "xrefs_from", "xrefs_both", "cfg"}:
-        states = _batch_cursor_states(cursor, len(targets), "graph")
+    if normalized in {"xrefs", "xrefs_from", "xrefs_both", "cfg"}:
+        states = _per_target_cursor_states(cursor, len(targets), "graph")
         pending = [
             (index, target, state)
             for index, (target, state) in enumerate(zip(targets, states))
             if state is not None
         ]
-        if kind == "cfg":
+        if normalized == "cfg":
             result = []
             for _index, target, state in pending:
                 page = _legacy_call(
@@ -897,7 +898,7 @@ def graph_query(
                 "xrefs": "to",
                 "xrefs_from": "from",
                 "xrefs_both": "both",
-            }[kind]
+            }[normalized]
             result = _legacy_call(
                 "xref_query",
                 {
@@ -912,17 +913,17 @@ def graph_query(
                     ]
                 },
             )
-        next_cursor = _batch_next_cursor(result, pending, len(targets), "graph")
-    elif kind == "calls":
+        next_cursor = _per_target_next_cursor(result, pending, len(targets), "graph")
+    elif normalized == "calls":
         if cursor:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Call graphs do not support cursor continuation")
         result = _legacy_call("callgraph", {"roots": targets, "max_depth": max_depth, "max_nodes": limit, "max_edges": limit * 2, "max_edges_per_func": 100})
         next_cursor = None
     else:
-        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported graph kind: {kind}")
+        _unsupported("graph kind", kind, get_args(GraphKind))
     return ToolEnvelope(
         result,
-        provenance={"kind": kind},
+        provenance={"kind": normalized},
         truncated=next_cursor is not None or _result_truncated(result),
         next_cursor=next_cursor,
     ).to_dict()
@@ -931,23 +932,26 @@ def graph_query(
 @tool
 def dataflow_trace(
     addr: Annotated[str, "Seed address, string, or function"],
-    direction: Annotated[str, "forward, backward, or both"] = "forward",
+    direction: Annotated[DataflowDirection, "forward, backward, or both"] = "forward",
     max_depth: Annotated[int, "Maximum reference depth"] = 3,
 ) -> dict[str, Any]:
-    """Trace data flow, explicitly labeling the engine and fidelity."""
+    """WHEN asking where a value flows, use this; for sink matching use taint_analyze.
+    RETURNS {engine, fidelity, nodes, edges, warnings, truncated} graph dict.
+    LIMITS semantic microcode engine when Hex-Rays is present, else reference-flow fallback (unsupported_edges labeled); max_depth caps reference hops. NEXT taint_analyze for source/sink correlation."""
+    normalized = str(direction).lower()
 
     try:
         from .hexrays_dataflow import trace_microcode
 
-        return trace_microcode(addr, direction=direction, max_depth=max_depth)
+        return trace_microcode(addr, direction=normalized, max_depth=max_depth)
     except VNextError as exc:
         if exc.code is not ErrorCode.NOT_SUPPORTED:
             raise
         fallback_warning = f"Hex-Rays microcode unavailable: {exc}"
 
-    if direction not in {"forward", "backward", "both"}:
-        raise VNextError(ErrorCode.INVALID_OPERATION, f"Invalid data-flow direction: {direction}")
-    result = _legacy_call("trace_data_flow", {"addr": addr, "direction": direction, "max_depth": max_depth})
+    if normalized not in get_args(DataflowDirection):
+        _unsupported("data-flow direction", direction, get_args(DataflowDirection))
+    result = _legacy_call("trace_data_flow", {"addr": addr, "direction": normalized, "max_depth": max_depth})
     nodes, edges, truncated = normalize_reference_flow_graph(result if isinstance(result, dict) else {})
     warnings = [fallback_warning, "Result is reference flow, not semantic data flow"]
     if isinstance(result, dict) and result.get("error"):
@@ -972,18 +976,20 @@ def taint_analyze(
     sources: Annotated[list[str], "Source addresses or symbols"],
     sinks: Annotated[list[str], "Sink addresses or symbols"],
     max_depth: Annotated[int, "Maximum propagation depth"] = 4,
-    sanitizers: Annotated[list[str], "Known sanitizer symbols"] = [],
-    options: Annotated[dict[str, Any] | None, "Propagation domains and result budgets"] = None,
+    sanitizers: Annotated[list[str] | None, "Known sanitizer symbols"] = None,
+    options: Annotated[TaintOptions | None, "Propagation domains and result budgets"] = None,
 ) -> dict[str, Any]:
-    """Perform bounded microcode or reference-flow taint correlation."""
-
+    """WHEN matching sources to sinks, use this instead of raw dataflow_trace walks.
+    RETURNS {engine, fidelity, hits, sanitizer_annotations, warnings, truncated} dict.
+    LIMITS BFS over reference/microcode graphs capped by max_depth and options.max_paths (1-1000); domains filter register/stack/global/memory; large outputs use the rpc 50k download indirection. NEXT investigation_add_finding to record hits."""
+    effective_sanitizers = list(sanitizers or [])
+    effective_options = dict(options or {})
     traces = [dataflow_trace(source, "forward", max_depth) for source in sources]
-    effective_options = options or {}
     include_traces = bool(effective_options.get("include_traces", False))
     max_paths = max(1, min(int(effective_options.get("max_paths", 100)), 1000))
     enabled_domains = set(effective_options.get("domains", ["register", "stack", "global", "memory"]))
     sink_set = {normalized_match_token(sink) for sink in sinks}
-    sanitizer_set = {normalized_match_token(item) for item in sanitizers}
+    sanitizer_set = {normalized_match_token(item) for item in effective_sanitizers}
     hits: list[dict[str, Any]] = []
     sanitizer_annotations: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -1044,7 +1050,7 @@ def taint_analyze(
         "fidelity": "semantic_intraprocedural" if semantic else "reference_or_mixed",
         "sources": sources,
         "sinks": sinks,
-        "sanitizers": sanitizers,
+        "sanitizers": effective_sanitizers,
         "domains": sorted(enabled_domains),
         "hits": hits,
         "sanitizer_annotations": sanitizer_annotations,
@@ -1080,15 +1086,17 @@ def _node_domains(nodes: list[dict[str, Any]]) -> set[str]:
 
 @tool
 def job_status(job_id: Annotated[str, "Job identifier"]) -> dict[str, Any]:
-    """Return job state and progress without the potentially large result."""
-
+    """WHEN polling a deep analysis/investigation job, use this; for data use job_result.
+    RETURNS job record without the result payload.
+    LIMITS terminal states are persisted; interrupted jobs restore as interrupted. NEXT job_result when done."""
     return _jobs().status(job_id, include_result=False)
 
 
 @tool
 def job_cancel(job_id: Annotated[str, "Job identifier"]) -> dict[str, Any]:
-    """Request cooperative cancellation of a queued or running job."""
-
+    """WHEN a deep job is no longer needed, use this instead of waiting.
+    RETURNS {job_id, cancel_requested}.
+    LIMITS cooperative: running jobs observe cancellation at the next checkpoint. NEXT job_status to confirm."""
     return {"job_id": job_id, "cancel_requested": _jobs().cancel(job_id)}
 
 
@@ -1098,8 +1106,9 @@ def job_result(
     cursor: Annotated[str | None, "Opaque result cursor"] = None,
     limit: Annotated[int, "Maximum list items"] = 100,
 ) -> dict[str, Any]:
-    """Return a completed result with opaque cursor pagination for lists."""
-
+    """WHEN a deep job finished, use this; for progress use job_status.
+    RETURNS {data, truncated, next_cursor} envelope; lists paginate by cursor/limit.
+    LIMITS non-list results return whole; list pages cap at 1000 items and large outputs use the rpc 50k download indirection. NEXT investigation_add_finding to record conclusions."""
     result = _jobs().result(job_id)
     if not isinstance(result, list):
         return ToolEnvelope(result).to_dict()
@@ -1113,23 +1122,25 @@ def job_result(
 @tool
 def investigation_start(
     objective: Annotated[str, "Investigation goal"],
-    seeds: Annotated[list[str], "Seed functions, addresses, or strings"] = [],
-    budgets: Annotated[dict[str, Any] | None, "Depth and result budgets"] = None,
+    seeds: Annotated[list[str] | None, "Seed functions, addresses, or strings"] = None,
+    budgets: Annotated[InvestigationBudgets | None, "Depth and result budgets"] = None,
 ) -> dict[str, Any]:
-    """Start a resumable, evidence-oriented deep investigation."""
-
+    """WHEN a multi-step question needs resumable evidence, use this instead of one-shot analysis_run.
+    RETURNS the investigation record with its background job id.
+    LIMITS seeds fan out to one function analysis each; budgets carry detail_level/include_asm/max_depth/direction; findings arrive via investigation_add_finding. NEXT investigation_get/job_status to follow progress."""
+    effective_seeds = list(seeds or [])
+    effective_budgets = dict(budgets or {})
     manager = _investigations()
-    record = manager.create(objective, database=_database_id(), seeds=seeds)
-
+    record = manager.create(objective, database=_database_id(), seeds=effective_seeds)
     def run(context: JobContext) -> dict[str, Any]:
         try:
             context.progress(0.05, "triage")
-            triage = _analysis_sync("triage", [], budgets or {})
+            triage = _analysis_sync("triage", [], effective_budgets)
             analyses = []
-            for index, seed in enumerate(seeds):
+            for index, seed in enumerate(effective_seeds):
                 context.check_cancelled()
-                analyses.append(_analysis_sync("function", [seed], budgets or {}))
-                context.progress(0.1 + 0.8 * ((index + 1) / max(1, len(seeds))), f"analyzed {seed}")
+                analyses.append(_analysis_sync("function", [seed], effective_budgets))
+                context.progress(0.1 + 0.8 * ((index + 1) / max(1, len(effective_seeds))), f"analyzed {seed}")
             manager.set_state(record.investigation_id, "completed", triage=triage, analyses=analyses)
             return manager.get(record.investigation_id).to_dict()
         except JobCancelledError:
@@ -1139,15 +1150,16 @@ def investigation_start(
             manager.set_state(record.investigation_id, "failed")
             raise
 
-    job = _jobs().submit("investigation.deep", run, database=record.database, resumable=True)
+    job = _jobs().submit("investigation.deep", run, database=record.database)
     manager.set_job(record.investigation_id, job.job_id)
     return manager.get(record.investigation_id).to_dict()
 
 
 @tool
 def investigation_get(investigation_id: Annotated[str, "Investigation identifier"]) -> dict[str, Any]:
-    """Return persisted investigation state, evidence, and findings."""
-
+    """WHEN following a started investigation, use this; for jobs use job_status.
+    RETURNS the persisted investigation record with findings and evidence.
+    LIMITS read-only view; state changes only via add_finding or the background job. NEXT investigation_add_finding/investigation_export."""
     return _investigations().get(investigation_id).to_dict()
 
 
@@ -1156,22 +1168,26 @@ def investigation_add_finding(
     investigation_id: Annotated[str, "Investigation identifier"],
     title: Annotated[str, "Finding title"],
     description: Annotated[str, "Finding description"],
-    severity: Annotated[str, "info, low, medium, high, or critical"] = "info",
+    severity: Annotated[InvestigationSeverity, "info, low, medium, high, or critical"] = "info",
     confidence: Annotated[float, "Confidence from 0 to 1"] = 0.5,
-    evidence: Annotated[list[dict[str, Any]], "Evidence records"] = [],
-    tags: Annotated[list[str], "Finding tags"] = [],
+    evidence: Annotated[list[dict[str, Any]] | None, "Evidence records"] = None,
+    tags: Annotated[list[str] | None, "Finding tags"] = None,
 ) -> dict[str, Any]:
-    """Attach a structured, evidence-backed finding to an investigation."""
-
+    """WHEN a conclusion has tool evidence, use this; bare notes do not belong here.
+    RETURNS the created finding record.
+    LIMITS severity is info/low/medium/high/critical; confidence clamps to 0-1; evidence entries need addr or data. NEXT investigation_export for the report."""
+    normalized_severity = str(severity).lower()
+    if normalized_severity not in get_args(InvestigationSeverity):
+        _unsupported("investigation severity", severity, get_args(InvestigationSeverity))
     manager = _investigations()
     finding = manager.add_finding(
         investigation_id,
         title=title,
         description=description,
-        severity=severity,
+        severity=normalized_severity,
         confidence=confidence,
-        evidence=evidence,
-        tags=tags,
+        evidence=list(evidence or []),
+        tags=list(tags or []),
     )
     return finding.to_dict()
 
@@ -1179,12 +1195,16 @@ def investigation_add_finding(
 @tool
 def investigation_export(
     investigation_id: Annotated[str, "Investigation identifier"],
-    format: Annotated[str, "json, markdown, sarif, dot, or mermaid"] = "markdown",
+    format: Annotated[InvestigationExportFormat, "json, markdown, or sarif"] = "markdown",
     path: Annotated[str | None, "Optional output path"] = None,
 ) -> dict[str, Any]:
-    """Export an investigation deterministically, optionally writing a file."""
-
-    content = _investigations().export(investigation_id, format)
+    """WHEN the record is complete, use this; generate_report prompts the same flow.
+    RETURNS {format, content} inline or {path, format, bytes} when path is set.
+    LIMITS json/markdown/sarif only; invalid formats raise NOT_SUPPORTED with Allowed list. NEXT write the file yourself if path was omitted."""
+    normalized_format = str(format).lower()
+    if normalized_format not in get_args(InvestigationExportFormat):
+        _unsupported("investigation export format", format, get_args(InvestigationExportFormat))
+    content = _investigations().export(investigation_id, normalized_format)
     if path:
         output = get_workspace_policy().resolve(path, must_exist=False)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1210,6 +1230,8 @@ _OPERATION_TARGETS: dict[str, tuple[str, str, SafetyScope]] = {
     "make_data": ("make_data", "items", SafetyScope.MODIFY),
     "declare_stack": ("declare_stack", "items", SafetyScope.ANNOTATE),
     "delete_stack": ("delete_stack", "items", SafetyScope.ANNOTATE),
+    "apply_flirt": ("apply_flirt_signature", "items", SafetyScope.MODIFY),
+    "load_til": ("load_type_library", "items", SafetyScope.MODIFY),
     "save_database": ("idb_save", "path", SafetyScope.FILESYSTEM),
 }
 
@@ -1243,13 +1265,6 @@ def _as_dict_list(value: Any) -> list[dict[str, Any]] | None:
     return None
 
 
-def _first_present(args: dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if key in args and args[key] not in (None, ""):
-            return args[key]
-    return None
-
-
 def _parse_mutation_address(raw: Any, *, index: int, field: str = "addr") -> str:
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         raise VNextError(
@@ -1276,10 +1291,7 @@ def _copy_passthrough(source: dict[str, Any], dest: dict[str, Any], keys: tuple[
 
 
 def _normalize_comment_item(item: dict[str, Any], *, index: int) -> dict[str, Any]:
-    addr = _parse_mutation_address(
-        item.get("addr") or item.get("ea") or item.get("func_addr"),
-        index=index,
-    )
+    addr = _parse_mutation_address(item.get("addr"), index=index)
     comment = item.get("comment")
     if comment is None:
         comment = item.get("text")
@@ -1294,73 +1306,49 @@ def _normalize_comment_item(item: dict[str, Any], *, index: int) -> dict[str, An
 
 
 def _reshape_mutation_arguments(kind: str, arguments: dict[str, Any], *, index: int = 0) -> tuple[str, dict[str, Any]]:
-    """Normalize agent-friendly mutation kinds/args into canonical forms."""
+    """Normalize the kinds/flat forms documented on mutation_preview into canonical arguments."""
     canonical = _MUTATION_KIND_ALIASES.get(kind, kind)
     args = dict(arguments)
 
     if canonical == "rename":
         if any(key in args for key in _RENAME_BATCH_KEYS):
-            for key in ("func", "data", "global", "globals", "local", "stack"):
-                items = _as_dict_list(args.get(key))
-                if items is None:
-                    continue
-                for item in items:
-                    if any(field in item for field in ("addr", "ea", "func_addr")):
-                        item["addr"] = _parse_mutation_address(
-                            item.get("addr") or item.get("func_addr") or item.get("ea"),
-                            index=index,
-                        )
+            for key in _RENAME_BATCH_KEYS:
+                for item in _as_dict_list(args.get(key)) or []:
+                    if "addr" in item:
+                        item["addr"] = _parse_mutation_address(item["addr"], index=index)
             return canonical, args
-        if any(key in args for key in ("addr", "func_addr", "ea", "name", "new", "new_name")):
-            addr = args.get("addr", args.get("func_addr", args.get("ea")))
-            name = _first_present(args, "name", "new", "new_name")
-            parsed_addr = _parse_mutation_address(addr, index=index)
-            if not name:
+        if "addr" in args or "name" in args:
+            parsed_addr = _parse_mutation_address(args.get("addr"), index=index)
+            if not args.get("name"):
                 raise VNextError(
                     ErrorCode.INVALID_OPERATION,
                     f"Mutation operation {index} rename is missing name",
                 )
-            reshaped: dict[str, Any] = {
-                "func": [{"addr": parsed_addr, "name": str(name)}]
-            }
+            reshaped: dict[str, Any] = {"func": [{"addr": parsed_addr, "name": str(args["name"])}]}
             _copy_passthrough(args, reshaped, _RENAME_PASSTHROUGH_KEYS)
             return canonical, reshaped
 
     elif canonical in {"comment", "append_comment"}:
-        items = _as_dict_list(args.get("items") if "items" in args else args.get("item"))
+        items = _as_dict_list(args.get("items"))
         if items is not None:
             return canonical, {"items": [_normalize_comment_item(item, index=index) for item in items]}
-        if any(key in args for key in ("addr", "ea", "func_addr", "comment", "text")):
-            item = {
-                "addr": args.get("addr", args.get("ea", args.get("func_addr"))),
-                "comment": args["comment"] if "comment" in args else args.get("text"),
-            }
-            _copy_passthrough(args, item, ("scope", "dedupe"))
-            return canonical, {"items": [_normalize_comment_item(item, index=index)]}
+        if any(key in args for key in ("addr", "comment", "text")):
+            return canonical, {"items": [_normalize_comment_item(args, index=index)]}
 
     elif canonical == "set_type":
         edits = _as_dict_list(args.get("edits"))
         if edits is not None:
             for edit in edits:
-                if any(field in edit for field in ("addr", "ea", "func_addr")):
-                    edit["addr"] = _parse_mutation_address(
-                        edit.get("addr") or edit.get("ea") or edit.get("func_addr"),
-                        index=index,
-                    )
-            return canonical, {"edits": edits, **{k: v for k, v in args.items() if k != "edits"}}
-        addr = args.get("addr") or args.get("ea") or args.get("func_addr")
-        type_text = _first_present(args, "type", "ty", "signature", "decl")
-        if addr and type_text:
-            edit = {"addr": _parse_mutation_address(addr, index=index), "type": str(type_text)}
-            _copy_passthrough(args, edit, ("kind", "name", "signature", "ty", "variable"))
+                if "addr" in edit:
+                    edit["addr"] = _parse_mutation_address(edit["addr"], index=index)
+            return canonical, {**args, "edits": edits}
+        if args.get("addr") and args.get("type"):
+            edit = {"addr": _parse_mutation_address(args["addr"], index=index), "type": str(args["type"])}
+            _copy_passthrough(args, edit, ("kind", "name", "variable"))
             return canonical, {"edits": [edit]}
 
-    elif canonical == "declare_type":
-        if "decls" in args and args["decls"] not in (None, "", []):
-            return canonical, args
-        decl = _first_present(args, "decl", "declaration", "type")
-        if decl:
-            return canonical, {"decls": decl}
+    elif canonical == "declare_type" and not args.get("decls") and args.get("decl"):
+        return canonical, {"decls": args["decl"]}
 
     return canonical, args
 
@@ -1512,7 +1500,7 @@ def _apply_operation(operation: MutationOperation) -> Any:
     return result
 
 
-@_ida_synchronized
+@idasync
 def _mutation_before_state(operation: MutationOperation) -> Any:
     """Capture current names/comments/bytes so preview is useful for reversing."""
 
@@ -1579,7 +1567,7 @@ def _mutation_before_state(operation: MutationOperation) -> Any:
     return None
 
 
-@_ida_synchronized
+@idasync
 def _create_undo_point() -> bool:
     try:
         import ida_undo
@@ -1601,7 +1589,7 @@ def _create_undo_point() -> bool:
         return False
 
 
-@_ida_synchronized
+@idasync
 def _perform_undo() -> bool:
     try:
         import ida_undo
@@ -1612,7 +1600,7 @@ def _perform_undo() -> bool:
         return False
 
 
-@_ida_synchronized
+@idasync
 def _debug_attach(pid: int, event_id: int = -1) -> dict[str, Any]:
     import ida_dbg
 
@@ -1622,7 +1610,7 @@ def _debug_attach(pid: int, event_id: int = -1) -> dict[str, Any]:
     return {"attached": True, "pid": int(pid), "result": result}
 
 
-@_ida_synchronized
+@idasync
 def _debug_pause() -> dict[str, Any]:
     import ida_dbg
 
@@ -1631,7 +1619,7 @@ def _debug_pause() -> dict[str, Any]:
     return {"pause_requested": True}
 
 
-@_ida_synchronized
+@idasync
 def _debug_add_watchpoints(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     import ida_dbg
     import idaapi
@@ -1648,7 +1636,7 @@ def _debug_add_watchpoints(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         address = str(item.get("addr", ""))
         kind = str(item.get("kind", "write")).lower()
         if kind not in watch_types:
-            results.append({"addr": address, "error": f"Unsupported watchpoint kind: {kind}"})
+            results.append({"addr": address, "error": f"Unsupported watchpoint kind: {kind}. Allowed: write, read, readwrite, execute"})
             continue
         try:
             ea = parse_address(address)
@@ -1660,7 +1648,7 @@ def _debug_add_watchpoints(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return results
 
 
-@_ida_synchronized
+@idasync
 def _debug_trace_action(action: str, options: dict[str, Any]) -> dict[str, Any]:
     import ida_dbg
 
@@ -1672,7 +1660,7 @@ def _debug_trace_action(action: str, options: dict[str, Any]) -> dict[str, Any]:
         "step": (ida_dbg.enable_step_trace, ida_dbg.disable_step_trace, ida_dbg.is_step_trace_enabled),
     }
     if kind not in toggles:
-        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported trace kind: {kind}")
+        _unsupported("trace kind", options.get("kind", "instruction"), tuple(toggles))
     enable, disable, enabled = toggles[kind]
     if action == "start":
         if bool(options.get("clear", True)):
@@ -1686,7 +1674,7 @@ def _debug_trace_action(action: str, options: dict[str, Any]) -> dict[str, Any]:
     elif action == "stop":
         disable()
     elif action not in {"status", "result"}:
-        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported trace action: {action}")
+        _unsupported("trace action", action, ("start", "status", "stop", "export", "result"))
 
     quantity = int(ida_dbg.get_tev_qty())
     offset = max(0, int(options.get("offset", 0)))
@@ -1721,7 +1709,7 @@ def _debug_trace_action(action: str, options: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@_ida_synchronized
+@idasync
 def _debug_trace_export(path: str, description: str) -> dict[str, Any]:
     import ida_dbg
 
@@ -1743,14 +1731,14 @@ def mutation_preview(
         "{kind: comment, arguments: {items: [{addr, comment}]}}. "
         "kind is one of: rename, comment, append_comment, bookmark, declare_type, "
         "set_type, patch_bytes, write_integer, patch_asm, define_function, define_code, "
-        "undefine, set_operand_type, make_data, declare_stack, delete_stack, save_database. "
+        "undefine, set_operand_type, make_data, declare_stack, delete_stack, apply_flirt, "
+        "load_til, save_database. "
         "Aliases set_name/rename_func map to rename.",
     ],
 ) -> dict[str, Any]:
-    """Validate and stage a mutation batch without changing the database.
-
-    Rename operations are validated with a legacy dry-run; other kinds are structural only.
-    """
+    """WHEN staging any IDB change, use this; never call legacy mutators directly.
+    RETURNS staged transaction with per-operation before/after and warnings.
+    LIMITS rename dry-runs against legacy rename; other kinds are structural-only; commit requires the unchanged transaction id. NEXT mutation_status/mutation_commit."""
 
     parsed = _parse_operations(operations)
     for operation in parsed:
@@ -1788,7 +1776,9 @@ def mutation_preview(
 
 @tool
 def mutation_commit(transaction_id: Annotated[str, "Preview transaction identifier"]) -> dict[str, Any]:
-    """Commit an unchanged preview; write a recovery checkpoint only when that dashboard option is enabled."""
+    """WHEN a staged transaction reviewed clean, use this; for state checks use mutation_status.
+    RETURNS the commit receipt with recovery outcome.
+    LIMITS commits the unchanged preview only; recovery checkpoints only when the dashboard option enables them. NEXT mutation_rollback on regret."""
 
     receipt = _TRANSACTIONS.commit(
         transaction_id,
@@ -1804,97 +1794,116 @@ def mutation_commit(transaction_id: Annotated[str, "Preview transaction identifi
 
 @tool
 def mutation_status(transaction_id: Annotated[str, "Transaction identifier"]) -> dict[str, Any]:
-    """Return preview or committed transaction state."""
+    """WHEN following a staged transaction, use this instead of re-previewing.
+    RETURNS preview or committed transaction state.
+    LIMITS read-only view; expired transactions raise TRANSACTION_EXPIRED. NEXT mutation_commit/mutation_rollback."""
 
     return _TRANSACTIONS.status(transaction_id)
 
 
 @tool
 def mutation_rollback(transaction_id: Annotated[str, "Committed transaction identifier"]) -> dict[str, Any]:
-    """Roll back the latest committed transaction using native undo; otherwise raise REOPEN_REQUIRED with the checkpoint path (null when checkpoints are disabled). Reopen is manual."""
+    """WHEN undoing the latest commit, use this; older transactions are rejected.
+    RETURNS the rollback receipt.
+    LIMITS latest committed transaction only; without a checkpoint it uses native undo, else raises REOPEN_REQUIRED with the checkpoint path. NEXT re-preview corrections via mutation_preview."""
 
     return _TRANSACTIONS.rollback(transaction_id, rollback_undo=_perform_undo).to_dict()
 
 
 @tool
-def debug_session(action: Annotated[str, "start, attach, detach, terminate, or status"], target: Annotated[dict[str, Any] | None, "Process launch or attach target"] = None) -> dict[str, Any]:
-    """Manage debugger lifecycle through one capability-gated tool."""
+def debug_session(action: Annotated[DebugSessionAction, "start, attach, detach, terminate, or status"], target: Annotated[dict[str, Any] | None, "Process launch or attach target"] = None) -> dict[str, Any]:
+    """WHEN driving the debugger process, use this; for stepping use debug_control.
+    RETURNS {data} envelope with the legacy backend result.
+    LIMITS capability-gated; attach needs target.pid; start/terminate/detach delegate to dbg_start/dbg_exit/dbg_detach. NEXT debug_control/debug_breakpoints once running."""
 
     mapping = {"start": "dbg_start", "status": "dbg_status", "terminate": "dbg_exit", "detach": "dbg_detach"}
-    if action == "attach":
+    normalized = str(action).lower()
+    if normalized == "attach":
         pid = (target or {}).get("pid")
         if pid is None:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Attach requires target.pid")
         return ToolEnvelope(_debug_attach(int(pid), int((target or {}).get("event_id", -1)))).to_dict()
-    name = mapping.get(action)
+    name = mapping.get(normalized)
     if name is None:
-        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported debug session action: {action}")
+        _unsupported("debug session action", action, get_args(DebugSessionAction))
     return ToolEnvelope(_legacy_call(name, target or {}), provenance={"legacy_tool": name}).to_dict()
 
 
 @tool
-def debug_control(action: Annotated[str, "continue, step_into, step_over, pause, or run_to"], addr: Annotated[str | None, "Run-to address"] = None) -> dict[str, Any]:
-    """Control execution of the active debugger session."""
+def debug_control(action: Annotated[DebugControlAction, "continue, step_into, step_over, pause, or run_to"], addr: Annotated[str | None, "Run-to address"] = None) -> dict[str, Any]:
+    """WHEN the session runs, use this; for lifecycle use debug_session.
+    RETURNS {data} envelope with the backend step result.
+    LIMITS pause runs locally; run_to needs addr; other actions delegate to dbg_continue/dbg_step_into/dbg_step_over/dbg_run_to. NEXT debug_state to read the stopped state."""
 
     mapping = {"continue": "dbg_continue", "step_into": "dbg_step_into", "step_over": "dbg_step_over", "run_to": "dbg_run_to"}
-    if action == "pause":
+    normalized = str(action).lower()
+    if normalized == "pause":
         return ToolEnvelope(_debug_pause()).to_dict()
-    name = mapping.get(action)
+    name = mapping.get(normalized)
     if name is None:
-        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported debugger control: {action}")
-    return ToolEnvelope(_legacy_call(name, {"addr": addr} if action == "run_to" else {}), provenance={"legacy_tool": name}).to_dict()
+        _unsupported("debugger control", action, get_args(DebugControlAction))
+    return ToolEnvelope(_legacy_call(name, {"addr": addr} if normalized == "run_to" else {}), provenance={"legacy_tool": name}).to_dict()
 
 
 @tool
-def debug_breakpoints(action: Annotated[str, "list, add, delete, toggle, condition, or watch"], items: Annotated[list[dict[str, Any]] | list[str], "Breakpoint addresses or records"] = []) -> dict[str, Any]:
-    """List or mutate breakpoints and their conditions."""
+def debug_breakpoints(action: Annotated[DebugBreakpointAction, "list, add, delete, toggle, or watch"], items: Annotated[list[dict[str, Any]] | list[str] | None, "Breakpoint addresses or records"] = None) -> dict[str, Any]:
+    """WHEN stopping places matter, use this; for stepping use debug_control.
+    RETURNS {data} envelope with the backend breakpoint result.
+    LIMITS list/add/delete/toggle delegate to dbg_bps/dbg_add_bp/dbg_delete_bp/dbg_toggle_bp; watch needs record items and runs locally. NEXT debug_control to run to them."""
 
-    if action == "watch":
-        if not all(isinstance(item, dict) for item in items):
+    effective_items = list(items or [])
+    normalized = str(action).lower()
+    if normalized == "watch":
+        if not all(isinstance(item, dict) for item in effective_items):
             raise VNextError(ErrorCode.INVALID_OPERATION, "Watchpoints require record items")
-        return ToolEnvelope(_debug_add_watchpoints(items)).to_dict()
-    mapping = {"list": ("dbg_bps", {}), "add": ("dbg_add_bp", {"addrs": items}), "delete": ("dbg_delete_bp", {"addrs": items}), "toggle": ("dbg_toggle_bp", {"items": items}), "condition": ("dbg_set_bp_condition", {"items": items})}
-    if action not in mapping:
-        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported breakpoint action: {action}")
-    name, arguments = mapping[action]
+        return ToolEnvelope(_debug_add_watchpoints(effective_items)).to_dict()
+    mapping = {"list": ("dbg_bps", {}), "add": ("dbg_add_bp", {"addrs": effective_items}), "delete": ("dbg_delete_bp", {"addrs": effective_items}), "toggle": ("dbg_toggle_bp", {"items": effective_items})}
+    if normalized not in mapping:
+        _unsupported("breakpoint action", action, get_args(DebugBreakpointAction))
+    name, arguments = mapping[normalized]
     return ToolEnvelope(_legacy_call(name, arguments), provenance={"legacy_tool": name}).to_dict()
 
 
 @tool
-def debug_state(include: Annotated[list[str], "registers, stack, breakpoints, or status"] = ["status", "registers", "stack"]) -> dict[str, Any]:
-    """Read a consolidated debugger state snapshot."""
-
+def debug_state(include: Annotated[list[str] | None, "registers, stack, breakpoints, or status"] = None) -> dict[str, Any]:
+    """WHEN reading stopped state, use this instead of individual dbg_* tools.
+    RETURNS {data} envelope keyed by the requested sections.
+    LIMITS sections are status/registers/stack/breakpoints (default status+registers+stack); each delegates to one legacy dbg_* read. NEXT debug_control to resume."""
+    effective = [str(item).lower() for item in (include if include is not None else ["status", "registers", "stack"])]
     result: dict[str, Any] = {}
     mapping = {"status": "dbg_status", "registers": "dbg_regs", "stack": "dbg_stacktrace", "breakpoints": "dbg_bps"}
-    for item in include:
+    for item in effective:
         if item not in mapping:
-            raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported debugger state section: {item}")
+            _unsupported("debugger state section", item, ("status", "registers", "stack", "breakpoints"))
         result[item] = _legacy_call(mapping[item], {})
     return ToolEnvelope(result).to_dict()
 
 
 @tool
-def debug_memory(action: Annotated[str, "read, write, snapshot, or diff"], regions: Annotated[list[dict[str, Any]], "Live memory regions"], confirm_nonrollbackable: Annotated[bool, "Required for writes"] = False, snapshot_id: Annotated[str | None, "Snapshot identifier for diff"] = None) -> dict[str, Any]:
-    """Read or explicitly confirm a non-rollbackable live-memory write."""
-
-    if action == "read":
-        return ToolEnvelope(_legacy_call("dbg_read", {"regions": regions}), provenance={"legacy_tool": "dbg_read"}).to_dict()
-    if action == "write":
+def debug_memory(action: Annotated[DebugMemoryAction, "read, write, snapshot, or diff"], regions: Annotated[list[dict[str, Any]] | None, "Live memory regions"] = None, confirm_nonrollbackable: Annotated[bool, "Required for writes"] = False, snapshot_id: Annotated[str | None, "Snapshot identifier for diff"] = None) -> dict[str, Any]:
+    """WHEN live process bytes matter, use this; for static bytes use memory_read.
+    RETURNS {data} envelope; snapshot returns {snapshot_id, regions, value}, diff returns {snapshot_id, changed, before, after}.
+    LIMITS writes need confirm_nonrollbackable=true and are non-rollbackable; snapshots are per-database. NEXT debug_state for registers/stack."""
+    normalized = str(action).lower()
+    effective_regions = list(regions or [])
+    if normalized == "read":
+        return ToolEnvelope(_legacy_call("dbg_read", {"regions": effective_regions}), provenance={"legacy_tool": "dbg_read"}).to_dict()
+    if normalized == "write":
         if not confirm_nonrollbackable:
             raise VNextError(ErrorCode.PROFILE_DENIED, "Live-memory writes require confirm_nonrollbackable=true")
-        return ToolEnvelope(_legacy_call("dbg_write", {"regions": regions}), provenance={"legacy_tool": "dbg_write"}).to_dict()
-    if action == "snapshot":
-        value = _legacy_call("dbg_read", {"regions": regions})
+        return ToolEnvelope(_legacy_call("dbg_write", {"regions": effective_regions}), provenance={"legacy_tool": "dbg_write"}).to_dict()
+    if normalized == "snapshot":
+        value = _legacy_call("dbg_read", {"regions": effective_regions})
         identifier = str(uuid4())
-        _DEBUG_SNAPSHOTS[identifier] = {"database": _database_id(), "regions": regions, "value": value}
-        return ToolEnvelope({"snapshot_id": identifier, "regions": regions, "value": value}).to_dict()
-    if action == "diff":
+        _DEBUG_SNAPSHOTS[identifier] = {"database": _database_id(), "regions": effective_regions, "value": value}
+        return ToolEnvelope({"snapshot_id": identifier, "regions": effective_regions, "value": value}).to_dict()
+    if normalized == "diff":
         if not snapshot_id or snapshot_id not in _DEBUG_SNAPSHOTS:
             raise VNextError(ErrorCode.INVALID_OPERATION, "A valid snapshot_id is required")
         previous = _DEBUG_SNAPSHOTS[snapshot_id]
         if previous["database"] != _database_id():
             raise VNextError(ErrorCode.INVALID_DATABASE, "Snapshot belongs to another database")
-        current = _legacy_call("dbg_read", {"regions": regions or previous["regions"]})
+        current = _legacy_call("dbg_read", {"regions": effective_regions or previous["regions"]})
         return ToolEnvelope(
             {
                 "snapshot_id": snapshot_id,
@@ -1903,15 +1912,18 @@ def debug_memory(action: Annotated[str, "read, write, snapshot, or diff"], regio
                 "after": current,
             }
         ).to_dict()
-    raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported debug memory action: {action}")
-
+    _unsupported("debug memory action", action, get_args(DebugMemoryAction))
 
 @tool
-def debug_trace(action: Annotated[str, "start, status, stop, or export"], options: Annotated[dict[str, Any] | None, "Trace limits and export options"] = None) -> dict[str, Any]:
-    """Manage cancellable execution traces when supported by the runtime."""
-
-    effective = options or {}
-    if action == "export":
+def debug_trace(action: Annotated[DebugTraceAction, "start, status, stop, or export"], options: Annotated[DebugTraceOptions | None, "Trace limits and export options"] = None) -> dict[str, Any]:
+    """WHEN single-stepping history matters, use this; for static flow use dataflow_trace.
+    RETURNS {kind, enabled, event_count, events, truncated, next_offset} dict.
+    LIMITS kind is instruction/function/basic_block/step; status paginates by options.offset/limit (max 5000); export needs filesystem scope and options.path. NEXT debug_memory/debug_state for the stopped state."""
+    normalized = str(action).lower()
+    if normalized not in get_args(DebugTraceAction):
+        _unsupported("debug trace action", action, get_args(DebugTraceAction))
+    effective = dict(options or {})
+    if normalized == "export":
         if SafetyScope.FILESYSTEM not in get_active_scopes():
             raise VNextError(ErrorCode.PROFILE_DENIED, "Trace export requires filesystem scope")
         path = effective.get("path")
@@ -1921,16 +1933,20 @@ def debug_trace(action: Annotated[str, "start, status, stop, or export"], option
         return ToolEnvelope(
             _debug_trace_export(str(output), str(effective.get("description", "ida-pro-mcp trace")))
         ).to_dict()
-    return ToolEnvelope(_debug_trace_action(action, effective)).to_dict()
+    return ToolEnvelope(_debug_trace_action(normalized, effective)).to_dict()
 
 
 @tool
-def python_execute(mode: Annotated[str, "eval or file"], code: Annotated[str | None, "Python expression or statements"] = None, path: Annotated[str | None, "Python file path"] = None) -> dict[str, Any]:
-    """Execute Python only when the isolated python safety scope is enabled."""
-
-    if mode == "eval" and code is not None:
+def python_execute(mode: Annotated[PythonExecuteMode, "eval or file"], code: Annotated[str | None, "Python expression or statements"] = None, path: Annotated[str | None, "Python file path"] = None) -> dict[str, Any]:
+    """WHEN no canonical tool covers the need, use this escape hatch; prefer typed tools first.
+    RETURNS {data} envelope with the backend execution result.
+    LIMITS python safety scope gates both modes; eval needs code, file needs path plus filesystem scope and audit redaction. NEXT investigation_add_finding to record anything learned."""
+    normalized = str(mode).lower()
+    if normalized not in get_args(PythonExecuteMode):
+        _unsupported("python execute mode", mode, get_args(PythonExecuteMode))
+    if normalized == "eval" and code is not None:
         return ToolEnvelope(_legacy_call("py_eval", {"code": code}), provenance={"legacy_tool": "py_eval"}).to_dict()
-    if mode == "file" and path is not None:
+    if normalized == "file" and path is not None:
         if SafetyScope.FILESYSTEM not in get_active_scopes():
             raise VNextError(ErrorCode.PROFILE_DENIED, "Python file execution also requires filesystem scope")
         safe_path = get_workspace_policy().resolve(path, must_exist=True)
@@ -2071,13 +2087,6 @@ def deobfuscate_component(targets: str, database: str = "") -> str:
     """Plan evidence-preserving deobfuscation."""
 
     return _prompt(f"Analyze obfuscation around {targets}.", "Identify the transformation, document invariants, stage all IDB changes through mutation_preview, and do not commit without explicit approval.", database)
-
-
-@prompt
-def compare_binaries(left_database: str, right_database: str) -> str:
-    """Cross-database binary comparison workflow."""
-
-    return _prompt("Compare two binaries and explain meaningful code changes.", f"Use analysis_run binary_diff with `{left_database}` and `{right_database}`; correlate symbols, normalized instructions, signatures, callers, callees, and types.")
 
 
 @prompt

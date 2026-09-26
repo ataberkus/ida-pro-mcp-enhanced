@@ -9,11 +9,13 @@ import datetime
 import glob
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
 
@@ -40,6 +42,9 @@ class InstanceInfo(TypedDict, total=False):
 
 
 INSTANCE_DIR_ENV = "IDA_MCP_INSTANCE_DIR"
+
+# Session-management tools answered by the idalib supervisor/worker itself.
+IDB_MANAGEMENT_TOOLS = {"idb_open", "idb_list", "idb_close"}
 
 
 def _get_ida_user_dir() -> str:
@@ -116,6 +121,8 @@ def unregister_instance(port: int) -> bool:
 
 def is_pid_alive(pid: int) -> bool:
     """Check if a process is still running."""
+    if pid <= 0:
+        return False
     if sys.platform == "win32":
         import ctypes
 
@@ -148,25 +155,20 @@ def probe_instance(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
-def discover_instances() -> list[InstanceInfo]:
-    """Scan for registered instances, cleaning up stale entries."""
-    instances_dir = get_instances_dir()
-    if not os.path.isdir(instances_dir):
+def read_registry_dir(registry_dir: str, probe: bool = True) -> list[InstanceInfo]:
+    """Read instance_*.json files in `registry_dir`, dropping stale entries."""
+    if not os.path.isdir(registry_dir):
         return []
 
     def _drop_stale(file_path: str) -> None:
-        try:
-            os.unlink(file_path)
-        except OSError:
-            pass
-        try:
-            port = int(file_path.rsplit("_", 1)[1].split(".", 1)[0])
-            os.unlink(_instance_token_path(port))
-        except (OSError, ValueError, IndexError):
-            pass
+        for path in (file_path, file_path.removesuffix(".json") + ".token"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     result: list[InstanceInfo] = []
-    pattern = os.path.join(instances_dir, "instance_*.json")
+    pattern = os.path.join(registry_dir, "instance_*.json")
     for file_path in glob.glob(pattern):
         try:
             with open(file_path, "r", encoding="utf-8") as f:
@@ -186,7 +188,7 @@ def discover_instances() -> list[InstanceInfo]:
         # Secondary check: verify the instance is actually listening.
         # Catches PID reuse (Windows can recycle PIDs quickly) and
         # cases where the process is alive but the server crashed.
-        if not probe_instance(info["host"], info["port"], timeout=1.0):
+        if probe and not probe_instance(info["host"], info["port"], timeout=1.0):
             _drop_stale(file_path)
             continue
 
@@ -194,6 +196,86 @@ def discover_instances() -> list[InstanceInfo]:
 
     result.sort(key=lambda x: x.get("started_at", ""))
     return result
+
+
+def discover_instances() -> list[InstanceInfo]:
+    """Scan the registered-instances dir, cleaning up stale entries."""
+    return read_registry_dir(get_instances_dir())
+
+
+# ---------------------------------------------------------------------------
+# Bridge routing: map discovered instances to prefixed tool names.
+# ---------------------------------------------------------------------------
+
+
+def sanitize_prefix(name: str) -> str:
+    """Make an input file name a valid tool-name token."""
+    s = re.sub(r"[^a-z0-9_]+", "_", name.lower())
+    return re.sub(r"_+", "_", s).strip("_") or "ida"
+
+
+def assign_prefixes(instances: list[InstanceInfo]) -> dict[int, str]:
+    """Map instance port -> tool prefix. Single instance => '' (unprefixed)."""
+    if len(instances) == 1:
+        return {instances[0]["port"]: ""}
+    seen: dict[str, list[int]] = {}
+    for inst in instances:
+        base = sanitize_prefix(str(inst.get("input_file") or inst.get("binary", "")))
+        seen.setdefault(base, []).append(inst["port"])
+    prefixes: dict[int, str] = {}
+    for base, ports in seen.items():
+        for port in ports:
+            prefixes[port] = f"{base}__" if len(ports) == 1 else f"{base}_port{port}__"
+    return prefixes
+
+
+@dataclass
+class InstanceTarget:
+    id: str
+    host: str
+    port: int
+    prefix: str
+
+
+@dataclass
+class ToolTable:
+    targets: list[InstanceTarget]
+    # exposed_name -> (target, inner_name)
+    routes: dict[str, tuple[InstanceTarget, str]] = field(default_factory=dict)
+    schemas: dict[str, dict] = field(default_factory=dict)
+
+    def list_tools(self) -> list[dict]:
+        return list(self.schemas.values())
+
+
+def build_tool_table(targets: list[InstanceTarget], tools_by_id: dict[str, list[dict]]) -> ToolTable:
+    table = ToolTable(targets=targets)
+    for target in targets:
+        for tool in tools_by_id.get(target.id, []):
+            inner = tool["name"]
+            exposed = f"{target.prefix}{inner}"
+            if target.prefix == "" or exposed not in table.routes:
+                table.routes[exposed] = (target, inner)
+                schema = dict(tool)
+                schema["name"] = exposed
+                table.schemas[exposed] = schema
+    # shared bridge-local tool
+    table.schemas["ida_list_instances"] = {
+        "name": "ida_list_instances",
+        "description": "List running IDA instances and their tool prefixes.",
+        "inputSchema": {"type": "object", "properties": {}},
+    }
+    return table
+
+
+def route_tool_call(table: ToolTable, exposed_name: str) -> tuple[str, int, str]:
+    if exposed_name not in table.routes:
+        raise KeyError(
+            f"Unknown or unavailable tool '{exposed_name}'. "
+            "Call ida_list_instances to see live instances and prefixes."
+        )
+    target, inner = table.routes[exposed_name]
+    return target.host, target.port, inner
 
 
 def _find_existing_idb(file_path: str) -> str | None:

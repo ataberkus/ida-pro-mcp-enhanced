@@ -153,34 +153,8 @@ def inf_is_64bit() -> bool:
 
 
 def get_func(ea: int):
-    """Return the function containing *ea*.
-
-    Prefer ``func_t`` so callers can use ``end_ea``, flowcharts, and ranges.
-    ``func_entry_info_t`` is only a fallback when ``get_func`` is unavailable.
-    """
-    try:
-        fn = ida_funcs.get_func(ea)
-        if fn is not None:
-            return fn
-    except (AttributeError, TypeError):
-        pass
-    try:
-        info = ida_funcs.func_entry_info_t()
-        if ida_funcs.get_func_entry_info(info, ea):
-            try:
-                fn = ida_funcs.get_func(info.start_ea)
-                if fn is not None:
-                    return fn
-            except (AttributeError, TypeError):
-                pass
-            return info
-        return None
-    except (AttributeError, TypeError):
-        pass
-    try:
-        return idaapi.get_func(ea)
-    except (AttributeError, TypeError):
-        return None
+    """Return the ``func_t`` containing *ea*, or None."""
+    return ida_funcs.get_func(ea)
 
 
 def get_func_end_ea(func) -> int:
@@ -212,24 +186,20 @@ def get_func_flags(func) -> int:
 
 
 def get_segment_info(ea: int):
-    """Return modern segment info, with a legacy fallback."""
-    try:
-        info = ida_segment.segment_info_t()
-        if ida_segment.get_segment_info(info, ea):
-            return info
-        return None
-    except (AttributeError, TypeError):
-        return idaapi.getseg(ea)
+    """Return the ``segment_info_t`` containing *ea*, or None."""
+    info = ida_segment.segment_info_t()
+    return info if ida_segment.get_segment_info(info, ea) else None
+
+
+def get_segment_perm(seg) -> int:
+    """Return SEGPERM_* bits of a segment_info_t or legacy segment_t."""
+    getter = getattr(seg, "get_perm", None)
+    return int(getter() if getter is not None else seg.perm)
 
 
 def get_segment_name(ea: int) -> str | None:
     """Return a segment name by address without deprecated APIs."""
-    try:
-        name = ida_segment.get_segment_name(ea)
-        return name or None
-    except (AttributeError, TypeError):
-        seg = idaapi.getseg(ea)
-        return idaapi.get_segm_name(seg) if seg else None
+    return ida_segment.get_segment_name(ea) or None
 
 
 def get_func_name(func) -> str | None:

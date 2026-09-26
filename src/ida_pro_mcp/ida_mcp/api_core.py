@@ -14,7 +14,6 @@ import ida_lines
 import idautils
 import ida_loader
 import ida_nalt
-import ida_segment
 import ida_strlist
 import ida_typeinf
 import idc
@@ -30,8 +29,6 @@ from .sync import (
 from .utils import (
     ConvertedNumber,
     EntityQuery,
-    Function,
-    FunctionQuery,
     Global,
     Import,
     ListQuery,
@@ -46,6 +43,7 @@ from .utils import (
     clamp_int,
     paginate,
     pattern_filter,
+    _segments,
 )
 
 # Cached strings list: [(ea, text), ...]
@@ -165,29 +163,21 @@ def _collect_imports() -> list[Import]:
     return all_imports
 
 
-def _segment_name_for_ea(ea: int) -> str | None:
-    try:
-        return ida_segment.get_segment_name(ea) or None
-    except (AttributeError, TypeError):
-        return None
-
-
-def _get_func(ea: int):
-    """Return function entry/range info without IDA 9.x deprecation warnings."""
-    return compat.get_func(ea)
-
-
 def _primary_text_key(kind: str) -> str:
     if kind == "strings":
         return "text"
+    if kind == "switches":
+        return "func"
+    if kind == "patches":
+        return "addr"
     return "name"
 
 
-def _collect_entities(kind: str) -> list[dict]:
+def _collect_entities(kind: str, query: dict | None = None) -> list[dict]:
     if kind == "functions":
         rows: list[dict] = []
         for ea in idautils.Functions():
-            fn = _get_func(ea)
+            fn = compat.get_func(ea)
             if not fn:
                 continue
             size_int = fn.end_ea - fn.start_ea
@@ -198,7 +188,7 @@ def _collect_entities(kind: str) -> list[dict]:
                     "name": ida_funcs.get_func_name(fn.start_ea) or "<unnamed>",
                     "size": hex(size_int),
                     "size_int": size_int,
-                    "segment": _segment_name_for_ea(fn.start_ea),
+                    "segment": compat.get_segment_name(fn.start_ea),
                     "has_type": bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), fn.start_ea)),
                 }
             )
@@ -207,7 +197,7 @@ def _collect_entities(kind: str) -> list[dict]:
     if kind == "globals":
         rows = []
         for ea, name in idautils.Names():
-            if _get_func(ea) or name is None:
+            if compat.get_func(ea) or name is None:
                 continue
             rows.append(
                 {
@@ -215,7 +205,7 @@ def _collect_entities(kind: str) -> list[dict]:
                     "addr": hex(ea),
                     "name": name,
                     "size": idc.get_item_size(ea),
-                    "segment": _segment_name_for_ea(ea),
+                    "segment": compat.get_segment_name(ea),
                 }
             )
         return rows
@@ -242,7 +232,7 @@ def _collect_entities(kind: str) -> list[dict]:
                     "addr": hex(ea),
                     "text": text,
                     "length": len(text),
-                    "segment": _segment_name_for_ea(ea),
+                    "segment": compat.get_segment_name(ea),
                 }
             )
         return rows
@@ -251,21 +241,32 @@ def _collect_entities(kind: str) -> list[dict]:
         rows = []
         imports_by_ea = {int(imp["addr"], 16): imp for imp in _collect_imports()}
         for ea, name in idautils.Names():
-            is_function = bool(_get_func(ea))
+            is_function = bool(compat.get_func(ea))
             is_import = ea in imports_by_ea
             rows.append(
                 {
                     "kind": "name",
                     "addr": hex(ea),
                     "name": name,
-                    "segment": _segment_name_for_ea(ea),
+                    "segment": compat.get_segment_name(ea),
                     "is_function": is_function,
                     "is_import": is_import,
                 }
             )
         return rows
 
-    return []
+    if kind in {"switches", "patches", "classes", "vtables", "signatures", "type_libraries"}:
+        from . import api_recovery
+
+        if kind == "switches":
+            return api_recovery.collect_switches(api_recovery.resolve_switch_targets(query or {}))
+        if kind == "patches":
+            return api_recovery.collect_patches()
+        if kind in {"classes", "vtables"}:
+            return api_recovery.collect_classes()
+        if kind == "signatures":
+            return api_recovery.collect_signature_files()
+        return api_recovery.collect_type_libraries()
 
 
 def _apply_projection(items: list[dict], fields: list[str] | None) -> list[dict]:
@@ -315,7 +316,10 @@ def _build_health_payload() -> dict:
 @tool
 @idasync
 def server_health() -> dict:
-    """Health/ready probe for MCP server and current IDB state."""
+    """Legacy health probe (no canonical equivalent; server_capabilities covers runtime caps).
+    WHEN: check MCP server liveness and current IDB/analysis state.
+    RETURNS: {ok?, auto_analysis_ready?, idb path/arch/functions?...} health payload.
+    LIMITS: point-in-time snapshot; auto-analysis may still be running after ok."""
     return _build_health_payload()
 
 
@@ -326,7 +330,10 @@ def server_warmup(
     build_caches: Annotated[bool, "Build core caches (currently strings)"] = True,
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler plugin"] = True,
 ) -> dict:
-    """Warm up IDA subsystems to reduce first-call latency and transient failures."""
+    """Legacy warmup (no canonical equivalent).
+    WHEN: reduce first-call latency by waiting auto-analysis, building caches, initing Hex-Rays.
+    RETURNS: {ok, steps[{step, ok, ms, error?}], health}.
+    LIMITS: may take seconds; init_hexrays reports ok=false when Hex-Rays is unavailable."""
     steps = []
 
     if wait_auto_analysis:
@@ -363,7 +370,10 @@ def server_warmup(
 def lookup_funcs(
     queries: Annotated[list[str] | str, "Address(es) or name(s)"],
 ) -> list[dict]:
-    """Get functions by address or name (auto-detects)"""
+    """Prefer entity_query(kind="functions", ...) for filtered/paginated lookup.
+    WHEN: resolve exact addresses/names to function records (auto-detects; "*" lists all).
+    RETURNS: [{query, fn, error}] per query.
+    LIMITS: "*" caps at 1000 functions; non-function addresses report "Not a function"/"Not found"."""
     queries = normalize_list_input(queries)
 
     # Treat empty/"*" as "all functions" - but add limit
@@ -408,7 +418,10 @@ def int_convert(
         "Convert numbers to various formats (hex, decimal, binary, ascii)",
     ],
 ) -> list[dict]:
-    """Convert numbers to different formats"""
+    """Canonical number conversion (listed in CANONICAL_TOOLS).
+    WHEN: render numbers as decimal/hex/bytes/ascii/binary (string form means {"text": s, size 64}).
+    RETURNS: [{input, result{decimal, hexadecimal, bytes, ascii, binary}, error}] per input.
+    LIMITS: unparsable text and values too big for size return error entries, result None."""
     inputs = normalize_dict_list(inputs, lambda s: {"text": s, "size": 64})
 
     results = []
@@ -466,140 +479,22 @@ def int_convert(
 
 @tool
 @idasync
-def list_funcs(
-    queries: Annotated[
-        list[ListQuery] | ListQuery | str,
-        "List functions with optional filtering and pagination",
-    ],
-) -> list[Page[Function]]:
-    """List functions with optional filtering and offset/count pagination."""
-    queries = normalize_dict_list(
-        queries, lambda s: {"offset": 0, "count": 50, "filter": s}
-    )
-    all_functions = [get_function(addr) for addr in idautils.Functions()]
-
-    results = []
-    for query in queries:
-        offset = query.get("offset", 0)
-        count = query.get("count", 100)
-        filter_pattern = query.get("filter", "")
-
-        # Treat empty/"*" filter as "all"
-        if filter_pattern in ("", "*"):
-            filter_pattern = ""
-
-        filtered = pattern_filter(all_functions, filter_pattern, "name")
-        results.append(paginate(filtered, offset, count))
-
-    return results
-
-
-@tool
-@idasync
-def func_query(
-    queries: Annotated[
-        list[FunctionQuery] | FunctionQuery | str,
-        "Richer function query (size/type/name filters + pagination)",
-    ],
-) -> list[dict]:
-    """Query functions with richer filtering than list_funcs."""
-    queries = normalize_dict_list(
-        queries,
-        lambda s: {
-            "filter": s,
-            "offset": 0,
-            "count": 50,
-            "sort_by": "addr",
-            "descending": False,
-        },
-    )
-
-    all_functions: list[dict] = []
-    for addr in idautils.Functions():
-        fn = _get_func(addr)
-        if not fn:
-            continue
-        size_int = fn.end_ea - fn.start_ea
-        fn_name = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
-        has_type = ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), fn.start_ea)
-        all_functions.append(
-            {
-                "addr": hex(fn.start_ea),
-                "name": fn_name,
-                "size": hex(size_int),
-                "size_int": size_int,
-                "has_type": has_type,
-            }
-        )
-
-    def apply_name_regex(items: list[dict], expr: str) -> list[dict]:
-        if not expr:
-            return items
-        try:
-            compiled = re.compile(expr)
-        except re.error:
-            return []
-        return [item for item in items if compiled.search(item["name"])]
-
-    results = []
-    for query in queries:
-        offset = query.get("offset", 0)
-        count = query.get("count", 50)
-        sort_by = query.get("sort_by", "addr")
-        descending = bool(query.get("descending", False))
-        if sort_by not in ("addr", "name", "size"):
-            sort_by = "addr"
-
-        filtered = all_functions
-        name_filter = query.get("filter", "")
-        if name_filter:
-            filtered = pattern_filter(filtered, name_filter, "name")
-
-        name_regex = query.get("name_regex", "")
-        if name_regex:
-            filtered = apply_name_regex(filtered, name_regex)
-
-        min_size = query.get("min_size")
-        if min_size is not None:
-            filtered = [f for f in filtered if f["size_int"] >= int(min_size)]
-
-        max_size = query.get("max_size")
-        if max_size is not None:
-            filtered = [f for f in filtered if f["size_int"] <= int(max_size)]
-
-        if "has_type" in query:
-            require_type = bool(query.get("has_type"))
-            filtered = [f for f in filtered if bool(f["has_type"]) is require_type]
-
-        if sort_by == "name":
-            filtered.sort(key=lambda f: f["name"].lower(), reverse=descending)
-        elif sort_by == "size":
-            filtered.sort(key=lambda f: f["size_int"], reverse=descending)
-        else:
-            filtered.sort(key=lambda f: int(f["addr"], 16), reverse=descending)
-
-        page = paginate(filtered, offset, count)
-        page["data"] = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
-        results.append(page)
-
-    return results
-
-
-@tool
-@idasync
 def list_globals(
     queries: Annotated[
         list[ListQuery] | ListQuery | str,
         "List global variables with optional filtering and pagination",
     ],
 ) -> list[Page[Global]]:
-    """List globals with optional filtering and offset/count pagination."""
+    """Prefer entity_query(kind="globals", ...) for filtered/paginated listing.
+    WHEN: list data globals (non-function named addresses) with glob filter + offset/count.
+    RETURNS: [{data, next_offset, total, ...}] page per query.
+    LIMITS: default count 50 (query count defaults 100); empty/"*" filter means all names."""
     queries = normalize_dict_list(
         queries, lambda s: {"offset": 0, "count": 50, "filter": s}
     )
     all_globals: list[Global] = []
     for addr, name in idautils.Names():
-        if not _get_func(addr) and name is not None:
+        if not compat.get_func(addr) and name is not None:
             all_globals.append(Global(addr=hex(addr), name=name))
 
     results = []
@@ -626,7 +521,10 @@ def entity_query(
         "Generic entity query with filtering, projection, and pagination",
     ],
 ) -> list[dict]:
-    """Query IDB entities with typed filters, projection, and pagination."""
+    """Canonical entity search (listed in CANONICAL_TOOLS).
+    WHEN: filtered/paginated listing of functions|globals|imports|strings|names|switches|patches|classes|vtables|signatures|type_libraries with glob/regex filter, projection, sorting.
+    RETURNS: [{kind, data[rows], next_offset, total, error}] per query.
+    LIMITS: count max 5000; bad kind returns an error entry listing Allowed values; regex errors surface in error, not raises."""
     queries = normalize_dict_list(
         queries,
         lambda s: {"kind": s, "offset": 0, "count": 100, "sort_by": "addr"},
@@ -635,19 +533,20 @@ def entity_query(
 
     for query in queries:
         kind = str(query.get("kind", "functions") or "functions").lower()
-        if kind not in {"functions", "globals", "imports", "strings", "names"}:
+        allowed_entity_kinds = ("functions", "globals", "imports", "strings", "names", "switches", "patches", "classes", "vtables", "signatures", "type_libraries")
+        if kind not in set(allowed_entity_kinds):
             results.append(
                 {
                     "kind": kind,
                     "data": [],
                     "next_offset": None,
                     "total": 0,
-                    "error": f"Unsupported kind: {kind}",
+                    "error": f"Unsupported kind: {kind}. Allowed: {', '.join(allowed_entity_kinds)}",
                 }
             )
             continue
 
-        rows = _collect_entities(kind)
+        rows = _collect_entities(kind, query)
         primary_key = _primary_text_key(kind)
         filter_pattern = str(query.get("filter", "") or "")
         if filter_pattern:
@@ -657,7 +556,8 @@ def entity_query(
         regex = str(query.get("regex", "") or "")
         if regex:
             try:
-                compiled = re.compile(regex)
+                flags = 0 if query.get("case_sensitive", True) else re.IGNORECASE
+                compiled = re.compile(regex, flags)
                 rows = [row for row in rows if compiled.search(str(row.get(primary_key, "")))]
             except re.error as exc:
                 query_error = f"Invalid regex: {exc}"
@@ -730,14 +630,34 @@ def entity_query(
     return results
 
 
+def _query_imports(queries: list[dict]) -> list[Page[Import]]:
+    all_imports = _collect_imports()
+    results = []
+    for query in queries:
+        filtered = all_imports
+        name_filter = query.get("filter", "")
+        module_filter = query.get("module", "")
+        if name_filter:
+            filtered = pattern_filter(filtered, name_filter, "imported_name")
+        if module_filter:
+            filtered = pattern_filter(filtered, module_filter, "module")
+        results.append(
+            paginate(filtered, query.get("offset", 0), query.get("count", 100))
+        )
+    return results
+
+
 @tool
 @idasync
 def imports(
     offset: Annotated[int, "Starting pagination index (default: 0)"],
     count: Annotated[int, "Maximum rows (0 returns all imports)"],
 ) -> Page[Import]:
-    """List imports with module names using offset/count pagination."""
-    return paginate(_collect_imports(), offset, count)
+    """Prefer entity_query(kind="imports", ...) for filtered/paginated import listing.
+    WHEN: page the whole import table by offset/count with no filtering.
+    RETURNS: {data[Import], next_offset, total, ...} page.
+    LIMITS: count=0 returns all imports; no name/module filter (use imports_query/entity_query)."""
+    return _query_imports([{"offset": offset, "count": count}])[0]
 
 
 @tool
@@ -748,28 +668,13 @@ def imports_query(
         "Import query with import/module filters and pagination",
     ],
 ) -> list[dict]:
-    """Query imports with richer filtering than imports(offset,count)."""
-    queries = normalize_dict_list(
-        queries, lambda s: {"filter": s, "offset": 0, "count": 100}
+    """Prefer entity_query(kind="imports", filter=..., module=...) for unified entity search.
+    WHEN: query imports with name/module filters plus offset/count pagination.
+    RETURNS: [{data[Import], next_offset, total, ...}] page per query.
+    LIMITS: filter/module are glob patterns; string form means {"filter": s, offset 0, count 100}."""
+    return _query_imports(
+        normalize_dict_list(queries, lambda s: {"filter": s, "offset": 0, "count": 100})
     )
-    all_imports = _collect_imports()
-    results = []
-
-    for query in queries:
-        filtered = all_imports
-        name_filter = query.get("filter", "")
-        module_filter = query.get("module", "")
-
-        if name_filter:
-            filtered = pattern_filter(filtered, name_filter, "imported_name")
-        if module_filter:
-            filtered = pattern_filter(filtered, module_filter, "module")
-
-        results.append(
-            paginate(filtered, query.get("offset", 0), query.get("count", 100))
-        )
-
-    return results
 
 
 @tool
@@ -778,7 +683,10 @@ def imports_query(
 def idb_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
 ) -> dict:
-    """Save active IDB to disk, optionally to a provided path."""
+    """Prefer mutation_preview(kind="save_database", ...) to stage a save through transactions.
+    WHEN: save the active IDB now, optionally to another path (FILESYSTEM scope, immediate).
+    RETURNS: {ok, path, error}.
+    LIMITS: empty path saves to the current IDB path; destructive overwrite of the target path."""
     try:
         save_path = path.strip() if path else ""
         if not save_path:
@@ -794,45 +702,6 @@ def idb_save(
         }
     except Exception as e:
         return {"ok": False, "path": path or None, "error": str(e)}
-
-
-@tool
-@idasync
-def find_regex(
-    pattern: Annotated[str, "Regex pattern to search for in strings"],
-    limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
-    offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
-) -> dict:
-    """Search strings by case-insensitive regex with offset/limit pagination."""
-    if limit <= 0:
-        limit = 30
-    if limit > 500:
-        limit = 500
-
-    matches = []
-    try:
-        regex = re.compile(pattern, re.IGNORECASE)
-    except re.error as e:
-        return {"n": 0, "matches": [], "cursor": {"done": True}, "error": f"invalid regex: {e}"}
-    strings = _get_strings_cache()
-
-    skipped = 0
-    more = False
-    for ea, text in strings:
-        if regex.search(text):
-            if skipped < offset:
-                skipped += 1
-                continue
-            if len(matches) >= limit:
-                more = True
-                break
-            matches.append({"addr": hex(ea), "string": text})
-
-    return {
-        "n": len(matches),
-        "matches": matches,
-        "cursor": {"next": offset + limit} if more else {"done": True},
-    }
 
 
 # ============================================================================
@@ -868,15 +737,13 @@ def _classify_hit_lines(
     matcher,
     want_disasm: bool,
     want_comments: bool,
-    max_lines: int = 32,
 ) -> list[SearchTextLine]:
     """Match disasm/comment text at *ea* without spamming IDA's Output window.
 
     Uses ``generate_disasm_line`` (one instruction line) plus explicit comment
-    getters. Avoid ``generate_disassembly``: when a head expands past
-    ``max_lines``, IDA prints ``Too many lines`` for every such address.
+    getters. Avoid ``generate_disassembly``: when a head expands past its
+    line limit, IDA prints ``Too many lines`` for every such address.
     """
-    del max_lines  # retained for call-site compatibility
     out: list[SearchTextLine] = []
 
     if want_disasm:
@@ -918,29 +785,6 @@ def _classify_hit_lines(
     return out
 
 
-def _exec_segments() -> list[tuple[int, int]]:
-    """Return [(start, end)] for executable segments in address order."""
-    ranges: list[tuple[int, int]] = []
-    for seg_ea in idautils.Segments():
-        seg = compat.get_segment_info(seg_ea)
-        if not seg:
-            continue
-        perm = seg.get_perm() if hasattr(seg, "get_perm") else getattr(seg, "perm", 0)
-        if not (perm & idaapi.SEGPERM_EXEC):
-            continue
-        ranges.append((seg.start_ea, seg.end_ea))
-    return ranges
-
-
-def _all_segments() -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
-    for seg_ea in idautils.Segments():
-        seg = compat.get_segment_info(seg_ea)
-        if seg:
-            ranges.append((seg.start_ea, seg.end_ea))
-    return ranges
-
-
 @tool
 @idasync
 def search_text(
@@ -953,13 +797,10 @@ def search_text(
     include: Annotated[str, "'disasm' | 'comments' | 'all' (default: all)"] = "all",
     code_only: Annotated[bool, "Restrict search to executable segments (default: true)"] = True,
 ) -> SearchTextResult:
-    """Search the rendered listing for `pattern` over [start, end).
-
-    Iterates `idautils.Heads()` and matches each head via
-    `ida_lines.generate_disasm_line()` plus comment getters. Per-head
-    work is cheap and yields between heads. Each page has a bounded time
-    budget and returns a continuation cursor before common MCP client timeouts.
-    """
+    """Prefer search(kind="text", targets=[pattern], ...) for unified search with opaque cursor.
+    WHEN: full-listing substring/regex search over disasm+comments within [start, end).
+    RETURNS: {n, hits[{addr, function, segment, matches[{kind, text}]}], cursor, error?, partial?, reason?}.
+    LIMITS: limit max 500; each page has a time budget (partial+reason set; continue via cursor); code_only skips data segments."""
     if limit <= 0:
         limit = 30
     if limit > 500:
@@ -993,7 +834,7 @@ def search_text(
         def matcher(text: str) -> bool:
             return needle in text.lower()
 
-    segments = _exec_segments() if code_only else _all_segments()
+    segments = _segments(exec_only=code_only)
     if not segments:
         return {"n": 0, "hits": [], "cursor": {"done": True}}
 

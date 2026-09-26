@@ -3,7 +3,7 @@ import ast
 import contextlib
 import io
 import os
-import sys
+import traceback
 import threading
 import idaapi
 import idc
@@ -108,102 +108,87 @@ def _capped_text(s: str) -> str:
     return s
 
 
+def _run_captured(run) -> dict:
+    """Run ``run()`` under the exec lock with stdout/stderr captured."""
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+    try:
+        with _PY_EXEC_LOCK, contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+            result_value = run()
+        return {
+            "result": _capped_text(result_value or ""),
+            "stdout": _capped_text(stdout_capture.getvalue()),
+            "stderr": _capped_text(stderr_capture.getvalue()),
+        }
+    except Exception as exc:
+        return {
+            "result": "",
+            "stdout": _capped_text(stdout_capture.getvalue()),
+            "stderr": _capped_text(traceback.format_exc()),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _eval_code(code: str) -> str | None:
+    exec_globals = _make_exec_globals()
+    exec_locals = {}
+
+    def _exec_and_pick(source) -> str | None:
+        exec(source, exec_globals, exec_locals)
+        exec_globals.update(exec_locals)
+        # Return 'result' variable if explicitly set, else the last assigned variable
+        if "result" in exec_locals:
+            return str(exec_locals["result"])
+        if exec_locals:
+            return str(exec_locals[list(exec_locals.keys())[-1]])
+        return None
+
+    # Parse code with AST to properly handle execution
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        # If parsing fails, fall back to direct exec
+        return _exec_and_pick(code)
+
+    if not tree.body:
+        return None
+    if len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+        # Single expression - use eval
+        return str(eval(code, exec_globals))
+    if isinstance(tree.body[-1], ast.Expr):
+        # Multiple statements, last one is an expression (Jupyter-style)
+        exec_tree = ast.Module(body=tree.body[:-1], type_ignores=[])
+        exec(compile(exec_tree, "<string>", "exec"), exec_globals, exec_locals)
+        exec_globals.update(exec_locals)
+        eval_tree = ast.Expression(body=tree.body[-1].value)
+        return str(eval(compile(eval_tree, "<string>", "eval"), exec_globals))
+    # All statements (no trailing expression)
+    return _exec_and_pick(code)
+
+
 @tool
 @idasync
 @unsafe
 def py_eval(
     code: Annotated[str, "Python code"],
 ) -> dict:
-    """Execute Python in IDA context and return result/stdout/stderr."""
-    stdout_capture = io.StringIO()
-    stderr_capture = io.StringIO()
-
-    try:
-        with _PY_EXEC_LOCK, contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
-            return _py_eval_locked(code, stdout_capture, stderr_capture)
-    except Exception as exc:
-        import traceback
-
-        return {
-            "result": "",
-            "stdout": _capped_text(stdout_capture.getvalue()),
-            "stderr": _capped_text(traceback.format_exc()),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    """Prefer python_execute(mode="eval", code=...) (delegates here; requires isolated python scope).
+    WHEN: evaluate Python statements/expression in the IDA context with stdout/stderr captured.
+    RETURNS: {result?, stdout, stderr, error?}.
+    LIMITS: UNSAFE; output text capped (truncated marker); exceptions surface as error entries, not raises."""
+    return _run_captured(lambda: _eval_code(code))
 
 
-def _py_eval_locked(code: str, stdout_capture: io.StringIO, stderr_capture: io.StringIO) -> dict:
-    import traceback
-
-    try:
-        exec_globals = _make_exec_globals()
-        result_value = None
-        exec_locals = {}
-
-        # Parse code with AST to properly handle execution
-        try:
-            tree = ast.parse(code)
-        except SyntaxError:
-            # If parsing fails, fall back to direct exec
-            exec(code, exec_globals, exec_locals)
-            exec_globals.update(exec_locals)
-            if "result" in exec_locals:
-                result_value = str(exec_locals["result"])
-            elif exec_locals:
-                last_key = list(exec_locals.keys())[-1]
-                result_value = str(exec_locals[last_key])
-        else:
-            if not tree.body:
-                # Empty code
-                pass
-            elif len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
-                # Single expression - use eval
-                result_value = str(eval(code, exec_globals))
-            elif isinstance(tree.body[-1], ast.Expr):
-                # Multiple statements, last one is an expression (Jupyter-style)
-                # Execute all statements except the last
-                if len(tree.body) > 1:
-                    exec_tree = ast.Module(body=tree.body[:-1], type_ignores=[])
-                    exec(
-                        compile(exec_tree, "<string>", "exec"),
-                        exec_globals,
-                        exec_locals,
-                    )
-                    exec_globals.update(exec_locals)
-                # Eval only the last expression
-                eval_tree = ast.Expression(body=tree.body[-1].value)
-                result_value = str(
-                    eval(compile(eval_tree, "<string>", "eval"), exec_globals)
-                )
-            else:
-                # All statements (no trailing expression)
-                exec(code, exec_globals, exec_locals)
-                exec_globals.update(exec_locals)
-                # Return 'result' variable if explicitly set
-                if "result" in exec_locals:
-                    result_value = str(exec_locals["result"])
-                # Return last assigned variable
-                elif exec_locals:
-                    last_key = list(exec_locals.keys())[-1]
-                    result_value = str(exec_locals[last_key])
-
-        # Collect output
-        stdout_text = stdout_capture.getvalue()
-        stderr_text = stderr_capture.getvalue()
-
-        return {
-            "result": _capped_text(result_value or ""),
-            "stdout": _capped_text(stdout_text),
-            "stderr": _capped_text(stderr_text),
-        }
-
-    except Exception as exc:
-        return {
-            "result": "",
-            "stdout": _capped_text(stdout_capture.getvalue()),
-            "stderr": _capped_text(traceback.format_exc()),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+def _exec_file(file_path: str) -> str | None:
+    exec_globals = _make_exec_globals()
+    exec_globals["__file__"] = file_path
+    exec_globals["__name__"] = "__main__"
+    exec_globals["__package__"] = None
+    with open(file_path, "r", encoding="utf-8") as f:
+        code = f.read()
+    exec(compile(code, file_path, "exec"), exec_globals)
+    result = exec_globals.get("result")
+    return None if result is None else str(result)
 
 
 @tool
@@ -212,64 +197,11 @@ def _py_eval_locked(code: str, stdout_capture: io.StringIO, stderr_capture: io.S
 def py_exec_file(
     file_path: Annotated[str, "Absolute path to a Python script to execute"],
 ) -> dict:
-    """Execute a Python script file in IDA context and return stdout/stderr.
-
-    Unlike py_eval, this runs the entire file with exec() using a single shared
-    globals dict (no locals split), so top-level definitions are visible to all
-    code in the script.
-    """
+    """Prefer python_execute(mode="file", path=...) (delegates here; requires isolated python scope).
+    WHEN: run a whole script file in the IDA context (single shared globals dict) with stdout/stderr captured.
+    RETURNS: {result?, stdout, stderr, error?}.
+    LIMITS: UNSAFE; missing file returns error entries; top-level definitions visible to all script code."""
     if not os.path.isfile(file_path):
         error = f"File not found: {file_path}"
         return {"result": "", "stdout": "", "stderr": error, "error": error}
-
-    stdout_capture = io.StringIO()
-    stderr_capture = io.StringIO()
-
-    try:
-        with _PY_EXEC_LOCK, contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
-            return _py_exec_file_locked(file_path, stdout_capture, stderr_capture)
-    except Exception as exc:
-        import traceback
-
-        return {
-            "result": "",
-            "stdout": _capped_text(stdout_capture.getvalue()),
-            "stderr": _capped_text(traceback.format_exc()),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-
-def _py_exec_file_locked(file_path: str, stdout_capture: io.StringIO, stderr_capture: io.StringIO) -> dict:
-    try:
-        exec_globals = _make_exec_globals()
-        exec_globals["__file__"] = file_path
-        exec_globals["__name__"] = "__main__"
-        exec_globals["__package__"] = None
-
-        with open(file_path, "r", encoding="utf-8") as f:
-            code = f.read()
-
-        exec(compile(code, file_path, "exec"), exec_globals)
-
-        stdout_text = stdout_capture.getvalue()
-        stderr_text = stderr_capture.getvalue()
-
-        result_value = ""
-        if "result" in exec_globals and exec_globals["result"] is not None:
-            result_value = str(exec_globals["result"])
-
-        return {
-            "result": _capped_text(result_value),
-            "stdout": _capped_text(stdout_text),
-            "stderr": _capped_text(stderr_text),
-        }
-
-    except Exception as exc:
-        import traceback
-
-        return {
-            "result": "",
-            "stdout": _capped_text(stdout_capture.getvalue()),
-            "stderr": _capped_text(traceback.format_exc()),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    return _run_captured(lambda: _exec_file(file_path))

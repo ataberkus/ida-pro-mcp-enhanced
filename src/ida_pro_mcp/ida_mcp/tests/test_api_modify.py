@@ -312,7 +312,6 @@ def test_rename_dry_run_summary():
     assert result["summary"]["dry_run"] is True
     assert_is_list(result["func"], min_length=1)
     assert result["func"][0].get("dry_run") is True
-    assert result["func"][0].get("dir") is None
 
 
 @test()

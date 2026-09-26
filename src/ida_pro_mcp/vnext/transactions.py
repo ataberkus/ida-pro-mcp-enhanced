@@ -36,10 +36,6 @@ class RevisionTracker:
             self._revisions[database] = revision
             return revision
 
-    def set(self, database: str, revision: int) -> None:
-        with self._lock:
-            self._revisions[database] = max(0, int(revision))
-
 
 class TransactionManager:
     def __init__(self, revisions: RevisionTracker | None = None, *, ttl_seconds: int = 900) -> None:
@@ -56,7 +52,6 @@ class TransactionManager:
         *,
         enabled_scopes: Iterable[SafetyScope | str],
         preview_operation: Callable[[MutationOperation], dict[str, Any]],
-        checkpoint_estimate_bytes: int | None = None,
     ) -> MutationPreview:
         parsed = [item if isinstance(item, MutationOperation) else MutationOperation.from_dict(item) for item in operations]
         if not parsed:
@@ -80,7 +75,6 @@ class TransactionManager:
                 else []
             ),
             expires_at=expires.isoformat(),
-            checkpoint_estimate_bytes=checkpoint_estimate_bytes,
         )
         with self._lock:
             self._previews[transaction_id] = preview
@@ -211,7 +205,6 @@ class TransactionManager:
         transaction_id: str,
         *,
         rollback_undo: Callable[[], bool] | None = None,
-        restore_checkpoint: Callable[[str], bool] | None = None,
     ) -> MutationReceipt:
         with self._lock:
             receipt = self._receipts.get(transaction_id)
@@ -234,8 +227,6 @@ class TransactionManager:
                     },
                 )
             restored = rollback_undo() if rollback_undo is not None else False
-            if not restored and receipt.checkpoint and restore_checkpoint is not None:
-                restored = restore_checkpoint(receipt.checkpoint)
             if not restored:
                 if receipt.checkpoint is None:
                     raise VNextError(

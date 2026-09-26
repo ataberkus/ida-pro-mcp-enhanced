@@ -21,7 +21,6 @@ from ..api_analysis import (
     disasm,
     func_profile,
     analyze_batch,
-    xrefs_to,
     xref_query,
     insn_query,
     xrefs_to_field,
@@ -51,6 +50,28 @@ def test_decompile_valid_function():
     assert_shape(result, {"addr": str, "code": optional(str), "error": optional(str)})
     assert_ok(result, "code")
     assert_non_empty(result["code"])
+
+
+@test()
+def test_decompile_without_deprecation_warning():
+    """Decompilation should not warn about deprecated IDA function lookups."""
+    import warnings
+
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always", DeprecationWarning)
+        result = decompile(fn_addr)
+
+    assert_ok(result, "code")
+    deprecated_here = [
+        warning for warning in captured
+        if issubclass(warning.category, DeprecationWarning)
+        and warning.filename.endswith("api_analysis.py")
+    ]
+    assert not deprecated_here, deprecated_here
 
 
 @test(binary="crackme03.elf")
@@ -220,33 +241,6 @@ def test_disasm_interior_address_preserves_cursor():
     result = disasm(hex(interior), max_instructions=4)
     assert_ok(result, "asm")
     assert result["asm"]["start_ea"] == hex(interior)
-
-
-@test(binary="crackme03.elf")
-def test_xrefs_to_check_pw_from_main():
-    """xrefs_to(check_pw) includes the known call from main."""
-    result = xrefs_to(CRACKME_CHECK_PW)
-    assert_is_list(result, min_length=1)
-    entry = result[0]
-    assert entry["addr"] == CRACKME_CHECK_PW
-    assert_is_list(entry["xrefs"], min_length=1)
-    hit = next(
-        (xref for xref in entry["xrefs"] if xref["addr"] == CRACKME_CALL_TO_CHECK_PW),
-        None,
-    )
-    assert hit is not None, "expected call site 0x12d3 -> check_pw"
-    assert hit["type"] == "code"
-    assert hit["fn"]["name"] == "main"
-
-
-@test()
-def test_xrefs_to_invalid():
-    """xrefs_to reports an error or empty xrefs for an invalid address."""
-    result = xrefs_to(get_unmapped_address())
-    assert_is_list(result, min_length=1)
-    assert result[0]["addr"] == get_unmapped_address()
-    if result[0].get("xrefs") is None:
-        assert_error(result[0])
 
 
 @test()
@@ -454,10 +448,11 @@ def test_find_code_ref_to_check_pw():
 
 @test()
 def test_find_invalid_type():
-    """find reports an unknown search type as an error."""
+    """find reports an unknown search type as an error with the Allowed list."""
     result = find("invalid_type", "test")
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="Unknown search type")
+    assert_error(result[0], contains="Allowed:")
 
 
 @test()
