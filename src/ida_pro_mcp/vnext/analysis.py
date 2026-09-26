@@ -10,7 +10,7 @@ import re
 from collections import deque
 from typing import Any, Iterable
 
-from .contracts import AnalysisEngine, AnalysisGraph
+from .contracts import AnalysisGraph
 
 _NODE_IDENTITY_FIELDS = ("id", "address", "addr", "name", "func")
 

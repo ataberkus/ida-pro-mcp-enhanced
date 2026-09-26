@@ -839,6 +839,7 @@ def analysis_run(
     def run(context: JobContext) -> dict[str, Any]:
         context.progress(0.05, "triage")
         triage = _analysis_sync("triage", [], effective_options)
+        functions: list[dict[str, Any]] = []
         total = max(1, len(effective_targets))
         depth = max(1, min(int(effective_options.get("max_depth", 3) or 3), 20))
         direction = str(effective_options.get("direction", "both") or "both")

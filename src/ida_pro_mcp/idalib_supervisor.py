@@ -270,7 +270,6 @@ class IdalibSupervisor:
 
     def _open_worker_log(self, port: int) -> tuple[Any, str]:
         import tempfile
-        from typing import BinaryIO
 
         directory = os.path.join(tempfile.gettempdir(), "ida-pro-mcp-workers")
         os.makedirs(directory, exist_ok=True)
