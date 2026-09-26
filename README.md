@@ -2,34 +2,34 @@
 
 > Turn IDA into an agentic reverse-engineering workspace—not just a remote decompiler.
 
-IDA Pro MCP Enhanced is a vNext-first derivative of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp). It gives AI agents a compact, high-leverage interface for navigating binaries, following control and data flow, building evidence, and safely improving the IDB.
+IDA Pro MCP Enhanced is a vNext-first derivative of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp). It gives AI agents a compact, high-leverage interface for navigating binaries, following control and data flow, recovering program structure, building evidence, and safely improving the IDB.
 
-Instead of forcing an agent through hundreds of tiny read calls, vNext combines structured investigation, graph traversal, data-flow tracing, taint analysis, batch operations, and transactional edits. The result is a faster analysis loop, less context waste, and substantially deeper reverse engineering than the legacy one-tool-at-a-time workflow.
+Instead of forcing an agent through hundreds of tiny read calls, vNext combines structured investigation, graph traversal, data-flow tracing, taint analysis, binary recovery, batch operations, and transactional edits behind a bounded 35-tool API. The result is a faster analysis loop, less context waste, and substantially deeper reverse engineering than a one-tool-at-a-time workflow.
 
-## Why it feels different
+## Highlights
 
 - **Investigation, not just lookup.** `analysis_run`, `investigation_start`, `graph_query`, `dataflow_trace`, and `taint_analyze` help an agent reconstruct behavior across whole code paths.
-- **Smaller and stronger tool surface.** A bounded 35-tool canonical API replaces legacy tool sprawl while retaining proven implementations internally.
+- **Small, strong tool surface.** 35 canonical tools replace legacy tool sprawl. Dead code, duplicate helpers, and superseded tools have been removed.
+- **Binary recovery built in.** RTTI class and vtable recovery (MSVC and Itanium), switch/jump-table enumeration, patched-byte listing and diffs, FLIRT signatures, type libraries, and function similarity search.
+- **Self-describing tools.** Fixed-choice parameters are advertised as JSON Schema enums and validated; invalid input returns actionable errors that list the allowed values; every tool description follows a WHEN / RETURNS / LIMITS / NEXT format.
 - **Fewer round trips.** Batch-first queries, bounded responses, cached strings, and combined analysis results reduce tool-call churn on large databases.
 - **Search the analysis, not only the binary.** Deadline-aware listing search finds rendered instructions and analyst comments across selected ranges with resumable cursors.
-- **Safe autonomous editing.** Renames, types, comments, and other IDB changes use preview/commit transactions, revision checks, recovery checkpoints, and rollback support.
-- **Binary recovery built in.** RTTI class and vtable recovery (MSVC and Itanium), switch/jump-table enumeration, patched-byte diffs, FLIRT signatures, type libraries, and function similarity search are part of the canonical surface.
-- **Self-describing tools.** Fixed-choice parameters are advertised as JSON Schema enums and validated, invalid input returns actionable errors that list the allowed values, and every tool description follows a WHEN / LIMITS / NEXT format.
-- **Sharper IDB refinement.** Agents can add bookmarks, set operand display and structure-offset types, and create typed data through the transactional mutation path.
+- **Safe autonomous editing.** Renames, types, comments, patches, and other IDB changes go through preview/commit transactions with revision checks, recovery checkpoints, and rollback.
 - **Multiple IDA databases at once.** The stdio bridge discovers live IDA processes and routes each call to the right database.
-- **Real safety controls.** Read, annotate, modify, debugger, filesystem, and Python capabilities are independently scoped.
+- **Real safety controls.** Read, annotate, modify, filesystem, debugger, and Python capabilities are independently scoped; non-loopback HTTP requires a bearer token.
+- **Headless mode.** `idalib-mcp` serves the same API from idalib, with multiple worker databases and no GUI.
 - **IDA 9.4-first runtime.** Current function, segment, decompiler, and microcode APIs are used without the deprecated-call noise found in older integrations.
 
 ## Requirements
 
 - **IDA Professional 9.4+ is strongly recommended and is the primary target.** IDA Free is not supported.
-- Older IDA releases may work through compatibility fallbacks, but this enhanced release is tested and optimized for IDA 9.4+.
-- Python 3.11+ and [uv](https://docs.astral.sh/uv/) for the standalone bridge.
-- IDAPython must be pinned to a Python runtime compatible with the IDA installation. Use `idapyswitch` if IDA reports a libpython mismatch.
+- Older IDA releases may work through compatibility fallbacks, but this release is tested and optimized for IDA 9.4+.
+- Python 3.11+ and [uv](https://docs.astral.sh/uv/).
+- IDAPython must use a Python runtime compatible with the IDA installation. Use `idapyswitch` if IDA reports a libpython mismatch.
 
 ## Install
 
-Clone the private repository, create the bridge environment, and install the IDA plugin plus global Codex stdio configuration:
+Clone the repository, create the environment, and install the IDA plugin plus an MCP client configuration. This example configures Codex globally over stdio:
 
 ```powershell
 git clone https://github.com/ataberkus/ida-pro-mcp-enhanced.git
@@ -38,9 +38,9 @@ uv sync --all-groups
 uv run --no-sync ida-pro-mcp --install codex --scope global --transport stdio
 ```
 
-`--no-sync` is intentional: installation only copies the already-synchronized checkout and avoids replacing a bridge executable that Windows may have open. Completely restart IDA and Codex after installation.
+`--no-sync` is intentional: installation only copies the already-synchronized checkout and avoids replacing a bridge executable that Windows may have open. Completely restart IDA and your MCP client after installation.
 
-Verify the global client entry:
+Verify the client entry (Codex example):
 
 ```powershell
 codex mcp get ida-pro-mcp
@@ -48,9 +48,11 @@ codex mcp get ida-pro-mcp
 
 The expected transport is `stdio`, with both `command` and `args` pointing into this checkout. If either path still points to an older clone, remove the stale entry and rerun the installer from the intended checkout.
 
+To remove the plugin and client entries, run `uv run --no-sync ida-pro-mcp --uninstall [targets]`.
+
 ### Update an existing installation
 
-Fully quit Codex and other MCP clients before synchronizing so Windows releases the bridge executable:
+Fully quit your MCP clients before synchronizing so Windows releases the bridge executable:
 
 ```powershell
 cd path\to\ida-pro-mcp-enhanced
@@ -59,9 +61,9 @@ uv sync --all-groups
 uv run --no-sync ida-pro-mcp --install codex --scope global --transport stdio
 ```
 
-Then restart IDA and Codex. Running the installer again safely refreshes the loader, plugin package, vNext support package, and Codex configuration.
+Then restart IDA and the client. Running the installer again safely refreshes the loader, plugin package, vNext support package, and client configuration.
 
-If `uv` reports `failed to remove ... Scripts/ida-pro-mcp.exe: Access denied`, a Codex/bridge process still has the executable open. Either fully quit Codex before rerunning `uv sync`, or refresh the plugin immediately without environment synchronization:
+If `uv` reports `failed to remove ... Scripts/ida-pro-mcp.exe: Access denied`, a client/bridge process still has the executable open. Either fully quit the client before rerunning `uv sync`, or refresh the plugin immediately without environment synchronization:
 
 ```powershell
 uv run --no-sync ida-pro-mcp --install codex --scope global --transport stdio
@@ -77,25 +79,22 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start_ida_clean.ps1
 
 ## MCP client configuration
 
-The bridge runs on **stdio** by default, which is the recommended transport because it enables multi-instance discovery and routing. The installer can write the correct configuration for you:
+When run by a client, the bridge serves MCP over **stdio**. This is the recommended transport because it enables multi-instance discovery and routing. The installer writes the configuration for you:
 
 ```powershell
 uv run --no-sync ida-pro-mcp --install <client> --scope <global|project> --transport stdio
 ```
 
-- `--install <client>` accepts comma-separated targets (e.g. `claude,cursor`) or an interactive selector when omitted.
-- `--scope global` writes a user-level config; `--scope project` writes a config inside the current project.
-- `--transport` selects `stdio` (default), `streamable-http`, or `sse`.
+- `--install <client>` accepts comma-separated targets (e.g. `claude,cursor`); without targets it shows an interactive selector.
+- `--scope global` writes a user-level config; `--scope project` (the non-interactive default) writes one inside the current directory.
+- `--transport` selects `stdio`, `streamable-http`, or `sse`. **Pass `--transport stdio` explicitly:** a non-interactive install otherwise defaults to `streamable-http`.
 - `--config` prints the raw JSON for the current setup; `--list-clients` lists every supported target.
 
-The examples below show manual configuration for the most common clients. All paths must be **absolute**. Replace `C:\path\to\ida-pro-mcp-enhanced` with the location of your checkout; do not mix the bridge from one clone with plugin files from another.
+The examples below show manual configuration for common clients. All paths must be **absolute**. Replace `C:\path\to\ida-pro-mcp-enhanced` with the location of your checkout, and do not mix the bridge from one clone with plugin files from another.
 
 ### VS Code
 
-VS Code reads MCP servers from a top-level `"servers"` object. Add the entry to either:
-
-- **Project scope** — `.vscode/mcp.json` in your workspace root.
-- **User scope** — `%APPDATA%\Code\User\mcp.json` (global, applies to every workspace).
+VS Code reads MCP servers from a top-level `"servers"` object in either `.vscode/mcp.json` (project) or `%APPDATA%\Code\User\mcp.json` (user):
 
 ```jsonc
 {
@@ -112,28 +111,13 @@ VS Code reads MCP servers from a top-level `"servers"` object. Add the entry to 
 
 > **Note:** When configuring through VS Code `settings.json` instead of `mcp.json`, the servers live under an extra `"mcp"` key: `{ "mcp": { "servers": { ... } } }`.
 
-### Claude Desktop
+### Claude Desktop, Claude Code, and Cursor
 
-Claude Desktop reads from `%APPDATA%\Claude\claude_desktop_config.json` using a top-level `"mcpServers"` object:
+These clients use a top-level `"mcpServers"` object:
 
-```json
-{
-  "mcpServers": {
-    "ida-pro-mcp": {
-      "command": "C:\\path\\to\\ida-pro-mcp-enhanced\\.venv\\Scripts\\python.exe",
-      "args": [
-        "C:\\path\\to\\ida-pro-mcp-enhanced\\src\\ida_pro_mcp\\bridge_server.py"
-      ]
-    }
-  }
-}
-```
-
-Fully quit and restart Claude Desktop after saving so it launches the server.
-
-### Claude Code
-
-Claude Code reads project-scoped servers from `.mcp.json` in the workspace root (or from `~/.claude.json` for user scope), using a top-level `"mcpServers"` object:
+- **Claude Desktop:** `%APPDATA%\Claude\claude_desktop_config.json`. Fully quit and restart Claude Desktop after saving.
+- **Claude Code:** `.mcp.json` in the workspace root (project) or `~/.claude.json` (user).
+- **Cursor:** `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (user).
 
 ```json
 {
@@ -150,7 +134,7 @@ Claude Code reads project-scoped servers from `.mcp.json` in the workspace root 
 
 ### Codex
 
-Codex stores global MCP servers in `%USERPROFILE%\.codex\config.toml` on Windows (`~/.codex/config.toml` on other platforms). Project-scoped entries may instead use `.codex/config.toml`. For the recommended global stdio configuration:
+Codex stores global MCP servers in `%USERPROFILE%\.codex\config.toml` on Windows (`~/.codex/config.toml` elsewhere); project entries may use `.codex/config.toml`:
 
 ```toml
 [mcp_servers.ida-pro-mcp]
@@ -158,7 +142,7 @@ command = "C:\\path\\to\\ida-pro-mcp-enhanced\\.venv\\Scripts\\python.exe"
 args = ["C:\\path\\to\\ida-pro-mcp-enhanced\\src\\ida_pro_mcp\\bridge_server.py"]
 ```
 
-You can also add it from the CLI:
+Or from the CLI:
 
 ```powershell
 codex mcp add ida-pro-mcp -- "C:\path\to\ida-pro-mcp-enhanced\.venv\Scripts\python.exe" "C:\path\to\ida-pro-mcp-enhanced\src\ida_pro_mcp\bridge_server.py"
@@ -166,28 +150,11 @@ codex mcp add ida-pro-mcp -- "C:\path\to\ida-pro-mcp-enhanced\.venv\Scripts\pyth
 
 Verify with `codex mcp get ida-pro-mcp` or `codex mcp list`.
 
-### Cursor
-
-Cursor reads project-scoped servers from `.cursor/mcp.json` (or `~/.cursor/mcp.json` for user scope), using a top-level `"mcpServers"` object:
-
-```json
-{
-  "mcpServers": {
-    "ida-pro-mcp": {
-      "command": "C:\\path\\to\\ida-pro-mcp-enhanced\\.venv\\Scripts\\python.exe",
-      "args": [
-        "C:\\path\\to\\ida-pro-mcp-enhanced\\src\\ida_pro_mcp\\bridge_server.py"
-      ]
-    }
-  }
-}
-```
-
 ### Other clients and transports
 
-The installer also knows how to configure Cline, Roo Code, Kilo Code, Windsurf, Zed, Kimi Code, Gemini CLI, Qwen Coder, Copilot CLI, LM Studio, Amazon Q, and more — run `uv run --no-sync ida-pro-mcp --list-clients` to see the full list.
+The installer also configures Cline, Roo Code, Kilo Code, Windsurf, Zed, Kimi Code, Gemini CLI, Qwen Coder, Copilot CLI, LM Studio, Amazon Q, and more. Run `uv run --no-sync ida-pro-mcp --list-clients` for the full list.
 
-For remote or headless setups, the bridge can also be reached over **streamable HTTP** or **SSE** instead of stdio. Its listener must use a different port from the IDA plugin, which uses `13337` by default. This example uses `8744`:
+For remote or headless setups, the bridge can also serve **streamable HTTP** or **SSE**. Its listener must use a different port from the IDA plugin, which uses `13337` by default. This example uses `8744`:
 
 ```powershell
 uv run --no-sync ida-pro-mcp --transport http://127.0.0.1:8744/mcp
@@ -204,75 +171,104 @@ uv run --no-sync ida-pro-mcp --transport http://127.0.0.1:8744/mcp
 }
 ```
 
+Binding to a non-loopback address requires a bearer token. Create one with `uv run --no-sync ida-pro-mcp auth init` (written to `%APPDATA%\ida-pro-mcp\auth-token` on Windows, `~/.config/ida-pro-mcp/auth-token` elsewhere), then pass `--auth-token-file <path>` or set `IDA_MCP_AUTH_TOKEN`.
+
 > **Note:** Connecting directly to IDA at `http://127.0.0.1:13337/mcp` reaches only that IDA process and bypasses multi-instance discovery. Prefer the stdio bridge when you run more than one database.
 
-### Installation troubleshooting
+## Tool reference
 
-If `tools/list` works but `entity_query`, `search`, or other IDA-backed calls time out:
+The advertised vNext API is deliberately focused. All 35 canonical tools:
 
-1. Run `codex mcp get ida-pro-mcp` and confirm both stdio paths point to the intended checkout.
-2. From that checkout, run `uv sync --all-groups` followed by `uv run --no-sync ida-pro-mcp --install codex --scope global --transport stdio`.
-3. Completely restart IDA so it loads the refreshed plugin package, then restart the MCP client so it launches the refreshed bridge.
-4. Inspect `%TEMP%\ida_pro_enhanced_logs\ida-pro-mcp-sync-<ida-pid>.log`. Each request records its ID, worker/UI thread, queue delay, execution time, scheduler, outcome, and exception traceback. `queue_start_timeout` means IDA's Qt event loop never dispatched the posted event; `ui_started` followed by no `ui_finished` identifies a tool that stalled after dispatch; `ui_event_deferred` means a nested Qt delivery was safely queued behind an active IDA call; and `ui_finished` should be followed by `ui_turn_released` on a later Qt turn.
+| Area | Tools |
+| --- | --- |
+| Server and databases | `server_capabilities`, `idb_open`, `idb_list`, `idb_save`, `idb_close` |
+| Lookup and evidence | `entity_query`, `search`, `memory_read`, `disassemble`, `decompile`, `type_query`, `int_convert`, `signature_create` |
+| Analysis | `analysis_run`, `graph_query`, `dataflow_trace`, `taint_analyze` |
+| Background jobs | `job_status`, `job_cancel`, `job_result` |
+| Investigations | `investigation_start`, `investigation_get`, `investigation_add_finding`, `investigation_export` |
+| IDB mutation | `mutation_preview`, `mutation_commit`, `mutation_status`, `mutation_rollback` |
+| Debugger (opt-in) | `debug_session`, `debug_control`, `debug_breakpoints`, `debug_state`, `debug_memory`, `debug_trace` |
+| Python (opt-in) | `python_execute` |
 
-The same directory contains `ida-pro-mcp-errors-<ida-pid>.log`, a smaller error-only stream for queue failures, exceptions, structured tool errors, decompiler failures, and call-stack inconsistencies. The UI-start timeout defaults to 10 seconds and can be overridden with `IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC`. Override the files with `IDA_MCP_SYNC_LOG` and `IDA_MCP_ERROR_LOG`.
+`idb_open`, `idb_list`, and `idb_close` manage sessions in headless `idalib-mcp`; in the GUI plugin the open database is used directly.
 
-Returned failures are logged as `tool_reported_error` with outcome `reported_error`, rather than being mistaken for successful calls. Decompiler failures additionally emit `decompile_failed` with the input and resolved function addresses, function name, Hex-Rays error code/name and description, exact failure address when supplied by Hex-Rays, exception details, and the diagnostic-log path. The `decompile` response carries the same bounded details plus a `disassemble` fallback target.
+What the main tools do:
 
-For argument-level history, export the trace embedded in a closed IDB with `uv run --no-sync ida-mcp-trace-dump <database.i64> --output <trace.jsonl>`. The reader is IDALib-only and does not load the GUI plugin or PySide6. Structured errors include safe context fields such as the original input, resolved address, and reason; Python execution exceptions include an explicit `error` field alongside captured stdout/stderr.
+- **`analysis_run`** modes: `triage` (whole-binary survey), `function` (decompilation, disassembly, references, strings, constants, callers, callees, blocks, and risk signals in one bounded result), `component` and `batch` (several targets), `similar` (ranks functions by mnemonic 3-gram similarity to a target), and `deep` (a cancellable background job that adds data-flow traces).
+- **`entity_query`** lists `functions`, `globals`, `imports`, `strings`, and `names`, plus recovered `switches`, `patches`, `classes`/`vtables` (RTTI), available FLIRT `signatures`, and `type_libraries`, with glob/regex filtering, projection, sorting, and pagination.
+- **`graph_query`** explores `xrefs`, `xrefs_from`, `xrefs_both`, `calls`, and `cfg` relationships, including paths and neighborhoods.
+- **`dataflow_trace`** follows values `forward`, `backward`, or `both` from an address or a symbol such as `main`; **`taint_analyze`** traces source-to-sink influence with explicit bounds.
+- **`search`** finds `text`, `regex`, `bytes`, `constant`, and `instruction` matches, covering rendered disassembly and comments with resumable cursors.
+- **`memory_read`** reads `bytes`, `integer`, `string`, and `global` values from agent-friendly address forms; kind `patch_diff` reports every patched byte range.
+- **`type_query`** inspects structs, unions, enums, typedefs, function types, and pointers.
+- **`signature_create`** produces byte signatures in `ida`, `x64dbg`, `mask`, or `bitmask` format.
+- **`investigation_*`** keeps an evidence-driven record of findings and exports it as `json`, `markdown`, or `sarif`.
+- **`python_execute`** runs an expression (`eval`) or a workspace-restricted script (`file`) when the Python scope is enabled.
 
-Rendered-listing text search uses five-second pages and returns a continuation cursor before common MCP client timeouts. When other IDA UI requests are queued, it yields a shorter 250 ms page with reason `queue_pressure` so concurrent searches can make progress instead of timing out in the main-thread queue. Override the normal page budget with `IDA_MCP_SEARCH_PAGE_BUDGET_SEC` (capped at 20 seconds) and the contended budget with `IDA_MCP_CONTENDED_SEARCH_PAGE_BUDGET_SEC` (capped at one second).
+MCP resources are also exposed: `ida://idb/metadata`, `ida://idb/entrypoints`, `ida://cursor`, and `ida://selection`.
 
-The plugin and bridge are separate runtime halves; updating only the client configuration or only the copied IDA plugin can leave an older implementation active.
+### Transactional mutation
 
-## Agentic analysis surface
+Every IDB change is staged with `mutation_preview`, which returns per-operation before/after state and warnings, then applied atomically with `mutation_commit`. Supported operation kinds:
 
-The advertised vNext API is deliberately focused:
+`rename`, `comment`, `append_comment`, `bookmark`, `declare_type`, `set_type`, `patch_bytes`, `write_integer`, `patch_asm`, `define_function`, `define_code`, `undefine`, `set_operand_type`, `make_data`, `declare_stack`, `delete_stack`, `apply_flirt`, `load_til`, `save_database`.
 
-- `analysis_run` collects decompilation, disassembly, references, strings, constants, callees, callers, blocks, and risk signals in one bounded result.
-- `investigation_start` and `investigation_get` maintain an evidence-driven investigation instead of losing findings between calls.
-- `graph_query` explores callers, callees, paths, neighborhoods, and cross-reference relationships.
-- `dataflow_trace` follows values forward or backward from an address or a symbol such as `main`.
-- `taint_analyze` traces source-to-sink influence with explicit bounds.
-- `decompile`, `disassemble`, `search`, `memory_read`, and `type_query` provide targeted evidence when deeper inspection is needed.
-- `entity_query` lists functions, globals, imports, strings, and names, plus recovered `switches`, `patches`, `classes`/`vtables`, available FLIRT `signatures`, and `type_libraries`.
-- `analysis_run` in `similar` mode ranks functions by mnemonic 3-gram similarity to a target; `memory_read` with kind `patch_diff` reports every patched byte range.
-- `search` now covers rendered disassembly and comments, while `memory_read` accepts agent-friendly address forms and produces bounded results.
-- Opt-in debugger and Python scopes include debugger-state inspection and execution of workspace-restricted analysis scripts.
-- Mutation tools preview a batch, validate the active database revision, create a checkpoint, and then commit atomically. Operations include `apply_flirt` and `load_til` for applying FLIRT signatures and loading type libraries.
-
-Legacy tools are hidden from MCP clients. Dead code, duplicate helpers, and tools superseded by vNext have been removed; the remaining legacy implementations are kept only where vNext orchestration delegates to them.
+Each preview expires and is tied to an IDB revision. If the database changes before commit, the operation fails with `STALE_REVISION` instead of silently applying an outdated plan. Commits create a recovery checkpoint that `mutation_rollback` can restore.
 
 ## Safety profiles
 
-New installations default to the **Modify** profile: read, annotation, and IDB mutation are enabled, while debugger, filesystem, and arbitrary Python access remain opt-in.
+New installations default to the **Modify** profile: read, annotation, and IDB mutation are enabled, while debugger, filesystem, and Python access remain opt-in.
 
-With IDA running, open [http://127.0.0.1:13337/config.html](http://127.0.0.1:13337/config.html) to switch quickly between Read only, Annotate, and Modify. Additional canonical, debug, Python, and legacy profiles live in [`profiles/`](profiles/).
-
-Every mutation preview expires and is tied to an IDB revision. If the database changes before commit, the operation fails with `STALE_REVISION` instead of silently applying an outdated plan.
+With IDA running, open [http://127.0.0.1:13337/config.html](http://127.0.0.1:13337/config.html) to switch between Read only, Annotate, and Modify. Profile files in [`profiles/`](profiles/) (`readonly`, `triage`, `annotate`, `modify`, `canonical`, `debug`, `python`, `legacy`) restrict the tool list further, for example with `idalib-mcp --profile profiles/triage.txt`.
 
 ## Multi-instance routing
 
-The stdio bridge is the recommended transport:
+The stdio bridge discovers every running IDA instance:
 
-- With one IDA instance, tools retain normal unprefixed names.
+- With one IDA instance, tools keep their normal unprefixed names.
 - With multiple instances, tools become `<database_prefix>__<tool>`.
 - `ida_list_instances` reports live processes, database paths, and routing prefixes.
 - Databases with colliding names receive an instance-derived disambiguator.
 - Closing or crashing IDA invalidates the stale routing target during discovery refresh.
 
-A direct connection to `http://127.0.0.1:13337/mcp` still works, but it connects to only that single IDA process and bypasses multi-instance discovery.
+## Headless mode (idalib)
 
-## Verification status
+`idalib-mcp` serves the API without the IDA GUI, using idalib worker processes:
 
-Current Windows/IDA 9.4 release checks:
+```powershell
+uv run --no-sync idalib-mcp --stdio path\to\binary
+uv run --no-sync idalib-mcp --host 127.0.0.1 --port 8745 path\to\binary
+```
 
-- Portable suite: **294 passed, 116 subtests passed**.
-- Multi-instance bridge suite: **24 passed**.
-- Targeted Ruff checks, `compileall`, package build, isolated installation, and CLI smoke pass.
-- Live IDA 9.4 registration, resource reads, tool listing, function analysis, transactional mutation, and IDB save have been exercised.
-- The thread-safe Qt posted-event scheduler and immediate request chaining are live verified in IDA 9.4; search-page budgeting and late-callback abandonment are regression tested.
-- Multi-instance routing is unit verified; final two-GUI live acceptance remains pending.
+- The binary argument is optional; open more databases later with `idb_open` and list them with `idb_list`.
+- `--max-workers` caps simultaneous worker databases (default 4, `0` = unlimited).
+- `--safety-scope` enables a scope (repeatable), `--profile` restricts tools to a profile file, and `--workspace-root` restricts binary and output paths (repeatable).
+- Non-loopback HTTP requires `--auth-token-file` or `IDA_MCP_AUTH_TOKEN`.
+
+## Troubleshooting
+
+If `tools/list` works but `entity_query`, `search`, or other IDA-backed calls time out:
+
+1. Confirm the client's stdio paths point to the intended checkout (for Codex, `codex mcp get ida-pro-mcp`).
+2. From that checkout, run `uv sync --all-groups` followed by the `--install` command above.
+3. Completely restart IDA so it loads the refreshed plugin package, then restart the MCP client so it launches the refreshed bridge.
+4. Inspect `%TEMP%\ida_pro_enhanced_logs\ida-pro-mcp-sync-<ida-pid>.log`. Each request records its ID, worker/UI thread, queue delay, execution time, scheduler, outcome, and exception traceback. `queue_start_timeout` means IDA's Qt event loop never dispatched the posted event; `ui_started` followed by no `ui_finished` identifies a tool that stalled after dispatch; `ui_event_deferred` means a nested Qt delivery was safely queued behind an active IDA call; and `ui_finished` should be followed by `ui_turn_released` on a later Qt turn.
+
+The same directory contains `ida-pro-mcp-errors-<ida-pid>.log`, a smaller error-only stream for queue failures, exceptions, structured tool errors, decompiler failures, and call-stack inconsistencies. Returned failures are logged as `tool_reported_error`; decompiler failures also emit `decompile_failed` with the resolved function, Hex-Rays error code and description, and failure address, and the `decompile` response suggests a `disassemble` fallback.
+
+For argument-level history, export the trace embedded in a closed IDB with `uv run --no-sync ida-mcp-trace-dump <database.i64> --output <trace.jsonl>`. The reader is idalib-only and does not load the GUI plugin or PySide6.
+
+The plugin and bridge are separate runtime halves; updating only the client configuration or only the copied IDA plugin can leave an older implementation active.
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `IDA_MCP_SYNC_QUEUE_TIMEOUT_SEC` | UI-thread start timeout (default 10 s) |
+| `IDA_MCP_SYNC_LOG`, `IDA_MCP_ERROR_LOG` | Override the diagnostic log paths |
+| `IDA_MCP_SEARCH_PAGE_BUDGET_SEC` | Listing-search page budget (default 5 s, max 20 s) |
+| `IDA_MCP_CONTENDED_SEARCH_PAGE_BUDGET_SEC` | Page budget under `queue_pressure` (default 250 ms, max 1 s) |
+| `IDA_MCP_AUTH_TOKEN` | Bearer token for non-loopback HTTP |
 
 ## Development
 
@@ -280,16 +276,32 @@ Current Windows/IDA 9.4 release checks:
 uv sync --all-groups
 uv run --no-sync pytest tests -q -p no:cacheprovider
 uv run --no-sync pytest tests_bridge -q -p no:cacheprovider
-uv run --no-sync ruff check src/ida_pro_mcp/ida_mcp/api_core.py src/ida_pro_mcp/ida_mcp/api_survey.py src/ida_pro_mcp/ida_mcp/compat.py src/ida_pro_mcp/ida_mcp/hexrays_dataflow.py
+uv run --no-sync ruff check src/ida_pro_mcp/vnext src/ida_pro_mcp/ida_mcp/api_vnext.py src/ida_pro_mcp/ida_mcp/hexrays_dataflow.py src/ida_pro_mcp/ida_mcp/rpc.py src/ida_pro_mcp/idalib_supervisor.py
 uv build
 ```
 
-The vNext contract is documented in [`devdocs/vnext.md`](devdocs/vnext.md). Multi-instance design and acceptance notes are under [`devdocs/multi-instance/`](devdocs/multi-instance/).
+IDA-backed API tests run headlessly through idalib against the maintained fixtures:
+
+```powershell
+uv run ida-mcp-test tests/crackme03.elf -q
+uv run ida-mcp-test tests/typed_fixture.elf -q
+```
+
+CI runs the portable suite on Windows, Linux, and macOS, plus the lint job and the idalib fixture tests.
+
+The vNext contract is documented in [`devdocs/vnext.md`](devdocs/vnext.md), the test framework in [`devdocs/test-framework.md`](devdocs/test-framework.md), and multi-instance design notes under [`devdocs/multi-instance/`](devdocs/multi-instance/).
+
+### Verification status
+
+Current Windows/IDA 9.4 checks:
+
+- Portable suite: **294 passed, 116 subtests passed**.
+- Multi-instance bridge suite: **24 passed**.
+- Live IDA 9.4 registration, resource reads, tool listing, function analysis, transactional mutation, and IDB save have been exercised.
+- Multi-instance routing is unit verified; two-GUI live acceptance is pending.
 
 ## Upstream and license
 
-This repository preserves the upstream Git history and is based on upstream commit `f82e6e2`. It is maintained as a standalone private derivative so enhanced development can remain private while retaining clear attribution.
-
-Upstream: [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)
+This repository preserves the upstream Git history and is based on upstream commit `f82e6e2` of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp), with full attribution retained.
 
 License: [MIT](LICENSE)
