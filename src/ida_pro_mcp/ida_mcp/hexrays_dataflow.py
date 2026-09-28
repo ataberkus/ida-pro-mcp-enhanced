@@ -98,7 +98,8 @@ def trace_microcode(
     ea = _resolve_trace_address(addr)
     function = ida_funcs.get_func(ea)
     if function is None:
-        raise VNextError(ErrorCode.INVALID_OPERATION, f"Address is not inside a function: {addr}")
+        # Globals/imports have no microcode; callers fall back to reference flow.
+        raise VNextError(ErrorCode.NOT_SUPPORTED, f"Address is not inside a function: {addr}")
 
     mba = None
     try:

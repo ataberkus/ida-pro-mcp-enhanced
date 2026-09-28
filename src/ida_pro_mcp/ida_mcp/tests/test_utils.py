@@ -31,6 +31,7 @@ def test_utils_parse_address_and_detection():
     assert parse_address("0x123e") == 0x123E
     assert parse_address(0x123E) == 0x123E
     assert resolve_address_or_name("main") == 0x123E
+    assert parse_address("main") == 0x123E, "parse_address should resolve IDA symbol names"
     assert resolve_address_or_name("0x123e") == 0x123E
     for bad, fragment in [
         (True, "bool"),

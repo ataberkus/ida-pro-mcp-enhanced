@@ -701,6 +701,9 @@ class McpServer:
             )
         else:
             self._http_server.allow_reuse_address = True
+        # socketserver's default backlog is 5; clients issuing parallel tool
+        # calls overflow it and Windows answers the excess with ECONNREFUSED.
+        self._http_server.request_queue_size = 128
         # Set the MCPServer instance on the handler class
         setattr(self._http_server, "mcp_server", self)
         try:

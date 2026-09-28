@@ -753,7 +753,7 @@ def memory_read(
     if normalized_kind == "patch_diff":
         from . import api_recovery
 
-        return ToolEnvelope({"text": api_recovery.patch_diff_text()}, provenance={"legacy_tool": "visit_patched_bytes"}).to_dict()
+        return ToolEnvelope({"text": idasync(api_recovery.patch_diff_text)()}, provenance={"legacy_tool": "visit_patched_bytes"}).to_dict()
     if normalized_kind not in mapping:
         _unsupported("memory read kind", kind, get_args(MemoryReadKind))
     name, argument_name = mapping[normalized_kind]
@@ -795,6 +795,14 @@ def signature_create(
     return ToolEnvelope(result, provenance={"legacy_tool": "make_signature_for_function"}).to_dict()
 
 
+@idasync
+def _similar_functions(target: str, limit: int, min_score: float) -> Any:
+    from . import api_recovery
+    from .utils import resolve_address_or_name
+
+    return api_recovery.similar_functions(resolve_address_or_name(target), limit, min_score)
+
+
 def _analysis_sync(mode: str, targets: list[str], options: dict[str, Any]) -> Any:
     if mode == "triage":
         return _legacy_call("survey_binary", {"detail_level": options.get("detail_level", "fast")})
@@ -807,13 +815,10 @@ def _analysis_sync(mode: str, targets: list[str], options: dict[str, Any]) -> An
     if mode == "batch":
         return _legacy_call("analyze_batch", {"queries": [{"addr": target} for target in targets]})
     if mode == "similar":
-        from . import api_recovery
-        from .utils import resolve_address_or_name
-
         if len(targets) != 1:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Similar analysis requires one target")
-        return api_recovery.similar_functions(
-            resolve_address_or_name(targets[0]),
+        return _similar_functions(
+            targets[0],
             int(options.get("limit", 20) or 20),
             float(options.get("min_score", 0.3) or 0.3),
         )
@@ -948,7 +953,7 @@ def dataflow_trace(
     except VNextError as exc:
         if exc.code is not ErrorCode.NOT_SUPPORTED:
             raise
-        fallback_warning = f"Hex-Rays microcode unavailable: {exc}"
+        fallback_warning = f"Semantic microcode trace unavailable: {exc}"
 
     if normalized not in get_args(DataflowDirection):
         _unsupported("data-flow direction", direction, get_args(DataflowDirection))
@@ -963,7 +968,7 @@ def dataflow_trace(
         nodes=nodes,
         edges=edges,
         unsupported_edges=[
-            {"kind": "semantic_def_use", "reason": "Hex-Rays microcode is unavailable"},
+            {"kind": "semantic_def_use", "reason": "Hex-Rays microcode trace is unavailable for this seed"},
             {"kind": "memory_alias", "reason": "reference flow does not model aliases"},
         ],
         warnings=warnings,
@@ -1372,6 +1377,8 @@ def _operation_payload_empty(kind: str, arguments: dict[str, Any]) -> bool:
     if kind == "declare_type":
         decls = arguments.get("decls")
         return decls in (None, "", [])
+    if kind == "save_database":
+        return False
     if argument_name == "path":
         return not str(arguments.get("path") or "").strip()
     if argument_name == "item":
@@ -1568,10 +1575,6 @@ def _mutation_before_state(operation: MutationOperation) -> Any:
     return None
 
 
-# IDA 9.4 rejects name/comment/byte reads off the main thread.
-_mutation_before_state_sync = idasync(_mutation_before_state)
-
-
 def _revalidate_preview(preview: MutationPreview) -> bool:
     """True when every operation's targeted state still matches the preview."""
 
@@ -1581,7 +1584,7 @@ def _revalidate_preview(preview: MutationPreview) -> bool:
         before = change.get("before") if isinstance(change, dict) else None
         if before is None:
             return False
-        if _mutation_before_state_sync(operation) != before:
+        if _mutation_before_state(operation) != before:
             return False
     return True
 
@@ -1777,7 +1780,7 @@ def mutation_preview(
             "kind": operation.kind,
             "arguments": operation.arguments,
             "validated": True,
-            "before": _mutation_before_state_sync(operation),
+            "before": _mutation_before_state(operation),
             "after": operation.arguments,
         },
     )

@@ -215,3 +215,27 @@ def test_recovery_similar_self_match_top():
     assert rows[0]["score"] == 1.0, f"self-match score != 1.0: {rows[0]!r}"
     scores = [row["score"] for row in rows]
     assert scores == sorted(scores, reverse=True), "rows not sorted by score desc"
+
+
+@test(binary="crackme03.elf")
+def test_dataflow_trace_global_seed_falls_back_to_reference_flow():
+    """dataflow_trace on a data address (no microcode) returns a reference-flow graph."""
+    from ..api_vnext import dataflow_trace
+    from ..framework import get_data_address
+
+    data_addr = get_data_address()
+    if not data_addr:
+        skip_test("no data address in fixture")
+    graph = dataflow_trace(data_addr, "backward", 1)
+    assert graph["engine"] == "reference_flow", f"expected fallback engine: {graph!r}"
+    assert any("not inside a function" in warning for warning in graph["warnings"]), graph["warnings"]
+
+
+@test(binary="crackme03.elf")
+def test_mutation_preview_save_database_without_path():
+    """save_database with no path means 'save to current IDB' and must preview."""
+    from ..api_vnext import mutation_preview
+
+    preview = mutation_preview([{"kind": "save_database"}])
+    assert preview["operations"][0]["kind"] == "save_database"
+    assert preview["required_scopes"] == ["filesystem"]

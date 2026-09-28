@@ -398,6 +398,23 @@ def read_struct(queries: list[StructRead] | StructRead) -> list[dict]:
     return results
 
 
+def _type_declaration(tif, name: str) -> str:
+    """Full one-line definition (struct body, enum values); str(tif) is only the name."""
+    try:
+        flags = (
+            ida_typeinf.PRTYPE_1LINE
+            | ida_typeinf.PRTYPE_TYPE
+            | ida_typeinf.PRTYPE_SEMI
+            | ida_typeinf.PRTYPE_DEF
+        )
+        text = tif._print(name, flags)
+        if text:
+            return text
+    except Exception:
+        pass
+    return str(tif)
+
+
 def _type_kind(tif: ida_typeinf.tinfo_t) -> str:
     try:
         if tif.is_enum():
@@ -557,7 +574,7 @@ def type_query(
             }
 
             if include_decl:
-                out["declaration"] = str(tif)
+                out["declaration"] = _type_declaration(tif, row["name"])
 
             if include_members:
                 members = []
@@ -671,7 +688,7 @@ def type_inspect(
             info = {
                 "name": name,
                 "exists": True,
-                "declaration": str(tif),
+                "declaration": _type_declaration(tif, name),
                 "size": tif.get_size(),
                 "is_func": tif.is_func(),
                 "is_ptr": tif.is_ptr(),

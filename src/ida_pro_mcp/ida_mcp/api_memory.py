@@ -210,7 +210,11 @@ def get_global_variable_value_internal(ea: int) -> str:
         if not ida_bytes.has_any_name(ea):
             raise IDAError(f"Failed to get type information for variable at {ea:#x}")
 
-        size = ida_bytes.get_item_size(ea)
+        # Named but undefined/untyped items (e.g. vftables): read one pointer.
+        if ida_bytes.is_unknown(ida_bytes.get_flags(ea)):
+            size = 8 if compat.inf_is_64bit() else 4
+        else:
+            size = ida_bytes.get_item_size(ea)
         if size == 0:
             raise IDAError(f"Failed to get type information for variable at {ea:#x}")
     else:

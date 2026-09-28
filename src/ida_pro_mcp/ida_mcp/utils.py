@@ -580,6 +580,13 @@ def parse_address(addr: str | int) -> int:
         return int(addr, 0)
     except (TypeError, ValueError):
         text = str(addr)
+        # Tool docs promise "address or name"; resolve IDA symbols before failing.
+        try:
+            ea = idaapi.get_name_ea(idaapi.BADADDR, text.strip())
+        except Exception:
+            ea = idaapi.BADADDR
+        if ea != idaapi.BADADDR:
+            return int(ea)
         for ch in text:
             if ch not in "0123456789abcdefABCDEF":
                 raise IDAError(f"Failed to parse address: {addr}")
@@ -1002,7 +1009,7 @@ def get_stack_frame_variables_internal(
     func = compat.get_func(fn_addr)
     if not func:
         if raise_error:
-            raise IDAError(f"No function found at address {fn_addr}")
+            raise IDAError(f"No function found at address {fn_addr:#x}")
         return []
 
     frame_id = (

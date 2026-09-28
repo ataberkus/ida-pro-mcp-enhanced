@@ -153,13 +153,14 @@ def inf_is_64bit() -> bool:
 # ============================================================================
 
 
-# IDA 9.4 marks get_func() deprecated, but callers here need the full func_t
-# (flags, frame, tails). Silence only the warning raised from this shim.
+# IDA 9.4 deprecates the func_t-based API (get_func, ida_frame.*), but
+# this package still needs func_t for flags/frames/tails and must run on 8.3+.
+# Silence those warnings only when raised from this package's modules.
 warnings.filterwarnings(
     "ignore",
-    message=r"get_func\(\) is deprecated",
+    message=r"\w+\(\) is deprecated",
     category=DeprecationWarning,
-    module=r"(.*\.)?compat$",
+    module=r"(ida_pro_mcp\.)?ida_mcp(\..*)?$",
 )
 
 
