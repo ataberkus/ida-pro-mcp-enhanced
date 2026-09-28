@@ -657,25 +657,71 @@ def _resolve_transport(value: str) -> str:
     return "streamable-http"
 
 
+_TRANSPORT_CHOICES = [
+    ("stdio", "stdio (recommended: routes to every open IDA instance)"),
+    ("streamable-http", "Streamable HTTP (first IDA instance only)"),
+    ("sse", "SSE (first IDA instance only)"),
+]
+
+
+def _entry_transport(entry) -> str | None:
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("command"):
+        return "stdio"
+    url = str(entry.get("url") or entry.get("serverUrl") or "")
+    if not url:
+        return None
+    return "sse" if url.rstrip("/").endswith("/sse") else "streamable-http"
+
+
+def _detect_installed_transport() -> str | None:
+    """Transport of an existing client config entry, so re-installs keep it."""
+    for project in (False, True):
+        try:
+            configs, special = _get_scope_config_spec(project=project)
+        except Exception:
+            continue
+        for name, (config_dir, config_file) in (configs or {}).items():
+            config_path = os.path.join(config_dir, config_file)
+            if not os.path.exists(config_path):
+                continue
+            try:
+                config = _read_config_file(config_path, is_toml=config_file.endswith(".toml"))
+                if config is None:
+                    continue
+                servers = _get_mcp_servers_view(
+                    config,
+                    client_name=name,
+                    is_toml=config_file.endswith(".toml"),
+                    special_json_structures=special,
+                )
+                found = _entry_transport(servers.get(MCP_SERVER_NAME))
+            except Exception:
+                continue
+            if found:
+                return found
+    return None
+
+
 def _get_install_transport(*, uninstall: bool, args, interactive: bool) -> str | None:
     if uninstall:
         return "stdio"
     if args.transport is not None:
         return _resolve_transport(args.transport)
     if not interactive:
-        return "streamable-http"
+        return "stdio"
 
-    choice = interactive_choose(
-        ["Streamable HTTP (recommended)", "stdio", "SSE"],
-        "Select transport mode:",
-    )
+    keys = [key for key, _label in _TRANSPORT_CHOICES]
+    labels = [label for _key, label in _TRANSPORT_CHOICES]
+    current = _detect_installed_transport()
+    default = keys.index(current) if current in keys else 0
+    if current in keys:
+        labels[default] += " [currently installed]"
+    choice = interactive_choose(labels, "Select transport mode:", default=default)
     if choice is None:
         return None
-    if choice.startswith("stdio"):
-        return "stdio"
-    if choice.startswith("Streamable"):
-        return "streamable-http"
-    return "sse"
+    return keys[labels.index(choice)]
 
 
 def _get_install_scope(args, *, interactive: bool) -> str | None:

@@ -447,7 +447,7 @@ def main():
         "--transport",
         type=str,
         default=None,
-        help="MCP transport for install: 'streamable-http' (default), 'stdio', or 'sse'. "
+        help="MCP transport for install: 'stdio' (default, multi-instance), 'streamable-http', or 'sse'. "
         "For running: use stdio (default) or pass a URL (e.g., http://127.0.0.1:8744[/mcp|/sse])",
     )
     parser.add_argument(

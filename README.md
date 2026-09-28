@@ -87,7 +87,7 @@ uv run --no-sync ida-pro-mcp --install <client> --scope <global|project> --trans
 
 - `--install <client>` accepts comma-separated targets (e.g. `claude,cursor`); without targets it shows an interactive selector.
 - `--scope global` writes a user-level config; `--scope project` (the non-interactive default) writes one inside the current directory.
-- `--transport` selects `stdio`, `streamable-http`, or `sse`. **Pass `--transport stdio` explicitly:** a non-interactive install otherwise defaults to `streamable-http`.
+- `--transport` selects `stdio` (default), `streamable-http`, or `sse`. The interactive installer pre-selects the transport already present in your client config.
 - `--config` prints the raw JSON for the current setup; `--list-clients` lists every supported target.
 
 The examples below show manual configuration for common clients. All paths must be **absolute**. Replace `C:\path\to\ida-pro-mcp-enhanced` with the location of your checkout, and do not mix the bridge from one clone with plugin files from another.
