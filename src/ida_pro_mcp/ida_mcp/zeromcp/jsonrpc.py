@@ -202,11 +202,18 @@ class JsonRpcRegistry:
                 logger.debug("[MCP] << %s (%.1fms) EXCEPTION: %s", method, elapsed_ms, e)
             if is_notification:
                 return None
-            logger.exception("[MCP] unhandled exception in %s", method)
+            if self.is_expected_exception(e):
+                logger.info("[MCP] %s failed: %s", method, e)
+            else:
+                logger.exception("[MCP] unhandled exception in %s", method)
             error = self.map_exception(e)
             return self._error(request_id, error["code"], error["message"], error.get("data"))
         finally:
             _current_request.id = None
+
+    def is_expected_exception(self, e: Exception) -> bool:
+        """Return True for structured domain errors that need no traceback."""
+        return False
 
     def map_exception(self, e: Exception) -> JsonRpcError:
         if self.redact_exceptions:

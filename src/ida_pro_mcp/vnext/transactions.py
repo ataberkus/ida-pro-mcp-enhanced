@@ -90,17 +90,31 @@ class TransactionManager:
         apply_operation: Callable[[MutationOperation], Any],
         undo: Callable[[], bool] | None = None,
         begin: Callable[[], bool] | None = None,
+        revalidate: Callable[[MutationPreview], bool] | None = None,
     ) -> MutationReceipt:
         with self._lock:
             preview = self._get_live_preview(transaction_id)
             if preview.database != database:
                 raise VNextError(ErrorCode.INVALID_DATABASE, "Transaction belongs to another database")
             current_revision = self.revisions.current(database)
+            commit_warnings: list[str] = []
             if current_revision != preview.revision:
-                raise VNextError(
-                    ErrorCode.STALE_REVISION,
-                    "Database changed after mutation preview",
-                    details={"expected": preview.revision, "actual": current_revision},
+                # Unrelated edits (auto-analysis, decompiler, other plugins) bump the
+                # revision too; accept the commit when the targeted state is unchanged.
+                verified = False
+                if revalidate is not None:
+                    try:
+                        verified = bool(revalidate(preview))
+                    except Exception:
+                        verified = False
+                if not verified:
+                    raise VNextError(
+                        ErrorCode.STALE_REVISION,
+                        "Database changed after mutation preview; call mutation_preview again",
+                        details={"expected": preview.revision, "actual": current_revision},
+                    )
+                commit_warnings.append(
+                    "Database revision changed after preview; targeted state was re-verified unchanged"
                 )
             enabled = {SafetyScope(scope) for scope in enabled_scopes}
             required = {SafetyScope(scope) for scope in preview.required_scopes}
@@ -154,7 +168,7 @@ class TransactionManager:
                     checkpoint=checkpoint_path,
                     undo_available=False,
                     status="failed_rolled_back" if restored else "failed",
-                    warnings=(
+                    warnings=commit_warnings + (
                         ["Applied operations were rolled back after commit failure"]
                         if restored
                         else (
@@ -181,6 +195,7 @@ class TransactionManager:
                 committed_at=_utc_now().isoformat(),
                 checkpoint=checkpoint_path,
                 undo_available=undo is not None,
+                warnings=commit_warnings,
                 applied_operations=applied_operations,
             )
             self._receipts[transaction_id] = receipt

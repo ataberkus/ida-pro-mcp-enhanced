@@ -441,3 +441,39 @@ def test_investigation_restore_skips_corrupt_record():
     assert "good" in manager._records
     assert "bad" not in manager._records
     assert manager._records["good"].findings[0].finding_id == "f1"
+
+
+def test_transaction_commit_accepts_unrelated_revision_bump_when_revalidated():
+    revisions = RevisionTracker()
+    manager = TransactionManager(revisions, ttl_seconds=30)
+    operation = MutationOperation("rename", {"items": []}, SafetyScope.ANNOTATE)
+    scopes = {SafetyScope.READ, SafetyScope.ANNOTATE}
+    applied: list[str] = []
+
+    rejected = manager.preview("db", [operation], enabled_scopes=scopes, preview_operation=lambda op: {"kind": op.kind})
+    revisions.bump("db")
+    with pytest.raises(VNextError) as caught:
+        manager.commit(
+            rejected.transaction_id,
+            database="db",
+            enabled_scopes=scopes,
+            checkpoint=lambda _tx: None,
+            apply_operation=lambda op: applied.append(op.kind),
+            revalidate=lambda _preview: False,
+        )
+    assert caught.value.code is ErrorCode.STALE_REVISION
+    assert applied == []
+
+    accepted = manager.preview("db", [operation], enabled_scopes=scopes, preview_operation=lambda op: {"kind": op.kind})
+    revisions.bump("db")
+    receipt = manager.commit(
+        accepted.transaction_id,
+        database="db",
+        enabled_scopes=scopes,
+        checkpoint=lambda _tx: None,
+        apply_operation=lambda op: applied.append(op.kind),
+        revalidate=lambda preview: preview.transaction_id == accepted.transaction_id,
+    )
+    assert applied == ["rename"]
+    assert receipt.status == "committed"
+    assert any("re-verified" in warning for warning in receipt.warnings)

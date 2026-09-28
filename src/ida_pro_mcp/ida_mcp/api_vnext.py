@@ -29,6 +29,7 @@ from ida_pro_mcp.vnext.contracts import (
     CapabilityManifest,
     ErrorCode,
     MutationOperation,
+    MutationPreview,
     SafetyScope,
     ToolEnvelope,
     VNextError,
@@ -1567,6 +1568,24 @@ def _mutation_before_state(operation: MutationOperation) -> Any:
     return None
 
 
+# IDA 9.4 rejects name/comment/byte reads off the main thread.
+_mutation_before_state_sync = idasync(_mutation_before_state)
+
+
+def _revalidate_preview(preview: MutationPreview) -> bool:
+    """True when every operation's targeted state still matches the preview."""
+
+    if len(preview.changes) != len(preview.operations):
+        return False
+    for operation, change in zip(preview.operations, preview.changes):
+        before = change.get("before") if isinstance(change, dict) else None
+        if before is None:
+            return False
+        if _mutation_before_state_sync(operation) != before:
+            return False
+    return True
+
+
 @idasync
 def _create_undo_point() -> bool:
     try:
@@ -1758,7 +1777,7 @@ def mutation_preview(
             "kind": operation.kind,
             "arguments": operation.arguments,
             "validated": True,
-            "before": _mutation_before_state(operation),
+            "before": _mutation_before_state_sync(operation),
             "after": operation.arguments,
         },
     )
@@ -1788,6 +1807,7 @@ def mutation_commit(transaction_id: Annotated[str, "Preview transaction identifi
         apply_operation=_apply_operation,
         undo=_perform_undo,
         begin=_create_undo_point,
+        revalidate=_revalidate_preview,
     )
     return receipt.to_dict()
 

@@ -32,6 +32,9 @@ class McpToolError(Exception):
 
 class McpRpcRegistry(JsonRpcRegistry):
     """JSON-RPC registry with custom error handling for MCP tools"""
+    def is_expected_exception(self, e: Exception) -> bool:
+        return isinstance(e, McpToolError) or (hasattr(e, "to_dict") and hasattr(e, "code"))
+
     def map_exception(self, e: Exception) -> JsonRpcError:
         if isinstance(e, McpToolError):
             error: JsonRpcError = {

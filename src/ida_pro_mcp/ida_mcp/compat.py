@@ -15,6 +15,7 @@ Compatibility notes:
 from __future__ import annotations
 
 import re
+import warnings
 from typing import TYPE_CHECKING, Callable, cast
 
 import idaapi
@@ -150,6 +151,16 @@ def inf_is_64bit() -> bool:
 # ============================================================================
 # Function info compatibility
 # ============================================================================
+
+
+# IDA 9.4 marks get_func() deprecated, but callers here need the full func_t
+# (flags, frame, tails). Silence only the warning raised from this shim.
+warnings.filterwarnings(
+    "ignore",
+    message=r"get_func\(\) is deprecated",
+    category=DeprecationWarning,
+    module=r"(.*\.)?compat$",
+)
 
 
 def get_func(ea: int):
