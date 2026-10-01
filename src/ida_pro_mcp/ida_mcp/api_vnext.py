@@ -72,10 +72,10 @@ except ImportError:
 
 # Closed vocabularies. Signatures use Literal so MCP clients get `enum`
 # constraints; bodies still `.lower()` for case-insensitive callers.
-SearchKind = Literal["text", "regex", "bytes", "constant", "instruction"]
+SearchKind = Literal["text", "regex", "bytes", "constant", "instruction", "crypto", "ctree"]
 MemoryReadKind = Literal["bytes", "integer", "string", "global", "patch_diff"]
-AnalysisMode = Literal["triage", "function", "component", "batch", "similar", "deep"]
-GraphKind = Literal["xrefs", "xrefs_from", "xrefs_both", "calls", "cfg"]
+AnalysisMode = Literal["triage", "function", "component", "batch", "similar", "deep", "emulate"]
+GraphKind = Literal["xrefs", "xrefs_from", "xrefs_both", "calls", "cfg", "callsite_args"]
 DataflowDirection = Literal["forward", "backward", "both"]
 SignatureFormat = Literal["ida", "x64dbg", "mask", "bitmask"]
 InvestigationExportFormat = Literal["json", "markdown", "sarif"]
@@ -95,6 +95,13 @@ class AnalysisOptions(TypedDict, total=False):
     direction: Annotated[str, "deep mode: dataflow direction forward, backward, or both"]
     limit: Annotated[int, "similar mode: maximum matches"]
     min_score: Annotated[float, "similar mode: minimum similarity score 0-1"]
+    calls: Annotated[
+        list[list[Any]],
+        "emulate mode: one argument list per call; each arg is an int, address/name string, "
+        "or {bytes: hex} / {string: text} / {wstring: text} / {buffer: size} placed on the emulator heap",
+    ]
+    max_insns: Annotated[int, "emulate mode: instruction budget per call (default 2000000)"]
+    timeout_ms: Annotated[int, "emulate mode: wall-clock budget per call (default 10000)"]
 
 
 class TaintOptions(TypedDict, total=False):
@@ -612,14 +619,14 @@ def server_capabilities() -> dict[str, Any]:
 
 @tool
 def search(
-    kind: Annotated[SearchKind, "text, regex, bytes, constant, or instruction"],
+    kind: Annotated[SearchKind, "text, regex, bytes, constant, instruction, crypto, or ctree"],
     targets: Annotated[list[str], "Search values or patterns"],
     limit: Annotated[int, "Maximum results"] = 100,
     cursor: Annotated[str | None, "Opaque continuation cursor"] = None,
 ) -> dict[str, Any]:
     """WHEN exact-value lookup is enough, use memory_read/entity_query instead.
     RETURNS {data, truncated, next_cursor} envelope; per-kind arity/pagination below.
-    LIMITS text/regex take exactly 1 target (offset cursor); bytes/constant take N targets (offset cursor); instruction takes N mnemonics (per-target {offset,start} cursor, legacy insn_query, max_scan_insns 200000). NEXT follow up with memory_read/disassemble/graph_query."""
+    LIMITS text/regex take exactly 1 target (offset cursor); bytes/constant take N targets (offset cursor); instruction takes N mnemonics (per-target {offset,start} cursor, legacy insn_query, max_scan_insns 200000); crypto scans known crypto/hash/encoding tables and code immediates (targets = algorithm substrings, [] = all; offset cursor); ctree takes N Hex-Rays patterns of space-separated key=value tokens: op=call|cmp|num, callee=<regex>, argN=const|!const|str|<int> (0-based), value=<int>, in=<function regex>; needs callee/value/in to bound the scan, decompiles at most 500 candidate functions (offset cursor). NEXT follow up with memory_read/disassemble/graph_query."""
     normalized = str(kind).lower()
     legacy_tool = normalized
     if normalized == "instruction":
@@ -686,6 +693,19 @@ def search(
                 },
             )
             legacy_tool = "find"
+        elif normalized == "crypto":
+            from . import api_recovery
+
+            rows = idasync(api_recovery.collect_crypto_constants)(targets)
+            page = rows[offset : offset + limit]
+            more = len(rows) > offset + limit
+            result = {"matches": page, "count": len(page), "total": len(rows), "next_offset": offset + limit if more else None}
+            legacy_tool = "crypto_constants"
+        elif normalized == "ctree":
+            from .hexrays_ctree import pattern_search
+
+            result = [pattern_search(target, offset, limit) for target in targets]
+            legacy_tool = "hexrays_ctree"
         else:
             _unsupported("search kind", kind, get_args(SearchKind))
         next_cursor = _search_next_cursor(result)
@@ -822,18 +842,24 @@ def _analysis_sync(mode: str, targets: list[str], options: dict[str, Any]) -> An
             int(options.get("limit", 20) or 20),
             float(options.get("min_score", 0.3) or 0.3),
         )
+    if mode == "emulate":
+        if len(targets) != 1:
+            raise VNextError(ErrorCode.INVALID_OPERATION, "Emulate analysis requires one target")
+        from .emulate import emulate
+
+        return emulate(targets[0], options)
     _unsupported("analysis mode", mode, get_args(AnalysisMode))
 
 
 @tool
 def analysis_run(
-    mode: Annotated[AnalysisMode, "triage, function, component, batch, similar, or deep"],
+    mode: Annotated[AnalysisMode, "triage, function, component, batch, similar, deep, or emulate"],
     targets: Annotated[list[str] | None, "Seed functions or addresses"] = None,
     options: Annotated[AnalysisOptions | None, "Analysis budgets and mode options"] = None,
 ) -> dict[str, Any]:
     """WHEN choosing analysis depth, use this; for one disassembly use disassemble.
     RETURNS inline {data,...} envelope, or a job record for deep. Per-mode arity below.
-    LIMITS triage takes no targets (detail_level fast/full); function/similar take 1 target (similar ranks mnemonic 3-gram matches, options limit/min_score); component/batch take N targets; deep submits a cancellable job (options max_depth 1-20, direction forward/backward/both) and large outputs use the rpc 50k download indirection. NEXT dataflow_trace/taint_analyze on the targets."""
+    LIMITS triage takes no targets (detail_level fast/full); function/similar take 1 target (similar ranks mnemonic 3-gram matches, options limit/min_score); component/batch take N targets; emulate takes 1 target, runs it under Unicorn (x86/x64/ARM/ARM64) once per options.calls entry, returning {status, return, return_string?, imports, writes[{addr,size,hex,text?}]} per call; deep submits a cancellable job (options max_depth 1-20, direction forward/backward/both) and large outputs use the rpc 50k download indirection. NEXT dataflow_trace/taint_analyze on the targets."""
     normalized = str(mode).lower()
     effective_options = dict(options or {})
     if normalized not in get_args(AnalysisMode):
@@ -869,7 +895,7 @@ def analysis_run(
 
 @tool
 def graph_query(
-    kind: Annotated[GraphKind, "xrefs, xrefs_from, xrefs_both, calls, or cfg"],
+    kind: Annotated[GraphKind, "xrefs, xrefs_from, xrefs_both, calls, cfg, or callsite_args"],
     targets: Annotated[list[str], "Root functions or addresses"],
     max_depth: Annotated[int, "Maximum traversal depth"] = 3,
     limit: Annotated[int, "Maximum nodes or blocks"] = 1000,
@@ -877,10 +903,10 @@ def graph_query(
 ) -> dict[str, Any]:
     """WHEN code references matter, use this instead of raw xrefs/disassembly.
     RETURNS {data, truncated, next_cursor} envelope; per-kind arity/pagination below.
-    LIMITS xrefs/xrefs_from/xrefs_both take N targets (per-target offset cursor, legacy xref_query); cfg takes N targets (per-target offset cursor, legacy basic_blocks, max_blocks=limit); calls takes N roots (no cursor, max_nodes=limit, max_edges=2*limit). NEXT dataflow_trace for value flow."""
+    LIMITS xrefs/xrefs_from/xrefs_both take N targets (per-target offset cursor, legacy xref_query); cfg takes N targets (per-target offset cursor, legacy basic_blocks, max_blocks=limit); callsite_args takes N callee functions/imports and returns each decompiled call with args[{text, value?, addr?, string?}] (Hex-Rays required, thunks followed one hop, per-target offset cursor, limit calls per page); calls takes N roots (no cursor, max_nodes=limit, max_edges=2*limit). NEXT dataflow_trace for value flow; analysis_run(emulate) to run a decryptor on recovered args."""
     normalized = str(kind).lower()
 
-    if normalized in {"xrefs", "xrefs_from", "xrefs_both", "cfg"}:
+    if normalized in {"xrefs", "xrefs_from", "xrefs_both", "cfg", "callsite_args"}:
         states = _per_target_cursor_states(cursor, len(targets), "graph")
         pending = [
             (index, target, state)
@@ -899,6 +925,10 @@ def graph_query(
                     },
                 )
                 result.extend(page if isinstance(page, list) else [page])
+        elif normalized == "callsite_args":
+            from .hexrays_ctree import callsite_args
+
+            result = [callsite_args(target, state["offset"], limit) for _index, target, state in pending]
         else:
             direction = {
                 "xrefs": "to",

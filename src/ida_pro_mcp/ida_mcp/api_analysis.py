@@ -92,7 +92,7 @@ def _value_candidates_for_immediate(value: int) -> list[tuple[int, int, bytes]]:
     def add(size: int, signed_val: int):
         if size == 4:
             masked = signed_val & 0xFFFFFFFF
-            if not (-0x80000000 <= signed_val <= 0x7FFFFFFF):
+            if not (-0x80000000 <= signed_val <= 0xFFFFFFFF):
                 return
             b = struct.pack("<I", masked)
         else:
@@ -130,7 +130,11 @@ def _resolve_immediate_insn_start(
             op_val = _operand_value(insn, i)
             if op_val is None:
                 continue
-            if op_val == value or (alt_value is not None and op_val == alt_value):
+            # IDA sign-extends imm32 operands to 64 bits (`cmp dword [x], 9E3779B9h` -> 0xffffffff9e3779b9).
+            width = ida_ua.get_dtype_size(insn.ops[i].dtype)
+            mask = (1 << (8 * width)) - 1 if width in (1, 2, 4) else 0xFFFFFFFFFFFFFFFF
+            wanted = {v & mask for v in (value, alt_value) if v is not None and -(mask >> 1) - 1 <= v <= mask}
+            if op_val & mask in wanted:
                 offb = getattr(insn.ops[i], "offb", 0)
                 if offb and start + offb != match_ea:
                     continue

@@ -9,7 +9,7 @@ Build command recorded for a future from-source fixture rebuild:
 
 from ..api_core import entity_query
 from ..api_memory import get_bytes, patch
-from ..api_vnext import analysis_run, memory_read
+from ..api_vnext import analysis_run, graph_query, memory_read, search
 from ..framework import assert_has_keys, assert_is_list, assert_valid_address, get_named_address, skip_test, test
 
 
@@ -239,3 +239,117 @@ def test_mutation_preview_save_database_without_path():
     preview = mutation_preview([{"kind": "save_database"}])
     assert preview["operations"][0]["kind"] == "save_database"
     assert preview["required_scopes"] == ["filesystem"]
+
+
+@test(binary="typed_fixture.elf")
+def test_callsite_args_resolves_field_pointer_argument():
+    """callsite_args(sum_point) reports use_wrapper passing &g_wrapper.pt (offset 0)."""
+    g_wrapper = get_named_address("g_wrapper")
+    if not g_wrapper:
+        skip_test("g_wrapper symbol not present")
+    page = graph_query("callsite_args", ["sum_point"])["data"][0]
+    assert page["count"] == 1, page
+    call = page["matches"][0]
+    assert call["func_name"] == "use_wrapper", call
+    assert int(call["args"][0]["addr"], 16) == int(g_wrapper, 16), call
+
+
+@test(binary="typed_fixture.elf")
+def test_callsite_args_follows_plt_thunk_to_import():
+    """callsite_args(puts) resolves the extern through its .plt thunk and decodes the string arg."""
+    page = graph_query("callsite_args", ["puts"])["data"][0]
+    strings = [arg.get("string") for call in page["matches"] for arg in call["args"]]
+    assert "unreachable branch" in strings, page
+
+
+@test(binary="typed_fixture.elf")
+def test_ctree_search_call_arg_predicates():
+    """ctree call patterns filter on callee regex and per-argument predicates."""
+    hit = search("ctree", ["callee=printf arg0=str arg2=!const"])["data"][0]
+    assert hit["count"] == 1, hit
+    assert hit["matches"][0]["func_name"] == "main"
+    assert hit["matches"][0]["args"][0]["string"] == "%s %d\n"
+    miss = search("ctree", ["callee=printf arg0=const"])["data"][0]
+    assert miss["matches"] == [], miss
+
+
+@test(binary="typed_fixture.elf")
+def test_ctree_search_comparison_constant():
+    """op=cmp value=1000 finds main's `argc > 1000`; unbounded patterns are rejected."""
+    from ida_pro_mcp.vnext.contracts import VNextError
+
+    hit = search("ctree", ["op=cmp value=1000"])["data"][0]
+    assert [(m["func_name"], m["cmp"]) for m in hit["matches"]] == [("main", ">")], hit
+    try:
+        search("ctree", ["op=cmp"])
+    except VNextError as exc:
+        assert "bound the scan" in str(exc)
+    else:
+        raise AssertionError("unbounded ctree pattern was accepted")
+
+
+@test(binary="typed_fixture.elf")
+def test_crypto_search_finds_patched_aes_sbox():
+    """An AES S-box row patched into g_numbers is reported; algorithm filters exclude it."""
+    g_numbers = get_named_address("g_numbers")
+    if not g_numbers:
+        skip_test("g_numbers symbol not present")
+    original = get_bytes({"addr": g_numbers, "size": 16})[0]["data"]
+    original_hex = "".join(part.zfill(2) for part in original.replace("0x", "").split()).lower()
+    try:
+        assert patch({"addr": g_numbers, "data": "637c777bf26b6fc53001672bfed7ab76"})[0]["ok"]
+        rows = search("crypto", ["aes"])["data"]["matches"]
+        assert {"algorithm": "AES", "label": "S-box", "kind": "table"}.items() <= next(
+            r for r in rows if int(r["addr"], 16) == int(g_numbers, 16)
+        ).items(), rows
+        other = search("crypto", ["sha"])["data"]["matches"]
+        assert all(int(r["addr"], 16) != int(g_numbers, 16) for r in other), other
+    finally:
+        patch({"addr": g_numbers, "data": original_hex})
+
+
+@test(binary="typed_fixture.elf")
+def test_crypto_search_finds_unsigned_code_immediate():
+    """Patching use_wrapper's `1234` imm32 to TEA's 0x9E3779B9 (>= 2**31) yields an immediate row at that insn."""
+    from ..api_analysis import find
+
+    insns = find("immediate", ["0x9E3779B9"])[0]
+    assert insns["error"] is None and insns["matches"] == [], insns
+    hit = find("immediate", ["1234"])[0]["matches"]
+    if not hit:
+        skip_test("no 1234 immediate in fixture")
+    insn = int(hit[0], 16)
+    data = get_bytes({"addr": hex(insn), "size": 16})[0]["data"]
+    raw = bytes.fromhex("".join(part.zfill(2) for part in data.replace("0x", "").split()))
+    imm_at = insn + raw.index(bytes.fromhex("d2040000"))
+    try:
+        assert patch({"addr": hex(imm_at), "data": "b979379e"})[0]["ok"]
+        rows = search("crypto", ["tea"])["data"]["matches"]
+        assert [(r["addr"], r["kind"], r["value"]) for r in rows] == [(hex(insn), "immediate", "0x9e3779b9")], rows
+        assert hex(insn) in find("immediate", ["0x9E3779B9"])[0]["matches"]
+    finally:
+        patch({"addr": hex(imm_at), "data": "d2040000"})
+
+
+@test(binary="typed_fixture.elf")
+def test_emulate_returns_values_and_stubs_imports():
+    """use_wrapper -> 279 from IDB globals; sum_point reads a heap struct; main's printf is stubbed."""
+    try:
+        import unicorn  # noqa: F401
+    except ImportError:
+        skip_test("unicorn not installed")
+    wrapper = analysis_run("emulate", ["use_wrapper"])["data"]["calls"][0]
+    assert wrapper["status"] == "returned", wrapper
+    assert int(wrapper["return"], 16) == 33 + 44 + ord("B") + 0x88
+
+    point = analysis_run("emulate", ["sum_point"], {"calls": [[{"bytes": "01000000 02000000 03"}]]})["data"]["calls"][0]
+    assert point["status"] == "returned", point
+    assert int(point["return"], 16) == 6
+
+    main = analysis_run("emulate", ["main"], {"calls": [[1, 0]]})["data"]["calls"][0]
+    assert main["status"] == "returned", main
+    assert int(main["return"], 16) == 0
+    assert [entry["name"] for entry in main["imports"]] == ["printf"], main["imports"]
+
+    starved = analysis_run("emulate", ["use_wrapper"], {"max_insns": 1})["data"]["calls"][0]
+    assert starved["status"] == "budget_exhausted", starved

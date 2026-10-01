@@ -715,6 +715,119 @@ def similar_functions(ea: int, limit: int = 20, min_score: float = 0.3) -> list[
     return rows[: max(0, int(limit))]
 
 
+# (algorithm, label, LE byte table). Byte tables catch static data and .rodata copies.
+_CRYPTO_TABLES: list[tuple[str, str, bytes]] = [
+    ("AES", "S-box", bytes.fromhex("637c777bf26b6fc53001672bfed7ab76")),
+    ("AES", "inverse S-box", bytes.fromhex("52096ad53036a538bf40a39e81f3d7fb")),
+    ("AES", "Te0 T-table", bytes.fromhex("a56363c6847c7cf8997777ee8d7b7bf6")),
+    ("AES", "Td0 T-table", bytes.fromhex("50a7f4515365417ec3a4171a965e273a")),
+    ("SHA-256", "K table", bytes.fromhex("982f8a4291443771cffbc0b5a5dbb5e9")),
+    ("SHA-512", "K table", bytes.fromhex("22ae28d7982f8a42cd65ef2391443771")),
+    ("MD5", "T table", bytes.fromhex("78a46ad756b7c7e8db702024eecebdc1")),
+    ("MD5/SHA-1", "IV", bytes.fromhex("0123456789abcdeffedcba9876543210")),
+    ("CRC32", "table (0xEDB88320)", bytes.fromhex("00000000963007772c610eeeba510999")),
+    ("CRC32C", "table (0x82F63B78)", bytes.fromhex("0000000003836bf2f7703be1f4f35013")),
+    ("Blowfish", "P-array", bytes.fromhex("886a3f24d308a3852e8a191344737003")),
+    ("ChaCha/Salsa20", "sigma", b"expand 32-byte k"),
+    ("ChaCha/Salsa20", "tau", b"expand 16-byte k"),
+    ("DES", "initial permutation", bytes.fromhex("3a322a221a120a023c342c241c140c04")),
+    ("DES", "S1 box", bytes.fromhex("0e040d01020f0b08030a060c05090007")),
+    ("Keccak/SHA-3", "round constants", bytes.fromhex("010000000000000082800000000000008a80000000000080")),
+    ("Base64", "alphabet", b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"),
+    ("zlib/deflate", "length base table", bytes.fromhex("03000400050006000700080009000a000b000d000f001100")),
+]
+
+# (algorithm, label, value) for constants inlined in code. Matched as raw LE bytes inside an
+# instruction, so `lea eax, [rax+rcx-70E44324h]` (SHA-1 K2 as a displacement) counts too.
+_CRYPTO_IMMEDIATES: list[tuple[str, str, int]] = [
+    ("MD5", "T[1]", 0xD76AA478),
+    ("MD5/SHA-1", "IV A", 0x67452301),
+    ("MD5/SHA-1", "IV D", 0x10325476),
+    ("SHA-1", "IV E", 0xC3D2E1F0),
+    ("SHA-1", "K0", 0x5A827999),
+    ("SHA-1", "K1", 0x6ED9EBA1),
+    ("SHA-1", "K2", 0x8F1BBCDC),
+    ("SHA-1", "K3", 0xCA62C1D6),
+    ("SHA-256", "IV H0", 0x6A09E667),
+    ("SHA-256", "IV H1", 0xBB67AE85),
+    ("SHA-256", "K[0]", 0x428A2F98),
+    ("SHA-224", "IV H0", 0xC1059ED8),
+    ("SHA-512", "IV H0", 0x6A09E667F3BCC908),
+    ("TEA/XTEA/RC5", "delta (golden ratio)", 0x9E3779B9),
+    ("TEA/XTEA", "-delta", 0x61C88647),
+    ("RC5/RC6", "P32", 0xB7E15163),
+    ("CRC32", "polynomial (reflected)", 0xEDB88320),
+    ("CRC32", "polynomial (normal)", 0x04C11DB7),
+    ("CRC32C", "polynomial (reflected)", 0x82F63B78),
+    ("FNV-1/1a 32", "offset basis", 0x811C9DC5),
+    ("FNV-1/1a 32", "prime", 0x01000193),
+    ("FNV-1/1a 64", "offset basis", 0xCBF29CE484222325),
+    ("FNV-1/1a 64", "prime", 0x100000001B3),
+    ("MurmurHash3", "c1", 0xCC9E2D51),
+    ("MurmurHash3", "c2", 0x1B873593),
+    ("MurmurHash3", "fmix 1", 0x85EBCA6B),
+    ("MurmurHash3", "fmix 2", 0xC2B2AE35),
+    ("xxHash32", "prime 1", 0x9E3779B1),
+    ("xxHash32", "prime 2", 0x85EBCA77),
+    ("xxHash64", "prime 1", 0x9E3779B185EBCA87),
+    ("ChaCha/Salsa20", "sigma word 0", 0x61707865),
+    ("ChaCha/Salsa20", "sigma word 1", 0x3320646E),
+    ("SipHash", "v0 init", 0x736F6D6570736575),
+    ("Adler-32", "modulus", 0xFFF1),
+    ("ROR13 API hash", "kernel32!LoadLibraryA", 0x0726774C),
+    ("ROR13 API hash", "kernel32!GetProcAddress", 0x7802F749),
+]
+
+
+def _crypto_row(algorithm: str, label: str, kind: str, ea: int) -> dict:
+    row = {"algorithm": algorithm, "label": label, "kind": kind, "addr": hex(ea)}
+    func_name = ida_funcs.get_func_name(ea)
+    if func_name:
+        row["func"] = func_name
+    return row
+
+
+def collect_crypto_constants(filters: list[str]) -> list[dict]:
+    """Known crypto/hash/encoding constants as byte tables anywhere or code immediates."""
+    from .api_analysis import _BIN_SEARCH_FLAGS
+    from .utils import _segments
+
+    wanted = [f.lower() for f in filters if str(f).strip()]
+
+    def selected(algorithm: str) -> bool:
+        return not wanted or any(f in algorithm.lower() for f in wanted)
+
+    def hits(data: bytes, ranges: list[tuple[int, int]]):
+        mask = b"\xff" * len(data)
+        for lo, hi in ranges:
+            ea = compat.raw_bin_search(lo, hi, data, mask, _BIN_SEARCH_FLAGS)
+            while ea != idaapi.BADADDR and ea < hi:
+                yield ea
+                ea = compat.raw_bin_search(ea + 1, hi, data, mask, _BIN_SEARCH_FLAGS)
+
+    rows: list[dict] = []
+    everywhere = [(compat.inf_get_min_ea(), compat.inf_get_max_ea())]
+    for algorithm, label, data in _CRYPTO_TABLES:
+        if selected(algorithm):
+            rows.extend(_crypto_row(algorithm, label, "table", ea) for ea in hits(data, everywhere))
+    code = _segments(exec_only=True)
+    for algorithm, label, value in _CRYPTO_IMMEDIATES:
+        if not selected(algorithm):
+            continue
+        data = value.to_bytes(8 if value > 0xFFFFFFFF else 4, "little")
+        seen: set[int] = set()
+        for ea in hits(data, code):
+            head = ida_bytes.get_item_head(ea)
+            if head in seen or not ida_bytes.is_code(ida_bytes.get_flags(head)):
+                continue
+            if ea + len(data) > head + ida_bytes.get_item_size(head):
+                continue
+            seen.add(head)
+            rows.append({**_crypto_row(algorithm, label, "immediate", head), "value": hex(value)})
+    rows.sort(key=lambda row: (int(row["addr"], 16), row["algorithm"]))
+    return rows
+
+
 def apply_flirt(name: str) -> dict:
     """Plan a FLIRT signature file, wait for analysis, report renamed count."""
     short = os.path.basename(str(name or "").strip())

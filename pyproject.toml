@@ -31,6 +31,7 @@ dev = [
     "mcp>=1.0",
     "pytest>=9.0.3",
     "ruff==0.15.12",
+    "unicorn>=2.0",
 ]
 
 [project.urls]
@@ -51,6 +52,11 @@ ida-pro-mcp = "ida_pro_mcp.bridge_server:main"
 idalib-mcp = "ida_pro_mcp.idalib_supervisor:main"
 ida-mcp-test = "ida_pro_mcp.test:main"
 ida-mcp-trace-dump = "ida_pro_mcp.trace_dump:main"
+
+[project.optional-dependencies]
+emulate = [
+    "unicorn>=2.0",
+]
 
 [tool.pyright]
 include = ["src/ida_pro_mcp"]

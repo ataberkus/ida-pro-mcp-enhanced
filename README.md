@@ -26,6 +26,7 @@ Instead of forcing an agent through hundreds of tiny read calls, vNext combines 
 - Older IDA releases may work through compatibility fallbacks, but this release is tested and optimized for IDA 9.4+.
 - Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 - IDAPython must use a Python runtime compatible with the IDA installation. Use `idapyswitch` if IDA reports a libpython mismatch.
+- Optional: `analysis_run(mode="emulate")` needs [Unicorn](https://www.unicorn-engine.org/) in IDA's Python (`pip install unicorn`); headless `idalib-mcp` gets it from `uv sync --all-groups` or the `emulate` extra.
 
 ## Install
 
@@ -194,11 +195,11 @@ The advertised vNext API is deliberately focused. All 35 canonical tools:
 
 What the main tools do:
 
-- **`analysis_run`** modes: `triage` (whole-binary survey), `function` (decompilation, disassembly, references, strings, constants, callers, callees, blocks, and risk signals in one bounded result), `component` and `batch` (several targets), `similar` (ranks functions by mnemonic 3-gram similarity to a target), and `deep` (a cancellable background job that adds data-flow traces).
+- **`analysis_run`** modes: `triage` (whole-binary survey), `function` (decompilation, disassembly, references, strings, constants, callers, callees, blocks, and risk signals in one bounded result), `component` and `batch` (several targets), `similar` (ranks functions by mnemonic 3-gram similarity to a target), `emulate` (runs a function under Unicorn once per `options.calls` argument list, with ints, names, or `{bytes|string|wstring|buffer}` heap arguments, and reports its return value, return string, stubbed import calls, and decoded memory writes; useful for string decryptors and API-hash resolvers), and `deep` (a cancellable background job that adds data-flow traces).
 - **`entity_query`** lists `functions`, `globals`, `imports`, `strings`, and `names`, plus recovered `switches`, `patches`, `classes`/`vtables` (RTTI), available FLIRT `signatures`, and `type_libraries`, with glob/regex filtering, projection, sorting, and pagination.
-- **`graph_query`** explores `xrefs`, `xrefs_from`, `xrefs_both`, `calls`, and `cfg` relationships, including paths and neighborhoods.
+- **`graph_query`** explores `xrefs`, `xrefs_from`, `xrefs_both`, `calls`, and `cfg` relationships, including paths and neighborhoods; `callsite_args` lists every decompiled call to a function or import with each argument's constant value, address, or string.
 - **`dataflow_trace`** follows values `forward`, `backward`, or `both` from an address or a symbol such as `main`; **`taint_analyze`** traces source-to-sink influence with explicit bounds.
-- **`search`** finds `text`, `regex`, `bytes`, `constant`, and `instruction` matches, covering rendered disassembly and comments with resumable cursors.
+- **`search`** finds `text`, `regex`, `bytes`, `constant`, and `instruction` matches, covering rendered disassembly and comments with resumable cursors; `crypto` finds known crypto, hash, CRC, compression, and API-hash constants as data tables or code immediates; `ctree` matches decompiled code with patterns such as `callee=memcpy arg2=!const`, `op=cmp value=0x5A4D`, or `op=num value=0x9E3779B9 in=^sub_`.
 - **`memory_read`** reads `bytes`, `integer`, `string`, and `global` values from agent-friendly address forms; kind `patch_diff` reports every patched byte range.
 - **`type_query`** inspects structs, unions, enums, typedefs, function types, and pointers.
 - **`signature_create`** produces byte signatures in `ida`, `x64dbg`, `mask`, or `bitmask` format.

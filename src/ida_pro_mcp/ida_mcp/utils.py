@@ -681,9 +681,10 @@ def resolve_address_or_name(addr: str | int) -> int:
     s = str(addr)
     if s.startswith("0x") or s.startswith("0X"):
         return parse_address(s)
-    ea = idaapi.get_name_ea(idaapi.BADADDR, s)
-    if ea != idaapi.BADADDR:
-        return int(ea)
+    for name in (s, "__imp_" + s):  # PE imports are named __imp_<api>
+        ea = idaapi.get_name_ea(idaapi.BADADDR, name)
+        if ea != idaapi.BADADDR:
+            return int(ea)
     return parse_address(s)
 
 
