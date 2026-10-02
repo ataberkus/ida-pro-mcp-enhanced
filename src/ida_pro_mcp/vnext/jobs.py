@@ -38,6 +38,56 @@ class CancelledError(RuntimeError):
     pass
 
 
+class StateSaver:
+    """Single-flight persistence that never calls ``save`` under the owner's lock.
+
+    ``save`` may block on another thread (IDA main-thread dispatch) that itself
+    needs the owner's lock, so callers MUST invoke :meth:`flush` after releasing
+    it. Concurrent flushes coalesce; the last write always reflects the latest
+    snapshot.
+    """
+
+    def __init__(
+        self,
+        lock: RLock,
+        snapshot: Callable[[], dict[str, Any]],
+        save: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        self._lock = lock
+        self._snapshot = snapshot
+        self._save = save
+        self._flushing = False
+        self._pending = False
+
+    def flush(self) -> None:
+        if self._save is None:
+            return
+        with self._lock:
+            if self._flushing:
+                self._pending = True
+                return
+            self._flushing = True
+        try:
+            while True:
+                with self._lock:
+                    self._pending = False
+                    state = self._snapshot()
+                try:
+                    self._save(state)
+                except Exception:
+                    # Persistence must not strand otherwise valid in-memory
+                    # state (closing IDB, unavailable backend); memory wins.
+                    pass
+                with self._lock:
+                    if not self._pending:
+                        self._flushing = False
+                        return
+        except BaseException:
+            with self._lock:
+                self._flushing = False
+            raise
+
+
 class JobManager:
     def __init__(
         self,
@@ -54,7 +104,11 @@ class JobManager:
         self._records: dict[str, JobRecord] = {}
         self._cancel: dict[str, Event] = {}
         self._futures: dict[str, Future[Any]] = {}
-        self._save_state = save_state
+        self._saver = StateSaver(
+            self._lock,
+            lambda: {key: value.to_dict() for key, value in self._records.items()},
+            save_state,
+        )
         self._on_change = on_change
         if load_state is not None:
             self._restore(load_state() or {})
@@ -83,10 +137,10 @@ class JobManager:
             cancelled = Event()
             self._records[job_id] = record
             self._cancel[job_id] = cancelled
-            self._persist_locked()
             future = self._executor.submit(self._run, job_id, callback, cancelled)
             self._futures[job_id] = future
             snapshot = self._copy(record)
+        self._saver.flush()
         self._notify(snapshot)
         return snapshot
 
@@ -117,8 +171,8 @@ class JobManager:
             for key, value in changes.items():
                 setattr(record, key, value)
             record.updated_at = _utc_now()
-            self._persist_locked()
             snapshot = self._copy(record)
+        self._saver.flush()
         self._notify(snapshot)
 
     def status(self, job_id: str, *, include_result: bool = False) -> dict[str, Any]:
@@ -136,7 +190,7 @@ class JobManager:
             if record.state is not JobState.COMPLETED:
                 raise VNextError(
                     ErrorCode.JOB_INTERRUPTED,
-                    f"Job is not complete: {record.state.value}",
+                    f"Job is {record.state.value}, not completed; call job_status(job_id, wait_sec=30) first",
                     details={"state": record.state.value},
                 )
             return record.result
@@ -161,8 +215,8 @@ class JobManager:
             if future is not None and future.cancel():
                 record.state = JobState.CANCELLED
                 record.updated_at = _utc_now()
-            self._persist_locked()
             snapshot = self._copy(record)
+        self._saver.flush()
         self._notify(snapshot)
         return True
 
@@ -180,15 +234,6 @@ class JobManager:
             self._records.pop(job_id, None)
             self._cancel.pop(job_id, None)
             self._futures.pop(job_id, None)
-
-    def _persist_locked(self) -> None:
-        if self._save_state is not None:
-            try:
-                self._save_state({key: value.to_dict() for key, value in self._records.items()})
-            except Exception:
-                # Persistence must not strand an otherwise completed job in a
-                # running state. The in-memory record remains authoritative.
-                pass
 
     def _notify(self, record: JobRecord) -> None:
         if self._on_change is not None:

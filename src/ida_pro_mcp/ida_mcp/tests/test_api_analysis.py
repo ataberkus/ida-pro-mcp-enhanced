@@ -125,6 +125,51 @@ def test_decompile_unknown_name():
     assert_error(result, contains="Function not found")
 
 
+@test(binary="crackme03.elf")
+def test_decompile_typo_suggests_near_miss():
+    """A one-letter typo names the intended function instead of a bare not-found."""
+    assert_error(decompile("chek_pw"), contains="did you mean: check_pw")
+    assert_error(disasm("chek_pw"), contains="did you mean: check_pw")
+
+
+@test(binary="crackme03.elf")
+def test_decompile_pages_concatenate_to_full_code():
+    """line_limit/next_line_offset pages of main join back into the unpaged pseudocode."""
+    full = decompile(CRACKME_MAIN, line_limit=5000)
+    assert_ok(full, "code")
+    assert full["next_line_offset"] is None
+    assert full["total_lines"] == len(full["code"].split("\n"))
+
+    pages, offset = [], 0
+    while offset is not None:
+        page = decompile(CRACKME_MAIN, line_offset=offset, line_limit=5)
+        assert page["total_lines"] == full["total_lines"]
+        assert len(page["code"].split("\n")) <= 5
+        pages.append(page["code"])
+        offset = page["next_line_offset"]
+    assert len(pages) > 1
+    assert "\n".join(pages) == full["code"]
+
+
+@test(binary="crackme03.elf")
+def test_decompile_without_declarations_drops_locals_block():
+    """include_declarations=false removes `char lAmBdA[7];` but keeps statements and reports the count."""
+    full = decompile(CRACKME_MAIN, line_limit=5000)
+    bare = decompile(CRACKME_MAIN, line_limit=5000, include_declarations=False)
+    assert_ok(full, "code")
+    assert_ok(bare, "code")
+    full_lines = full["code"].split("\n")
+    bare_lines = bare["code"].split("\n")
+    assert any("char lAmBdA[7];" in line for line in full_lines), full["code"]
+    assert not any("char lAmBdA[7];" in line for line in bare_lines), bare["code"]
+    assert "lAmBdA" in bare["code"]  # statements using it survive
+    assert bare["declaration_count"] == full["declaration_count"] > 0
+    # The locals block plus its blank separator line are gone.
+    assert bare["total_lines"] == full["total_lines"] - full["declaration_count"] - 1
+    assert bare_lines[bare["body_start_line"]] == full_lines[full["body_start_line"]]
+
+
+
 @test()
 def test_disasm_valid_function():
     """disasm returns non-empty assembly for a valid function."""
@@ -305,12 +350,12 @@ def test_xrefs_to_field_nonexistent_struct():
 
 
 @test()
-def test_xrefs_to_field_limit_and_more_flag():
-    """xrefs_to_field honors limit and always reports more."""
+def test_xrefs_to_field_unknown_struct_reports_error():
+    """xrefs_to_field returns an error row (not a raise) for a missing struct."""
     result = xrefs_to_field({"struct": "NonExistentStruct", "field": "x"}, limit=1)
     assert_is_list(result, min_length=1)
-    assert result[0]["more"] is False
-    assert len(result[0]["xrefs"]) <= 1
+    assert "not found" in result[0]["error"]
+    assert result[0]["xrefs"] == [] and result[0]["next_offset"] is None
 
 
 @test()
@@ -468,7 +513,7 @@ def test_find_data_ref_invalid_target():
     """find(data_ref, ...) reports invalid target address parsing errors."""
     result = find("data_ref", "definitely_not_an_address")
     assert_is_list(result, min_length=1)
-    assert_error(result[0], contains="Failed to parse address")
+    assert_error(result[0], contains="Unknown address or symbol 'definitely_not_an_address'")
 
 
 @test()
@@ -642,3 +687,45 @@ def test_analyze_batch():
             "constant_count",
             "basic_block_count",
         )
+
+
+@test(binary="crackme03.elf")
+def test_search_regex_hits_code_listing():
+    """search(regex) scans the disassembly listing, not just the strings list."""
+    from ..api_vnext import search
+
+    (row,) = search("regex", ["corr.ct"])["data"]
+    hits = {hit["addr"]: hit for hit in row["matches"]}
+    assert "0x12ea" in hits, row
+    assert hits["0x12ea"]["function"] == "main"
+    assert hits["0x12ea"].get("text", "").startswith("lea") or hits["0x12ea"].get("comment"), hits["0x12ea"]
+
+
+@test(binary="crackme03.elf")
+def test_search_instruction_operand_text_filter():
+    """instruction targets accept op filters; func scoping keeps hits inside the function."""
+    import idc
+
+    from ..api_vnext import search
+
+    op1 = idc.print_operand(0x12EA, 1).split()[0]
+    assert op1, "expected a second operand on the lea at 0x12ea"
+    (row,) = search("instruction", [f"lea op1={op1}"], options={"func": "main"})["data"]
+    addrs = [hit["addr"] for hit in row["matches"]]
+    assert "0x12ea" in addrs, row
+    assert all(hit["function"] == "main" and op1.lower() in idc.print_operand(int(hit["addr"], 16), 1).lower() for hit in row["matches"])
+    (none,) = search("instruction", ["lea op1=zz_no_such_operand"], options={"func": "main"})["data"]
+    assert none["matches"] == []
+
+
+@test(binary="crackme03.elf")
+def test_search_constant_finds_imm8_operands():
+    """Small constants encoded as imm8 (`cmp rax, 6`) are found and named by function."""
+    from ..api_vnext import search
+
+    (row,) = search("constant", ["6"])["data"]
+    hits = {hit["addr"]: hit for hit in row["matches"]}
+    assert "0x12b4" in hits, row
+    assert hits["0x12b4"]["function"] == "main" and hits["0x12b4"]["text"].startswith("cmp")
+    (row,) = search("constant", ["2"])["data"]
+    assert "0x1260" in {hit["addr"] for hit in row["matches"]}, row

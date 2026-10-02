@@ -299,9 +299,9 @@ _HEADLESS = False
 try:
     _qt_core = _load_qt_core()
 except ImportError:
-    # Headless idalib (IDA 9.2+): PySide6/PyQt5 refuse to load outside the
-    # GUI. Fall back to IDA's execute_sync scheduler, which works in both
-    # GUI and headless modes.
+    # Headless (idalib, IDA 9.2+): PySide6/PyQt5 refuse to load outside the
+    # GUI. A GUI without Qt bindings still services execute_sync; idalib has no
+    # event loop that does, so its server loop drains _IDALIB_QUEUE instead.
     _HEADLESS = True
     _qt_core = None
 
@@ -370,11 +370,21 @@ else:
     _qt_main_thread_dispatcher = _QtMainThreadDispatcher()
 
 
-_SYNC_SCHEDULER = "execute_sync" if _HEADLESS else "qt_post_event"
+# idalib: nothing services execute_sync from other threads (it blocks forever),
+# so background callers (jobs, state saves) queue here for run_main_thread_work.
+_IDALIB_QUEUE: "queue.SimpleQueue | None" = (
+    queue.SimpleQueue() if _HEADLESS and not ida_kernwin.is_idaq() else None
+)
+_SYNC_SCHEDULER = (
+    "main_loop_queue" if _IDALIB_QUEUE is not None else "execute_sync" if _HEADLESS else "qt_post_event"
+)
 
 
 def _post_to_main_thread(callback) -> None:
     """Post a thread-safe event to the Qt object owned by IDA's main thread."""
+    if _IDALIB_QUEUE is not None:
+        _IDALIB_QUEUE.put(callback)
+        return
     if _HEADLESS:
         idaapi.execute_sync(callback, idaapi.MFF_WRITE)
         return
@@ -382,11 +392,24 @@ def _post_to_main_thread(callback) -> None:
     _qt_core.QCoreApplication.postEvent(_qt_main_thread_dispatcher, event)
 
 
+def run_main_thread_work() -> None:
+    """Run callbacks queued by background threads; no-op off the idalib main thread."""
+    while _IDALIB_QUEUE is not None and ida_pro.is_main_thread():
+        try:
+            callback = _IDALIB_QUEUE.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            callback()
+        except BaseException:
+            logger.exception("Queued main-thread callback failed")
+
+
 def _defer_until_next_ui_turn(callback) -> None:
     """Run callback on a later Qt event-loop turn."""
     if _HEADLESS:
-        # No Qt event loop exists; execute_sync already ran the callback on
-        # the IDA main thread, so release the worker immediately.
+        # No Qt event loop exists; the callback already ran on the IDA main
+        # thread, so release the worker immediately.
         callback()
         return
     _qt_core.QTimer.singleShot(0, callback)

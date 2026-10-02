@@ -144,9 +144,10 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
         "set_type",
         "declare_stack",
         "delete_stack",
+        "set_op_type",
     }:
         registry.set_scope(name, SafetyScope.ANNOTATE, replacement="mutation_preview")
-    registry.set_scope("enum_upsert", SafetyScope.ANNOTATE)
+    registry.set_scope("enum_upsert", SafetyScope.ANNOTATE, replacement="mutation_preview")
     for name in {
         "patch",
         "put_int",
@@ -154,34 +155,30 @@ def register_builtin_policies(registry: ToolPolicyRegistry) -> None:
         "define_func",
         "define_code",
         "undefine",
-        "set_op_type",
         "make_data",
         "apply_flirt_signature",
         "load_type_library",
     }:
         registry.set_scope(name, SafetyScope.MODIFY, replacement="mutation_preview")
 
-    registry.register(ToolPolicy(name="mutation_preview", canonical=True))
+    # mutation_preview reads by default; commit=true commits annotate-only
+    # transactions, still gated by the transaction's required scopes.
     registry.register(
-        ToolPolicy(
-            name="mutation_commit",
-            scopes=frozenset({SafetyScope.MODIFY}),
-            read_only=False,
-            destructive=True,
-            idempotent=False,
-            canonical=True,
-        )
+        ToolPolicy(name="mutation_preview", read_only=False, idempotent=False, canonical=True)
     )
-    registry.register(
-        ToolPolicy(
-            name="mutation_rollback",
-            scopes=frozenset({SafetyScope.MODIFY}),
-            read_only=False,
-            destructive=True,
-            idempotent=False,
-            canonical=True,
+    # Commit/rollback only need annotate; TransactionManager enforces each
+    # transaction's own required scopes (e.g. modify for byte patches).
+    for name in ("mutation_commit", "mutation_rollback"):
+        registry.register(
+            ToolPolicy(
+                name=name,
+                scopes=frozenset({SafetyScope.ANNOTATE}),
+                read_only=False,
+                destructive=True,
+                idempotent=False,
+                canonical=True,
+            )
         )
-    )
 
     registry.set_scope("idb_save", SafetyScope.FILESYSTEM)
     registry.register(ToolPolicy(name="investigation_start", scopes=frozenset({SafetyScope.READ}), read_only=False, destructive=False, idempotent=False, canonical=True))

@@ -195,30 +195,34 @@ The advertised vNext API is deliberately focused. All 35 canonical tools:
 
 What the main tools do:
 
-- **`analysis_run`** modes: `triage` (whole-binary survey), `function` (decompilation, disassembly, references, strings, constants, callers, callees, blocks, and risk signals in one bounded result), `component` and `batch` (several targets), `similar` (ranks functions by mnemonic 3-gram similarity to a target), `emulate` (runs a function under Unicorn once per `options.calls` argument list, with ints, names, or `{bytes|string|wstring|buffer}` heap arguments, and reports its return value, return string, stubbed import calls, and decoded memory writes; useful for string decryptors and API-hash resolvers), and `deep` (a cancellable background job that adds data-flow traces).
-- **`entity_query`** lists `functions`, `globals`, `imports`, `strings`, and `names`, plus recovered `switches`, `patches`, `classes`/`vtables` (RTTI), available FLIRT `signatures`, and `type_libraries`, with glob/regex filtering, projection, sorting, and pagination.
-- **`graph_query`** explores `xrefs`, `xrefs_from`, `xrefs_both`, `calls`, and `cfg` relationships, including paths and neighborhoods; `callsite_args` lists every decompiled call to a function or import with each argument's constant value, address, or string.
-- **`dataflow_trace`** follows values `forward`, `backward`, or `both` from an address or a symbol such as `main`; **`taint_analyze`** traces source-to-sink influence with explicit bounds.
-- **`search`** finds `text`, `regex`, `bytes`, `constant`, and `instruction` matches, covering rendered disassembly and comments with resumable cursors; `crypto` finds known crypto, hash, CRC, compression, and API-hash constants as data tables or code immediates; `ctree` matches decompiled code with patterns such as `callee=memcpy arg2=!const`, `op=cmp value=0x5A4D`, or `op=num value=0x9E3779B9 in=^sub_`.
-- **`memory_read`** reads `bytes`, `integer`, `string`, and `global` values from agent-friendly address forms; kind `patch_diff` reports every patched byte range.
-- **`type_query`** inspects structs, unions, enums, typedefs, function types, and pointers.
+- **`analysis_run`** modes: `triage` (ranks interesting functions with reasons such as `calls:crypto` or `refs:strings`, plus interesting strings and imports by category; `detail_level="full"` widens the lists), `function` (prototype, a 120-line decompile excerpt with `next_line_offset`, strings, constants, callers, callees, references, and blocks; disassembly, comments, and declarations are opt-in), `component` and `batch` (several targets; `batch` returns only `options.sections`, by default decompile, callees, and strings), `similar` (ranks functions by mnemonic 3-gram similarity and lists each match's callee count and strings), `emulate` (runs a function under Unicorn once per `options.calls` argument list, with ints, names, or `{bytes|string|wstring|buffer}` heap arguments, and reports its return value, return string, stubbed import calls, and decoded memory writes, with a warning for every unmodelled import that returned 0; useful for string decryptors and API-hash resolvers), and `deep` (a cancellable background job that adds data-flow traces).
+- **`decompile`** pages pseudocode with `line_offset`/`line_limit` (default 400 lines) and reports `total_lines` and `next_line_offset`; a trailing `/*0xEA*/` marker maps each line to its instruction. Unknown names come back with near-miss suggestions.
+- **`entity_query`** lists `functions`, `globals`, `imports`, `strings`, `names`, `segments`, `entrypoints`, and per-function `locals`, plus recovered `switches`, `patches`, `classes`/`vtables` (RTTI), available FLIRT `signatures`, and `type_libraries`, with glob/regex filtering, projection, sorting, and pagination; `include_counts=true` adds `xref_count` and enables `sort_by="xref_count"`.
+- **`graph_query`** explores `xrefs`, `xrefs_from`, and `xrefs_both` (filterable by `options.xref_type` code/data), paged breadth-first `calls` and `callers` graphs (indirect call sites and address-taken references listed per node), shortest call `path` between two functions, `field_xrefs` for a `Struct.field`, and `cfg` blocks; `callsite_args` lists every decompiled call to a function or import with each argument's constant value, address, or string.
+- **`dataflow_trace`** follows values `forward`, `backward`, or `both` from an address, a function's parameters, or a `func:var` variable, returning pseudocode statements with variable-name defines/uses; **`taint_analyze`** finds source-to-sink paths (`main:argv` → `printf`, API results → calls) across direct calls into callees (at most 20 functions), with readable steps and a heuristic confidence; `options.domains` limits propagation to register, stack, global, or memory locations.
+- **`search`** finds `text`, `regex`, `bytes`, `constant`, and `instruction` matches with per-target resumable cursors. Text and regex cover disassembly and comments (`options.include="strings"` for string literals) and accept `case_sensitive`, `code_only`, `func`, `segment`, and `start`/`end` options; constants match any operand width; instruction patterns read like `cmp op1=6` or `* any=0x5A4D`. `crypto` finds known crypto, hash, CRC, compression, and API-hash constants as data tables or code immediates; `ctree` matches decompiled code with patterns such as `callee=memcpy arg2=!const`, `op=cmp value=0x5A4D`, or `op=num value=0x9E3779B9 in=^sub_`.
+- **`memory_read`** reads `bytes`, `integer`, `string`, `global`, and typed `struct` values. Addresses accept hex, names, `name+0x10`, and `segment:addr`; integer queries accept an `addr:ty` shorthand such as `main+0x10:u32`; sizes default to the item size. Kind `patch_diff` reports every patched byte range.
+- **`type_query`** inspects structs, unions, enums, typedefs, function types, and pointers; `kind="inferred"` reports an address's applied type, Hex-Rays prototype, or IDA's guess before `set_type`.
 - **`signature_create`** produces byte signatures in `ida`, `x64dbg`, `mask`, or `bitmask` format.
-- **`investigation_*`** keeps an evidence-driven record of findings and exports it as `json`, `markdown`, or `sarif`.
+- **`job_status`** with `wait_sec` (up to 30 s) blocks until a background job ends, replacing polling loops.
+- **`investigation_*`** keeps an evidence-driven record of findings and exports it as `json`, `markdown`, or `sarif`. Evidence accepts `addr` or `address`; `apply_to_idb=true` bookmarks every evidence address in one undoable commit. `investigation_start` budgets cap analyzed seeds (`max_seeds`, default 20) and can `skip_triage`.
 - **`python_execute`** runs an expression (`eval`) or a workspace-restricted script (`file`) when the Python scope is enabled.
 
 MCP resources are also exposed: `ida://idb/metadata`, `ida://idb/entrypoints`, `ida://cursor`, and `ida://selection`.
 
 ### Transactional mutation
 
-Every IDB change is staged with `mutation_preview`, which returns per-operation before/after state and warnings, then applied atomically with `mutation_commit`. Supported operation kinds:
+Every IDB change is staged with `mutation_preview`, which resolves addresses, parses types and declarations, records the before-state of each operation, and rejects an invalid operation by index. `mutation_commit` then applies the batch atomically. A batch made only of annotate-scope kinds (renames, comments, bookmarks, types, enums, operand display, stack variables) can pass `commit=true` to preview and commit in one call. Supported operation kinds:
 
-`rename`, `comment`, `append_comment`, `bookmark`, `declare_type`, `set_type`, `patch_bytes`, `write_integer`, `patch_asm`, `define_function`, `define_code`, `undefine`, `set_operand_type`, `make_data`, `declare_stack`, `delete_stack`, `apply_flirt`, `load_til`, `save_database`.
+`rename`, `comment`, `append_comment`, `bookmark`, `declare_type`, `set_type`, `upsert_enum`, `set_operand_type`, `declare_stack`, `delete_stack`, `patch_bytes`, `write_integer`, `patch_asm`, `define_function`, `define_code`, `undefine`, `make_data`, `apply_flirt`, `load_til`, `save_database`.
 
-Each preview expires and is tied to an IDB revision. If the database changes before commit, the operation fails with `STALE_REVISION` instead of silently applying an outdated plan. Commits create a recovery checkpoint that `mutation_rollback` can restore.
+Operations take flat fields, such as `{"kind": "rename", "addr": "sub_401000", "name": "parse_header"}`, or an `items` batch. A `__noreturn` prototype in `set_type` marks a function no-return. `define_function` with `end` resizes an existing function. `set_operand_type` with `operand_kind="enum"` shows an operand as an enum member. Appended line comments also appear in pseudocode.
+
+Each preview expires and is tied to an IDB revision. If a target changes before commit, the operation fails with `STALE_REVISION` instead of silently applying an outdated plan. Commits refresh cached decompilations and can be undone with `mutation_rollback`.
 
 ## Safety profiles
 
-New installations default to the **Modify** profile: read, annotation, and IDB mutation are enabled, while debugger, filesystem, and Python access remain opt-in.
+New installations default to the **Modify** profile: read, annotation, and IDB mutation are enabled, while debugger, filesystem, and Python access remain opt-in. The Annotate profile can commit and roll back annotate-only transactions; byte and code edits need Modify.
 
 With IDA running, open [http://127.0.0.1:13337/config.html](http://127.0.0.1:13337/config.html) to switch between Read only, Annotate, and Modify. Profile files in [`profiles/`](profiles/) (`readonly`, `triage`, `annotate`, `modify`, `canonical`, `debug`, `python`, `legacy`) restrict the tool list further, for example with `idalib-mcp --profile profiles/triage.txt`.
 
@@ -245,6 +249,10 @@ uv run --no-sync idalib-mcp --host 127.0.0.1 --port 8745 path\to\binary
 - `--max-workers` caps simultaneous worker databases (default 4, `0` = unlimited).
 - `--safety-scope` enables a scope (repeatable), `--profile` restricts tools to a profile file, and `--workspace-root` restricts binary and output paths (repeatable).
 - Non-loopback HTTP requires `--auth-token-file` or `IDA_MCP_AUTH_TOKEN`.
+- `idb_open` waits for auto-analysis up to `IDA_MCP_OPEN_WAIT_SEC` (default 90 s) and then returns `state="opening"` while analysis continues; `wait=false` returns immediately. Calls to a database that is still analyzing fail fast with the elapsed time; poll `idb_list`.
+- Worker tools take an optional `database`: a session id or prefix, filename, or path from `idb_list`. Omit it when one database is open.
+- Oversized results are truncated with a hint to narrow the request (paging, `line_offset`/`line_limit`, `fields`); no download URL is offered.
+- Background jobs reach IDA through a main-thread queue that the server drains every 20 ms, so `analysis_run(mode="deep")` and investigations complete headlessly.
 
 ## Troubleshooting
 
@@ -270,6 +278,7 @@ The plugin and bridge are separate runtime halves; updating only the client conf
 | `IDA_MCP_SEARCH_PAGE_BUDGET_SEC` | Listing-search page budget (default 5 s, max 20 s) |
 | `IDA_MCP_CONTENDED_SEARCH_PAGE_BUDGET_SEC` | Page budget under `queue_pressure` (default 250 ms, max 1 s) |
 | `IDA_MCP_AUTH_TOKEN` | Bearer token for non-loopback HTTP |
+| `IDA_MCP_OPEN_WAIT_SEC` | `idb_open` wait before returning `state="opening"` (default 90 s, `0` waits for analysis) |
 
 ## Development
 
@@ -296,8 +305,10 @@ The vNext contract is documented in [`devdocs/vnext.md`](devdocs/vnext.md), the 
 
 Current Windows/IDA 9.4 checks:
 
-- Portable suite: **294 passed, 116 subtests passed**.
+- Portable suite: **358 passed, 116 subtests passed**.
 - Multi-instance bridge suite: **24 passed**.
+- idalib fixture suites: `crackme03.elf` **307 passed, 1 skipped**; `typed_fixture.elf` **267 passed, 1 skipped**.
+- Live `idalib-mcp --stdio` smoke on `crackme03.elf` and `notepad.exe`: paged decompilation, triage, search, call graphs, taint, transactional commit/rollback, and deep jobs.
 - Live IDA 9.4 registration, resource reads, tool listing, function analysis, transactional mutation, and IDB save have been exercised.
 - Multi-instance routing is unit verified; two-GUI live acceptance is pending.
 

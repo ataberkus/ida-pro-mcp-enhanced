@@ -46,25 +46,34 @@ source, and sensitive arguments. There is no telemetry.
 - Debugger: `debug_session`, `debug_control`, `debug_breakpoints`, `debug_state`, `debug_memory`, `debug_trace`
 - Restricted execution: `python_execute`
 
-Canonical collections return a versioned envelope with `data`, `warnings`,
-`provenance`, `truncated`, and `next_cursor`. Addresses are hexadecimal strings.
+Canonical collections return a versioned envelope: `data` and `schema_version`,
+plus `warnings`, `provenance`, `truncated`, and `next_cursor` only when set.
+Addresses are hexadecimal strings. Address arguments also accept names,
+`name+0x10`, and `segment:addr`; unknown names fail with near-miss suggestions.
 Stable failures include `PROFILE_DENIED`, `AUTH_REQUIRED`, `NOT_SUPPORTED`,
 `STALE_REVISION`, `INVALID_DATABASE`, `JOB_INTERRUPTED`, `LIMIT_EXCEEDED`, and
 `REOPEN_REQUIRED`.
 
 ## Mutations and recovery
 
-`mutation_preview` validates a complete discriminated operation batch and
-records required scopes, affected arguments, revision, expiry, and estimated
-checkpoint size without changing the IDB. `mutation_commit` accepts only that
-preview identifier, rechecks database/revision/scopes, writes an external
-recovery IDB to the platform cache only when the dashboard Recovery-checkpoints
-option is enabled (off by default), and applies operations through the existing
-main-thread-safe IDA functions. When checkpoints are disabled the receipt
-checkpoint is null and rollback relies on native undo; otherwise it raises
-REOPEN_REQUIRED. IDB hooks cover names, comments, bookmarks,
-bytes, code/data, functions, types, stack members, and segments so out-of-band
-edits invalidate previews and caches.
+`mutation_preview` validates a complete discriminated operation batch without
+changing the IDB: addresses resolve, types and declarations parse, and each
+operation records its before-state, so an invalid operation fails at preview
+with its index and an unrelated edit does not stale a preview whose targets are
+unchanged. It records required scopes, affected arguments, revision, expiry,
+and estimated checkpoint size. A batch of annotate-scope operations (names,
+comments, bookmarks, types, `upsert_enum`, `set_operand_type`, stack variables)
+may pass `commit=true` to commit in the same call. `mutation_commit` accepts
+only that preview identifier, rechecks database/revision/scopes, writes an
+external recovery IDB to the platform cache only when the dashboard
+Recovery-checkpoints option is enabled (off by default), and applies operations
+through the existing main-thread-safe IDA functions. Commit and rollback need
+only the scopes the transaction lists, so the Annotate profile can apply and
+undo annotations. Commits discard cached decompilations, so callers see new
+prototypes. When checkpoints are disabled the receipt checkpoint is null and
+rollback relies on native undo; otherwise it raises REOPEN_REQUIRED. IDB hooks
+cover names, comments, bookmarks, bytes, code/data, functions, types, stack
+members, and segments so out-of-band edits invalidate previews and caches.
 
 Rollback uses native undo when available. Otherwise the checkpoint is returned
 with `REOPEN_REQUIRED`; a live database is never described as atomically
@@ -73,7 +82,13 @@ restored when it was not. Debug-memory writes require `debug` and
 
 `idb_open`, `idb_list`, and `idb_close` are supervisor-only canonical tools.
 `entity_query`, `decompile`, `type_query`, `int_convert`, and `idb_save` are
-canonical legacy tools in both runtimes.
+canonical legacy tools in both runtimes. The supervisor gives every worker tool
+an optional `database` argument (session id or prefix, filename, or path) that
+defaults to the only open database. `idb_open` blocks for at most
+`IDA_MCP_OPEN_WAIT_SEC` and otherwise reports `opening`; calls to a database
+that is still analyzing fail fast. Workers run with `IDA_MCP_SUPERVISED=1`, so
+truncated output carries a narrowing hint instead of a worker-private download
+URL.
 
 ## Jobs, investigations, and analysis
 
@@ -84,13 +99,27 @@ and evidence remain exportable as deterministic JSON, Markdown, SARIF, DOT, or
 Mermaid. Job and investigation resources support subscription updates with
 event coalescing.
 
-When Hex-Rays can generate microcode, `dataflow_trace` builds instruction
-definition/use location lists and computes reaching definitions across the
-function CFG. Results identify the `hexrays_microcode` engine, evidence, and
-unsupported edge categories. Without Hex-Rays, the existing traversal is
-returned as `reference_flow` and is never labeled semantic. `taint_analyze`
-uses those edges, stops at configured sanitizers, tracks location domains, and
-assigns engine-dependent confidence.
+`job_status(wait_sec)` blocks for up to 30 s until a job ends. Under idalib,
+`execute_sync` from a worker thread is never serviced, so background jobs post
+IDA work to a main-thread queue drained by the server's 20 ms poll loop and by
+waiting `job_status` calls. `investigation_start` analyzes at most
+`budgets.max_seeds` seeds (default 20; the rest are recorded as
+`skipped_seeds`) and can skip triage. `investigation_add_finding` with
+`apply_to_idb=true` bookmarks every evidence address in one undoable annotate
+commit.
+
+When Hex-Rays is available, `dataflow_trace` computes reaching definitions over
+the decompiler's local-variable microcode, so nodes are pseudocode statements
+(`line`) with variable names in `defines`/`uses`, and edges are `must`/`may`
+def-use links. Seeds are addresses, functions (their parameters), or
+`func:var`; `options.include_microcode` adds the raw instruction text. Without
+Hex-Rays, or for data addresses, the xref traversal is returned as
+`reference_flow` and is never labeled semantic. `taint_analyze` resolves
+sources (addresses, `func:var`, function parameters, API call results and
+written buffers) and sinks (call sites receiving the value, or statement
+addresses), follows those edges into direct callees by parameter position up
+to `max_depth` hops and 20 functions, honours `options.domains` and sanitizers,
+and reports readable `steps` with a heuristic confidence.
 
 Supervisor `analysis_run(mode="binary_diff")` accepts the left session as
 `database` and the other session as `options.right_database`. It matches

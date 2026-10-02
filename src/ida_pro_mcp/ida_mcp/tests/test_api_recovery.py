@@ -55,7 +55,7 @@ def test_recovery_switches_targets_filter():
 
 @test()
 def test_recovery_patch_roundtrip_lists_and_diffs():
-    """patch 1 byte -> patches row (original != patched) -> patch_diff line -> restore."""
+    """patch 1 byte -> patches row and structured patch_diff range -> restore clears both."""
     import ida_segment
     import idautils
 
@@ -87,15 +87,17 @@ def test_recovery_patch_roundtrip_lists_and_diffs():
         assert row["original"] == orig_plain
         assert row["patched"] == replacement
 
-        diff = memory_read("patch_diff")
-        text = diff["data"]["text"]
-        assert f": {orig_plain} {replacement}" in text.lower()
+        diff = [r for r in memory_read("patch_diff")["data"] if r["addr"] == probe]
+        assert len(diff) == 1, diff
+        assert diff[0]["size"] == 1
+        assert (diff[0]["original_hex"], diff[0]["patched_hex"]) == (orig_plain, replacement)
     finally:
         patch({"addr": probe, "data": orig_plain})
 
     restored = get_bytes({"addr": probe, "size": 1})[0]
     assert "".join(part.zfill(2) for part in restored["data"].replace("0x", "").split()).lower() == orig_plain
     assert entity_query({"kind": "patches"})[0]["data"] == []
+    assert memory_read("patch_diff")["data"] == []
 
 
 @test()
@@ -207,7 +209,8 @@ def test_recovery_similar_self_match_top():
     rows = analysis_run("similar", [main])["data"]
     assert_is_list(rows, min_length=1)
     for row in rows:
-        assert_has_keys(row, "addr", "name", "score", "insn_count")
+        assert_has_keys(row, "addr", "name", "score", "insn_count", "callee_count", "strings")
+        assert len(row["strings"]) <= 3
         assert_valid_address(row["addr"])
         assert 0.0 <= row["score"] <= 1.0, f"score out of range: {row!r}"
         assert row["insn_count"] > 0, f"bad insn_count: {row!r}"
@@ -350,6 +353,27 @@ def test_emulate_returns_values_and_stubs_imports():
     assert main["status"] == "returned", main
     assert int(main["return"], 16) == 0
     assert [entry["name"] for entry in main["imports"]] == ["printf"], main["imports"]
+    # Unmodelled imports are called out, with call counts, instead of silently returning 0.
+    assert len(main["warnings"]) == 1 and "printf" in main["warnings"][0], main["warnings"]
+    assert "1x" in main["warnings"][0] and "returned 0" in main["warnings"][0]
+    assert "warnings" not in wrapper
 
     starved = analysis_run("emulate", ["use_wrapper"], {"max_insns": 1})["data"]["calls"][0]
     assert starved["status"] == "budget_exhausted", starved
+
+
+@test(binary="crackme03.elf")
+def test_emulate_warns_about_each_unmodelled_import():
+    """crackme main(argc=1) prints usage through a stubbed libc call; every such import is warned once with its count."""
+    try:
+        import unicorn  # noqa: F401
+    except ImportError:
+        skip_test("unicorn not installed")
+    from ..emulate import _strip_import
+
+    call = analysis_run("emulate", ["main"], {"calls": [[1, 0]]})["data"]["calls"][0]
+    stubbed = [_strip_import(entry["name"]) for entry in call["imports"] if entry["stubbed"] == "returned 0"]
+    assert stubbed, call
+    assert len(call["warnings"]) == len(set(stubbed)), call["warnings"]
+    for name in set(stubbed):
+        assert any(w.startswith(f"{name} called {stubbed.count(name)}x") for w in call["warnings"]), call["warnings"]

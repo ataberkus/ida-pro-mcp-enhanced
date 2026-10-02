@@ -4,7 +4,6 @@ from ..framework import (
     test,
     skip_test,
     assert_is_list,
-    assert_non_empty,
     assert_ok,
     assert_error,
     get_any_function,
@@ -370,18 +369,14 @@ def test_set_type_stack_missing_member_typed_fixture():
 
 @test(binary="crackme03.elf")
 def test_infer_types_returns_high_confidence_for_main():
-    """infer_types(main) returns a non-empty inferred type with a method and confidence."""
+    """infer_types(main) reports main's applied prototype, not a weaker guess."""
     main_addr = get_named_address("main")
     if not main_addr:
         skip_test("main symbol not present")
 
-    result = infer_types(main_addr)
-    assert_is_list(result, min_length=1)
-    entry = result[0]
-    assert entry["confidence"] in {"high", "low", "none"}
-    if entry["inferred_type"] is not None:
-        assert_non_empty(entry["inferred_type"])
-        assert entry["method"] is not None
+    (entry,) = infer_types(main_addr)
+    assert entry["method"] in {"existing", "hexrays"} and entry["confidence"] == "high", entry
+    assert "argv" in entry["inferred_type"], entry
 
 
 @test(binary="typed_fixture.elf")
@@ -488,7 +483,7 @@ def test_infer_types_invalid_address_still_returns_structured_result():
     result = infer_types(get_unmapped_address())
     assert_is_list(result, min_length=1)
     entry = result[0]
-    assert entry["confidence"] in {"high", "low", "none"}
+    assert entry["confidence"] in {"high", "medium", "low", "none"}
     assert "addr" in entry
 
 
@@ -497,7 +492,7 @@ def test_infer_types_invalid_text_address_errors_cleanly():
     """infer_types reports parse failures for symbolic garbage addresses."""
     result = infer_types("InvalidAddressName123")
     assert_is_list(result, min_length=1)
-    assert_error(result[0], contains="Failed to parse address")
+    assert_error(result[0], contains="Unknown address or symbol 'InvalidAddressName123'")
 
 
 @test()
@@ -507,3 +502,18 @@ def test_type_query_invalid_kind_lists_allowed():
     assert page["data"] == []
     assert "not_a_kind" in str(page["error"])
     assert "Allowed:" in str(page["error"])
+
+
+@test(binary="crackme03.elf")
+def test_type_query_inferred_reports_type_guess_for_targets():
+    """kind=inferred returns IDA's type guess for an address; function aliases func."""
+    page = type_query({"kind": "inferred", "targets": ["check_pw"]})[0]
+    assert page["error"] is None
+    (row,) = page["data"]
+    assert row["addr"] == "0x11a9" and row["name"] == "check_pw"
+    assert "(" in str(row["type"]), f"expected a function prototype, got {row['type']!r}"
+    assert row["source"] in ("hexrays", "existing") and row["confidence"] == "high"
+    assert "requires targets" in type_query({"kind": "inferred"})[0]["error"]
+    funcs = type_query({"kind": "func", "count": 0})[0]
+    alias = type_query({"kind": "function", "count": 0})[0]
+    assert alias["error"] is None and alias["total"] == funcs["total"]

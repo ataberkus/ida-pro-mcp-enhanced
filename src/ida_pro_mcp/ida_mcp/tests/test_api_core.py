@@ -377,3 +377,54 @@ def test_entity_query_invalid_kind_lists_allowed():
     assert page["data"] == []
     assert "not_a_kind" in str(page["error"])
     assert "Allowed:" in str(page["error"])
+
+
+@test(binary="crackme03.elf")
+def test_entity_query_unknown_sort_by_errors_with_allowed_keys():
+    """Unknown sort_by is an error (not a silent address sort); xref_count needs include_counts."""
+    page = entity_query({"kind": "functions", "sort_by": "bogus"})[0]
+    assert page["data"] == []
+    assert "Unknown sort_by 'bogus'" in page["error"]
+    assert "addr" in page["error"] and "size" in page["error"]
+    page = entity_query({"kind": "functions", "sort_by": "xref_count"})[0]
+    assert "include_counts" in page["error"]
+
+
+@test(binary="crackme03.elf")
+def test_entity_query_include_counts_sorts_by_xref_count():
+    """include_counts adds per-row xref counts and sort_by=xref_count orders by them."""
+    page = entity_query({"kind": "functions", "include_counts": True, "sort_by": "xref_count", "descending": True, "count": 0})[0]
+    assert page["error"] is None
+    counts = [row["xref_count"] for row in page["data"]]
+    assert counts == sorted(counts, reverse=True)
+    by_addr = {row["addr"]: row["xref_count"] for row in page["data"]}
+    assert by_addr[CRACKME_CHECK_PW] >= 1, "main calls check_pw"
+
+
+@test(binary="crackme03.elf")
+def test_entity_query_segments_and_entrypoints():
+    """segments rows carry bounds/perms/class; ELF entrypoints have no fake ordinals."""
+    segments = {row["name"]: row for row in entity_query({"kind": "segments", "count": 0})[0]["data"]}
+    text = segments[".text"]
+    assert int(text["start"], 16) <= int(CRACKME_MAIN, 16) < int(text["end"], 16)
+    assert int(text["size"], 16) == int(text["end"], 16) - int(text["start"], 16)
+    assert "x" in text["perms"]
+    assert text["class"] == "CODE"
+    entries = entity_query({"kind": "entrypoints", "count": 0})[0]
+    assert entries["error"] is None and entries["data"]
+    assert all("ordinal" not in row for row in entries["data"])
+
+
+@test(binary="crackme03.elf")
+def test_entity_query_locals_lists_function_variables():
+    """locals lists the target function's variables and requires targets."""
+    page = entity_query({"kind": "locals", "targets": ["check_pw"], "count": 0})[0]
+    assert page["error"] is None
+    rows = page["data"]
+    assert rows and all(row["func"] == "check_pw" and row["addr"] == CRACKME_CHECK_PW for row in rows)
+    if "is_arg" in rows[0]:  # Hex-Rays available: check_pw(password, ...) has arguments
+        assert any(row["is_arg"] for row in rows)
+    missing = entity_query({"kind": "locals"})[0]
+    assert "requires targets" in missing["error"]
+    typo = entity_query({"kind": "locals", "targets": ["chek_pw"]})[0]
+    assert "did you mean" in typo["error"] and "check_pw" in typo["error"]

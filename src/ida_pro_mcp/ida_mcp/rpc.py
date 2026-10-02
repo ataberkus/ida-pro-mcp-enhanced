@@ -5,6 +5,7 @@ from typing import Any, Optional
 from ida_pro_mcp.vnext.audit import AuditLog
 from ida_pro_mcp.vnext.auth import WorkspacePolicy
 from ida_pro_mcp.vnext.contracts import SafetyScope, VNextError
+from ida_pro_mcp.vnext.guide import TOOL_GUIDE
 from ida_pro_mcp.vnext.policy import ToolPolicyRegistry, register_builtin_policies
 from .zeromcp import (
     McpRpcRegistry,
@@ -20,6 +21,7 @@ MCP_EXTENSIONS: dict[str, set[str]] = {}  # group -> set of function names
 # Quick profiles and --api-profile canonical can still hide them.
 LEGACY_TOOLS_ENABLED = True
 MCP_SERVER = McpServer("ida-pro-mcp", extensions=MCP_EXTENSIONS)
+MCP_SERVER.instructions = TOOL_GUIDE
 MCP_POLICY = ToolPolicyRegistry()
 register_builtin_policies(MCP_POLICY)
 MCP_UNSAFE.update(
@@ -158,40 +160,79 @@ def _generate_output_id() -> str:
 
 
 OUTPUT_LIMIT_PREVIEW_ITEMS = 10
-OUTPUT_LIMIT_PREVIEW_STR_LEN = 1000
+# Large enough to keep a page of pseudocode readable; shrunk further if the
+# preview would still exceed OUTPUT_LIMIT_MAX_CHARS.
+OUTPUT_LIMIT_PREVIEW_STR_LEN = 8000
+# Supervised idalib workers listen on a private port the agent cannot reach, so
+# the download URL would be a dead end there.
+OUTPUT_DOWNLOADS_ENABLED = os.environ.get("IDA_MCP_SUPERVISED") != "1"
+TRUNCATION_HINT = (
+    "Narrow the request: use limit/offset/next_cursor, decompile "
+    "line_offset/line_limit, or fields projection."
+)
 
 
-def _truncate_value(value: Any, depth: int = 0) -> Any:
+def _truncate_value(value: Any, depth: int = 0, str_len: int = OUTPUT_LIMIT_PREVIEW_STR_LEN) -> Any:
     if depth > 5:
         return value
 
-    if isinstance(value, str) and len(value) > OUTPUT_LIMIT_PREVIEW_STR_LEN:
-        return value[:OUTPUT_LIMIT_PREVIEW_STR_LEN] + f"... [{len(value)} chars total]"
+    if isinstance(value, str) and len(value) > str_len:
+        return value[:str_len] + f"... [{len(value)} chars total]"
 
     if isinstance(value, list):
         # IMPORTANT: Do not inject sentinel objects like {"_truncated": "..."} into lists.
         # Many tool schemas constrain list item shapes (additionalProperties: false),
         # so sentinels can break structured output validation. Truncation is reported
-        # via _meta.ida_mcp and the download_hint content.
+        # via _meta.ida_mcp and the truncation notice content block.
         return [
-            _truncate_value(item, depth + 1)
+            _truncate_value(item, depth + 1, str_len)
             for item in value[:OUTPUT_LIMIT_PREVIEW_ITEMS]
         ]
 
     if isinstance(value, dict):
-        return {k: _truncate_value(v, depth + 1) for k, v in value.items()}
+        return {k: _truncate_value(v, depth + 1, str_len) for k, v in value.items()}
 
     return value
 
 
-def _build_download_meta(output_id: str, total_chars: int) -> dict:
-    download_url = f"{get_download_base_url()}/output/{output_id}.json"
-    return {
+def limit_output(response: dict) -> dict:
+    """Replace an oversized tools/call result with a preview plus a paging notice."""
+    structured = response.get("structuredContent")
+    if response.get("isError") or structured is None:
+        return response
+    total_chars = len(json.dumps(structured))
+    if total_chars <= OUTPUT_LIMIT_MAX_CHARS:
+        return response
+
+    for str_len in (OUTPUT_LIMIT_PREVIEW_STR_LEN, 2000, 500):
+        preview = _truncate_value(structured, str_len=str_len)
+        preview_text = json.dumps(preview, separators=(",", ":"))
+        if len(preview_text) <= OUTPUT_LIMIT_MAX_CHARS:
+            break
+
+    notice = f"Output truncated ({total_chars} chars). {TRUNCATION_HINT}"
+    meta: dict[str, Any] = {
         "output_truncated": True,
         "total_chars": total_chars,
-        "output_id": output_id,
-        "download_url": download_url,
-        "download_hint": f"Output truncated. Run: curl -o .ida-mcp/{output_id}.json {download_url}",
+        "hint": TRUNCATION_HINT,
+    }
+    if OUTPUT_DOWNLOADS_ENABLED:
+        output_id = _generate_output_id()
+        _cache_output(output_id, structured)
+        meta["output_id"] = output_id
+        meta["download_url"] = f"{get_download_base_url()}/output/{output_id}.json"
+        notice += f" Full JSON (HTTP GET): {meta['download_url']}"
+
+    meta_root = dict(response.get("_meta") or {})
+    meta_root["ida_mcp"] = {**(meta_root.get("ida_mcp") or {}), **meta}
+    return {
+        "structuredContent": preview,
+        "content": [
+            {"type": "text", "text": notice},
+            {"type": "text", "text": preview_text},
+        ],
+        "isError": False,
+        "_meta": meta_root,
     }
 
 
@@ -237,37 +278,7 @@ def _install_tools_call_patch() -> None:
                 "removal": "next-major",
             }
 
-        if response.get("isError"):
-            return response
-
-        structured = response.get("structuredContent")
-        if structured is None:
-            return response
-
-        serialized = json.dumps(structured)
-        if len(serialized) <= OUTPUT_LIMIT_MAX_CHARS:
-            return response
-
-        output_id = _generate_output_id()
-        _cache_output(output_id, structured)
-
-        preview = _truncate_value(structured)
-        download_meta = _build_download_meta(output_id, len(serialized))
-
-        content = [{
-            "type": "text",
-            "text": json.dumps(preview, separators=(",", ":")),
-        }, {
-            "type": "text",
-            "text": download_meta["download_hint"],
-        }]
-
-        return {
-            "structuredContent": preview,
-            "content": content,
-            "isError": False,
-            "_meta": {"ida_mcp": download_meta},
-        }
+        return limit_output(response)
 
     MCP_SERVER.registry.methods["tools/call"] = patched
 

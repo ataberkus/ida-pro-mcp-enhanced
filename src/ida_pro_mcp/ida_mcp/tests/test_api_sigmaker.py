@@ -21,6 +21,8 @@ from ..framework import (
 from ..api_sigmaker import make_signature, make_signature_for_function
 from ..api_analysis import find_bytes
 
+CRACKME_CHECK_PW = "0x11a9"
+
 
 # ============================================================================
 # make_signature
@@ -184,6 +186,28 @@ def test_make_signature_for_function_batch_mixed_input():
 
     # Both should resolve to different addresses (different functions)
     assert result[0]["addr"] != result[1]["addr"]
+
+
+@test(binary="crackme03.elf")
+def test_signature_create_anchor_address_signs_mid_function():
+    """signature_create(anchor="address") signs the exact mid-function instruction; the default anchors to the function start."""
+    import ida_bytes
+    import ida_funcs
+
+    from ..api_vnext import signature_create
+
+    func = ida_funcs.get_func(int(CRACKME_CHECK_PW, 16))
+    mid = ida_bytes.next_head(ida_bytes.next_head(func.start_ea, func.end_ea), func.end_ea)
+    exact = signature_create([hex(mid)], anchor="address")["data"][0]
+    assert exact["addr"] == hex(mid), exact
+    assert exact["unique"] is True
+    scan = find_bytes(exact["signature"])
+    assert scan[0]["n"] == 1 and scan[0]["matches"][0] == hex(mid), scan
+
+    anchored = signature_create([hex(mid)])["data"][0]
+    assert anchored["addr"] == hex(func.start_ea), anchored
+    assert anchored["signature"] != exact["signature"]
+
 
 
 # ============================================================================

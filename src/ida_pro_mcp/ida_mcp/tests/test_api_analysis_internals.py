@@ -1,10 +1,10 @@
 """Targeted tests for deeper internal helpers in api_analysis.py."""
 
-from ..framework import test, assert_non_empty
+from ..framework import test
 from ..api_analysis import (
     _resolve_insn_scan_ranges,
     _scan_insn_ranges,
-    _value_candidates_for_immediate,
+    _immediate_forms,
 )
 
 
@@ -93,9 +93,8 @@ def test_internal_scan_insn_ranges_match_offset_and_truncation():
 
 
 @test(binary="typed_fixture.elf")
-def test_internal_immediate_encoding_helpers():
-    """Immediate-value candidates cover 32/64-bit encodings."""
-    candidates = _value_candidates_for_immediate(1234)
-    assert_non_empty(candidates)
-    assert any(item[0] == 1234 and item[1] == 4 for item in candidates)
-    assert any(item[0] == 1234 and item[1] == 8 for item in candidates)
+def test_internal_immediate_forms_cover_sign_extension():
+    """imm32 constants with the high bit set also match IDA's sign-extended 64-bit operand value."""
+    assert _immediate_forms(0x9E3779B9) == {0x9E3779B9, 0xFFFFFFFF9E3779B9}
+    assert _immediate_forms(-1) == {0xFFFFFFFFFFFFFFFF, 0xFFFFFFFF}
+    assert _immediate_forms(6) == {6}

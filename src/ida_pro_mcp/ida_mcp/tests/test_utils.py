@@ -4,10 +4,10 @@ from ..framework import test
 from ..sync import IDAError
 from ..utils import (
     parse_address,
+    display_name,
     normalize_list_input,
     normalize_dict_list,
     clamp_int,
-    resolve_address_or_name,
     get_function,
     get_prototype,
     get_type_by_name,
@@ -30,9 +30,7 @@ def test_utils_parse_address_and_detection():
     """Address parsing helpers accept canonical inputs and reject malformed ones."""
     assert parse_address("0x123e") == 0x123E
     assert parse_address(0x123E) == 0x123E
-    assert resolve_address_or_name("main") == 0x123E
     assert parse_address("main") == 0x123E, "parse_address should resolve IDA symbol names"
-    assert resolve_address_or_name("0x123e") == 0x123E
     for bad, fragment in [
         (True, "bool"),
         (-1, "negative"),
@@ -49,7 +47,7 @@ def test_utils_parse_address_and_detection():
         parse_address("xyz")
         assert False, "expected parse_address to fail"
     except IDAError as e:
-        assert "Failed to parse address" in str(e)
+        assert "Unknown address or symbol 'xyz'" in str(e)
     try:
         parse_address("")
         assert False, "expected empty address to fail"
@@ -60,6 +58,33 @@ def test_utils_parse_address_and_detection():
         assert False, "expected None address to fail"
     except IDAError as e:
         assert "empty address" in str(e)
+
+
+@test(binary="crackme03.elf")
+def test_utils_parse_address_expression_forms():
+    """parse_address accepts name+offset, segment:addr, bare hex and IDA listing forms."""
+    assert parse_address("main+0x10") == 0x124E
+    assert parse_address("main + 16") == 0x124E
+    assert parse_address("check_pw-0x9") == 0x11A0
+    assert parse_address(".text:123e") == 0x123E
+    assert parse_address("123e") == 0x123E
+    assert parse_address("000000000000123E") == 0x123E
+    assert parse_address("123eh") == 0x123E
+    assert parse_address("4670") == 4670, "pure digits stay decimal"
+    assert display_name(0x123E) == "main"
+
+
+@test(binary="crackme03.elf")
+def test_utils_parse_address_suggests_close_symbols():
+    """Unknown symbols raise with did-you-mean candidates."""
+    try:
+        parse_address("chek_pw")
+    except IDAError as e:
+        message = str(e)
+        assert message.startswith("Unknown address or symbol 'chek_pw'")
+        assert "did you mean" in message and "check_pw" in message
+    else:
+        raise AssertionError("chek_pw must not resolve")
 
 
 @test(binary="crackme03.elf")

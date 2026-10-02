@@ -281,7 +281,63 @@ def test_put_int_invalid_address():
 
 @test()
 def test_get_global_value_not_found():
-    """get_global_value reports unknown names as not found."""
+    """get_global_value reports unknown names with the resolver error."""
     result = get_global_value("definitely_not_a_global_symbol")
     assert_is_list(result, min_length=1)
-    assert_error(result[0], contains="Not found")
+    assert_error(result[0], contains="Unknown address or symbol 'definitely_not_a_global_symbol'")
+
+
+@test(binary="crackme03.elf")
+def test_memory_read_bytes_compact_hex_and_item_size_default():
+    """memory_read bytes returns compact hex; a bare address reads the whole item."""
+    import ida_bytes
+    import idaapi
+
+    from ..api_vnext import memory_read
+
+    (row,) = memory_read("bytes", ["format"])["data"]
+    assert row["size"] == ida_bytes.get_item_size(int(CRACKME_FORMAT, 16))
+    assert bytes.fromhex(row["hex"]).startswith(b"Yes, %s is correct!")
+    (row,) = memory_read("bytes", [{"addr": "main+0x10", "size": 4}])["data"]
+    assert row == {"addr": "main+0x10", "size": 4, "hex": idaapi.get_bytes(0x124E, 4).hex()}
+
+
+@test(binary="crackme03.elf")
+def test_memory_read_integer_shorthand_and_item_size_type():
+    """integer accepts 'addr:ty' and bare addresses (ty from the item size)."""
+    from ..api_vnext import memory_read
+
+    expected = get_int({"addr": CRACKME_DSO_HANDLE, "ty": "u64"})[0]
+    short, bare = memory_read("integer", [f"{CRACKME_DSO_HANDLE}:u64", CRACKME_DSO_HANDLE])["data"]
+    assert (short["ty"], short["value"]) == (expected["ty"], expected["value"]), short
+    assert (bare["ty"], bare["value"]) == (expected["ty"], expected["value"]), bare
+
+
+@test(binary="crackme03.elf")
+def test_memory_read_patch_diff_reports_function_of_patched_code():
+    """patch_diff ranges name the containing function and disappear after restore."""
+    from ..api_vnext import memory_read
+
+    probe = "0x1242"  # inside main
+    original = _plain_hex_bytes(get_bytes({"addr": probe, "size": 1})[0]["data"])
+    replacement = "cc" if original != "cc" else "90"
+    try:
+        assert patch({"addr": probe, "data": replacement})[0]["ok"] is True
+        rows = [r for r in memory_read("patch_diff")["data"] if r["addr"] == probe]
+        assert rows == [
+            {**rows[0], "size": 1, "original_hex": original, "patched_hex": replacement, "function": "main"}
+        ], rows
+    finally:
+        patch({"addr": probe, "data": original})
+    assert all(r["addr"] != probe for r in memory_read("patch_diff")["data"])
+
+
+@test(binary="typed_fixture.elf")
+def test_memory_read_struct_returns_typed_fields():
+    """memory_read struct reads named member values for a struct at an address."""
+    from ..api_vnext import memory_read
+
+    (row,) = memory_read("struct", [{"addr": "g_wrapper", "struct": "Wrapper"}])["data"]
+    members = {m["name"]: m for m in row["members"]}
+    assert members["pt"]["type"] == "Point"
+    assert "1122334455667788" in members["magic"]["value"]

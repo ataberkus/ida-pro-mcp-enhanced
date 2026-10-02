@@ -11,7 +11,7 @@ import ida_funcs
 
 from .rpc import tool
 from .sync import idasync
-from .utils import normalize_list_input, resolve_address_or_name
+from .utils import normalize_list_input, parse_address
 
 from . import _sigmaker as _sm
 
@@ -97,7 +97,7 @@ def _make_signatures(
     for addr_str in normalize_list_input(addrs):
         ea = None
         try:
-            ea = resolve_address_or_name(addr_str)
+            ea = parse_address(addr_str)
             extra = name_key
             if anchor == "function":
                 func = ida_funcs.get_func(ea)

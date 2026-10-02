@@ -54,6 +54,7 @@ class SetOpTypeOp(TypedDict, total=False):
     struct: NotRequired[str]
     delta: NotRequired[int]
     target_addr: NotRequired[str]
+    enum: NotRequired[str]
 
 
 class SetOpTypeResult(TypedDict, total=False):
@@ -171,9 +172,13 @@ def _append_comment(ea: int, comment: str, item: dict) -> dict:
     new_comment, skipped = _append_comment_text(current, comment, dedupe=dedupe)
     if skipped:
         return {"ok": True, "scope": "line", "skipped": True}
-    if not idaapi.set_cmt(ea, new_comment, False):
-        return {"error": f"Failed to set disassembly comment at {hex(ea)}"}
-    return {"ok": True, "scope": "line", "appended": True}
+    if fn is not None and fn.start_ea != ea:
+        result = _set_comment(ea, new_comment, item)  # also mirrors into pseudocode
+    elif idaapi.set_cmt(ea, new_comment, False):
+        result = {"ok": True}
+    else:
+        result = {"error": f"Failed to set disassembly comment at {hex(ea)}"}
+    return result if "error" in result else {**result, "scope": "line", "appended": True}
 
 
 @tool
@@ -194,7 +199,7 @@ def append_comments(items: list[CommentAppendOp] | CommentAppendOp):
     """Prefer mutation_preview(kind="append_comment", ...).
     WHEN: append a comment line at addresses directly (UNSAFE; dedupes exact text; preview stages it).
     RETURNS: [{addr, ok, scope(func|line), appended?, skipped?, error}] per item.
-    LIMITS: scope auto|func|line (bad scope is an error entry); dedupe skips exact-text repeats."""
+    LIMITS: scope auto|func|line (bad scope is an error entry); dedupe skips exact-text repeats; line comments inside a function are mirrored into pseudocode."""
     return _comment_batch(items, append=True)
 
 
@@ -720,9 +725,9 @@ def rename(batch: RenameBatch | dict) -> dict:
 @unsafe
 def define_func(items: list[DefineOp] | DefineOp) -> list[dict]:
     """Prefer mutation_preview(kind="define_function", ...).
-    WHEN: define a function at addr directly (UNSAFE; IDA infers bounds unless end given; preview stages it).
+    WHEN: define a function at addr, or resize an existing one by passing end (UNSAFE; IDA infers bounds unless end given; preview stages it).
     RETURNS: [{addr, start, end?, ok, error}] per item.
-    LIMITS: existing function at addr returns an error entry; add_func failure reports "define_func failed"."""
+    LIMITS: existing function at addr without end returns an error entry; add_func/set_func_end failure reports "define_func failed"."""
     if isinstance(items, dict):
         items = [items]
 
@@ -735,19 +740,20 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[dict]:
             start_ea = parse_address(addr_str)
             end_ea = parse_address(end_str) if end_str else idaapi.BADADDR
 
-            # Check if already a function
             existing = ida_funcs.get_func(start_ea)
             if existing and existing.start_ea == start_ea:
-                results.append(
-                    {
-                        "addr": addr_str,
-                        "start": hex(start_ea),
-                        "error": "Function already exists at this address",
-                    }
-                )
-                continue
-
-            success = ida_funcs.add_func(start_ea, end_ea)
+                if end_ea == idaapi.BADADDR:
+                    results.append(
+                        {
+                            "addr": addr_str,
+                            "start": hex(start_ea),
+                            "error": "Function already exists at this address; pass end to resize it",
+                        }
+                    )
+                    continue
+                success = ida_funcs.set_func_end(start_ea, end_ea)
+            else:
+                success = ida_funcs.add_func(start_ea, end_ea)
             if success:
                 func = ida_funcs.get_func(start_ea)
                 results.append(
@@ -926,7 +932,7 @@ def set_op_type(
     """Prefer mutation_preview(kind="set_operand_type", ...).
     WHEN: retype an instruction operand directly (UNSAFE; GUI Y/O/# equivalent; preview stages it).
     RETURNS: [{addr, op_n, kind, ok, error}] per item.
-    LIMITS: kind stroff|offset|stkvar|hex|dec|char|binary|octal; stroff needs struct, bad kind is an error entry."""
+    LIMITS: kind stroff|offset|stkvar|enum|hex|dec|char|binary|octal; stroff needs struct, enum needs enum (existing enum name), bad kind is an error entry."""
     if isinstance(items, dict):
         items = [items]
 
@@ -972,13 +978,22 @@ def set_op_type(
                     ok = bool(idc.op_plain_offset(ea, op_n, 0))
             elif kind == "stkvar":
                 ok = bool(idc.op_stkvar(ea, op_n))
+            elif kind == "enum":
+                enum_name = str(item.get("enum", "")).strip()
+                enum_id = idc.get_enum(enum_name) if enum_name else idc.BADADDR
+                if not enum_name:
+                    err = "enum name required for kind='enum'"
+                elif enum_id == idc.BADADDR:
+                    err = f"enum not found: {enum_name}"
+                else:
+                    ok = bool(ida_bytes.op_enum(ea, op_n, enum_id, 0))
             elif kind in _OP_FORMAT_FLAGS:
                 flag = _OP_FORMAT_FLAGS[kind]
                 ok = bool(ida_bytes.set_op_type(ea, flag, op_n))
             else:
                 err = (
                     f"unknown kind: {kind!r} "
-                    "(expected stroff/offset/stkvar/hex/dec/char/binary/octal)"
+                    "(expected stroff/offset/stkvar/enum/hex/dec/char/binary/octal)"
                 )
         except Exception as e:
             err = str(e)

@@ -32,6 +32,8 @@ import idaapi
 import idautils
 import idc
 
+from ida_pro_mcp.vnext import symbols
+
 from . import compat
 from .sync import IDAError
 
@@ -182,8 +184,8 @@ class EntityQuery(TypedDict, total=False):
     """Generic IDB entity query with filtering, projection, and pagination"""
 
     kind: Annotated[
-        Literal["functions", "globals", "imports", "strings", "names", "switches", "patches", "classes", "vtables", "signatures", "type_libraries"],
-        "Entity kind: functions|globals|imports|strings|names|switches|patches|classes|vtables|signatures|type_libraries",
+        Literal["functions", "globals", "imports", "strings", "names", "segments", "entrypoints", "locals", "switches", "patches", "classes", "vtables", "signatures", "type_libraries"],
+        "Entity kind",
     ]
     filter: Annotated[str, "Optional glob/regex filter (name/text depending on kind)"]
     regex: Annotated[str, "Optional regex applied to the primary text field"]
@@ -193,8 +195,9 @@ class EntityQuery(TypedDict, total=False):
     module: Annotated[str, "Optional import module filter (imports only)"]
     offset: Annotated[int, "Starting index (default: 0)"]
     count: Annotated[int, "Maximum number of results (default: 100, 0 for all)"]
-    sort_by: Annotated[str, "Sort key, e.g. addr|name|size|length"]
+    sort_by: Annotated[str, "Sort key: addr or any row field (name|size|length|...); xref_count needs include_counts"]
     descending: Annotated[bool, "Sort descending (default: false)"]
+    include_counts: Annotated[bool, "Add xref_count per row (non-flow xrefs to addr, capped); enables sort_by=xref_count"]
     fields: Annotated[
         list[str] | str,
         "Optional projection list; only selected fields are returned",
@@ -204,7 +207,7 @@ class EntityQuery(TypedDict, total=False):
     ]
     targets: Annotated[
         NotRequired[list[str]],
-        "Optional switch-target scope: function names/addresses (switches only)",
+        "Function names/addresses: required for locals, optional scope for switches",
     ]
 
 
@@ -249,6 +252,8 @@ class AnalyzeBatchQuery(TypedDict, total=False):
     max_strings: Annotated[int, "Maximum string refs returned (default: 100)"]
     max_constants: Annotated[int, "Maximum constants returned (default: 200)"]
     max_blocks: Annotated[int, "Maximum basic blocks returned (default: 500)"]
+    max_decompile_lines: Annotated[int, "Keep header + this many statement lines of pseudocode (default: 0 = full)"]
+    include_declarations: Annotated[bool, "Keep the local-variable declaration block in the excerpt (default: false)"]
 
 
 class ImportQuery(TypedDict, total=False):
@@ -273,9 +278,10 @@ class TypeQuery(TypedDict, total=False):
 
     filter: Annotated[str, "Optional type name glob/regex filter"]
     kind: Annotated[
-        Literal["any", "struct", "union", "enum", "typedef", "func", "ptr", "udt"],
-        "any|struct|union|enum|typedef|func|ptr|udt (default: any)",
+        Literal["any", "struct", "union", "enum", "typedef", "func", "ptr", "udt", "inferred"],
+        "Catalog kind any|struct|union|enum|typedef|func|ptr|udt (default: any), or inferred = IDA's type guess for targets",
     ]
+    targets: Annotated[list[str], "Addresses/names for kind=inferred"]
     offset: Annotated[int, "Starting index (default: 0)"]
     count: Annotated[int, "Maximum results (default: 100, 0 for all)"]
     sort_by: Annotated[str, "Sort key: name|size|ordinal (default: name)"]
@@ -304,6 +310,10 @@ class InsnPattern(TypedDict, total=False):
     op1: Annotated[int, "Value to match in second operand"]
     op2: Annotated[int, "Value to match in third operand"]
     op_any: Annotated[int, "Value to match in any operand"]
+    op0_text: Annotated[str, "Case-insensitive substring of the first operand's text"]
+    op1_text: Annotated[str, "Case-insensitive substring of the second operand's text"]
+    op2_text: Annotated[str, "Case-insensitive substring of the third operand's text"]
+    op_any_text: Annotated[str, "Case-insensitive substring of any operand's text"]
     func: Annotated[str, "Function address to scope the scan"]
     segment: Annotated[str, "Segment name to scope the scan"]
     start: Annotated[str, "Start address (hex/dec) to scope the scan"]
@@ -565,32 +575,135 @@ def get_image_size() -> int:
     return image_size
 
 
+def _check_int_address(addr: int) -> int:
+    if addr < 0:
+        raise IDAError(f"Failed to parse address: negative address {addr!r}")
+    if addr > 0xFFFFFFFFFFFFFFFF:
+        raise IDAError(f"Failed to parse address: out of range {addr!r}")
+    return addr
+
+
+def _demangle(raw: str) -> str:
+    try:
+        out = ida_name.demangle_name(raw, 0)
+    except Exception:
+        return ""
+    return out if isinstance(out, str) else ""
+
+
+def pretty_name(raw: str) -> str:
+    """display_name() for a raw (possibly mangled) symbol string."""
+    demangled = _demangle(raw)
+    return symbols.pretty_symbol(demangled) if demangled else raw
+
+
+def display_name(ea: int) -> str:
+    """Agent-facing symbol name: demangled + qualified, no params/return type, long templates collapsed."""
+    raw = ida_name.get_name(ea) or ""
+    if raw:
+        return pretty_name(raw)
+    func = ida_funcs.get_func(ea)
+    if func is not None and func.start_ea == ea:
+        return f"sub_{ea:X}"
+    return hex(ea)
+
+
+# display name / unqualified tail -> eas; rebuilt lazily when the name list changes.
+_NAME_INDEX: dict[str, Any] = {"key": None}
+
+
+def invalidate_name_index() -> None:
+    _NAME_INDEX["key"] = None
+
+
+def _name_index() -> dict[str, Any]:
+    key = (ida_name.get_nlist_size(), ida_nalt.get_root_filename())
+    if _NAME_INDEX["key"] == key:
+        return _NAME_INDEX
+    full: dict[str, list[int]] = {}
+    tail: dict[str, list[int]] = {}
+    pool: list[str] = []
+    # ponytail: demangles every public name once per rename; cache per-name if huge IDBs stall here
+    for ea, raw in idautils.Names():
+        pool.append(raw)
+        demangled = _demangle(raw)
+        if not demangled:
+            continue
+        stripped = symbols.strip_signature(demangled)
+        pretty = symbols.collapse_templates(stripped)
+        for form in {stripped, pretty}:
+            full.setdefault(form, []).append(ea)
+        tail.setdefault(symbols.unqualified(stripped), []).append(ea)
+        if pretty != raw:
+            pool.append(pretty)
+    _NAME_INDEX.update(key=key, full=full, tail=tail, pool=pool)
+    return _NAME_INDEX
+
+
+def _lookup_symbol(text: str) -> int | None:
+    """Exact IDA name, import aliases, then demangled display names (ambiguous -> IDAError)."""
+    for name in (text, "__imp_" + text, "." + text):
+        try:
+            ea = idaapi.get_name_ea(idaapi.BADADDR, name)
+        except Exception:
+            ea = idaapi.BADADDR
+        if ea != idaapi.BADADDR:
+            return int(ea)
+    index = _name_index()
+    for table in (index["full"], index["tail"]):
+        eas = sorted(set(table.get(text, ())))
+        if len(eas) == 1:
+            return eas[0]
+        if eas:
+            listed = ", ".join(f"{ea:#x} ({ida_name.get_name(ea)})" for ea in eas[:5])
+            raise IDAError(f"Ambiguous symbol '{text}' matches {len(eas)} addresses: {listed}")
+    return None
+
+
 def parse_address(addr: str | int) -> int:
+    """Resolve any address form to an ea.
+
+    Accepts ints, 0x-hex, decimal, bare hex containing a-f (or IDA-style `401000h`),
+    IDA names, `__imp_`/`.` import aliases, demangled display names, `name+0x10`/`name-16`,
+    and `segment:addr` (e.g. `.text:401000`).
+    """
     if addr is None or (isinstance(addr, str) and not addr.strip()):
         raise IDAError("Failed to parse address: empty address")
     if isinstance(addr, bool):
         raise IDAError("Failed to parse address: invalid bool address")
     if isinstance(addr, int):
-        if addr < 0:
-            raise IDAError(f"Failed to parse address: negative address {addr!r}")
-        if addr > 0xFFFFFFFFFFFFFFFF:
-            raise IDAError(f"Failed to parse address: out of range {addr!r}")
-        return addr
+        return _check_int_address(addr)
+    text = str(addr).strip()
     try:
-        return int(addr, 0)
-    except (TypeError, ValueError):
-        text = str(addr)
-        # Tool docs promise "address or name"; resolve IDA symbols before failing.
+        return _check_int_address(int(text, 0))
+    except ValueError:
+        pass
+    if text.isdigit():  # leading-zero listing addresses such as 0000123E
+        return int(text, 16)
+    segment = symbols.parse_segment_expr(text)
+    if segment and ida_segment.get_segm_by_name(segment[0]) is not None:
+        return segment[1]
+    has_hex_letter = any(ch in "abcdefABCDEF" for ch in text)
+    bare_hex = symbols.parse_bare_hex(text)
+    if bare_hex is not None and not has_hex_letter:
+        return bare_hex
+    # IDA names never contain +/-, so offset expressions are tried before the display-name index.
+    offset = symbols.parse_offset_expr(text)
+    if offset:
         try:
-            ea = idaapi.get_name_ea(idaapi.BADADDR, text.strip())
-        except Exception:
-            ea = idaapi.BADADDR
-        if ea != idaapi.BADADDR:
-            return int(ea)
-        for ch in text:
-            if ch not in "0123456789abcdefABCDEF":
-                raise IDAError(f"Failed to parse address: {addr}")
-        raise IDAError(f"Failed to parse address (missing 0x prefix): {addr}")
+            return _check_int_address(parse_address(offset[0]) + offset[1])
+        except IDAError:
+            pass
+    ea = _lookup_symbol(text)
+    if ea is not None:
+        return ea
+    if bare_hex is not None:
+        return bare_hex
+    message = f"Unknown address or symbol '{text}'"
+    suggestions = symbols.close_matches(text, _name_index()["pool"])
+    if suggestions:
+        message += "; did you mean: " + ", ".join(suggestions)
+    raise IDAError(message)
 
 
 def normalize_list_input(value: list | str) -> list:
@@ -670,22 +783,6 @@ def clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
     if i > maximum:
         return maximum
     return i
-
-
-def resolve_address_or_name(addr: str | int) -> int:
-    """Resolve an int, hex string, or IDA symbol name to an ea."""
-    import idaapi
-
-    if isinstance(addr, int) and not isinstance(addr, bool):
-        return parse_address(addr)
-    s = str(addr)
-    if s.startswith("0x") or s.startswith("0X"):
-        return parse_address(s)
-    for name in (s, "__imp_" + s):  # PE imports are named __imp_<api>
-        ea = idaapi.get_name_ea(idaapi.BADADDR, name)
-        if ea != idaapi.BADADDR:
-            return int(ea)
-    return parse_address(s)
 
 
 def hash_input_file(path: str, *, chunk_size: int = 1 << 20) -> dict:

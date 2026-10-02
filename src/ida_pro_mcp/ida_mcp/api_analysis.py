@@ -1,5 +1,5 @@
 from itertools import islice
-import struct
+import re
 import traceback
 from typing import Annotated, Optional
 import ida_funcs
@@ -9,7 +9,6 @@ import ida_typeinf
 import ida_nalt
 import ida_bytes
 import ida_idaapi
-import ida_xref
 import ida_ua
 from .rpc import tool
 from .sync import (
@@ -22,6 +21,7 @@ from .sync import (
 )
 from .utils import (
     clamp_int,
+    display_name,
     parse_address,
     normalize_list_input,
     normalize_dict_list,
@@ -44,7 +44,6 @@ from .utils import (
     extract_function_constants,
     Argument,
     DisassemblyFunction,
-    Xref,
     BasicBlock,
     StructFieldQuery,
     XrefQuery,
@@ -59,7 +58,6 @@ from . import compat
 # Instruction Helpers
 # ============================================================================
 
-_IMM_SCAN_BACK_MAX = 15
 _BIN_SEARCH_FLAGS = ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW
 
 
@@ -86,60 +84,37 @@ def _insn_mnem(insn: ida_ua.insn_t) -> str:
         return ""
 
 
-def _value_candidates_for_immediate(value: int) -> list[tuple[int, int, bytes]]:
-    candidates: list[tuple[int, int, bytes]] = []
-
-    def add(size: int, signed_val: int):
-        if size == 4:
-            masked = signed_val & 0xFFFFFFFF
-            if not (-0x80000000 <= signed_val <= 0xFFFFFFFF):
-                return
-            b = struct.pack("<I", masked)
-        else:
-            masked = signed_val & 0xFFFFFFFFFFFFFFFF
-            if not (-0x8000000000000000 <= signed_val <= 0x7FFFFFFFFFFFFFFF):
-                return
-            b = struct.pack("<Q", masked)
-        candidates.append((masked, size, b))
-
-    add(4, value)
-    add(8, value)
-    return candidates
+def _immediate_forms(value: int) -> set[int]:
+    """Operand values IDA may store for *value* (imm32 operands are sign-extended to 64 bits)."""
+    if not -0x8000000000000000 <= value <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("Immediate out of range")
+    forms = {value & 0xFFFFFFFFFFFFFFFF}
+    if 0x80000000 <= value <= 0xFFFFFFFF:
+        forms.add(value | 0xFFFFFFFF00000000)
+    if value < 0 and value >= -0x80000000:
+        forms.add(value & 0xFFFFFFFF)
+    return forms
 
 
-def _resolve_immediate_insn_start(
-    match_ea: int,
-    value: int,
-    seg_start: int,
-    alt_value: int | None = None,
-) -> int | None:
-    start_min = max(seg_start, match_ea - _IMM_SCAN_BACK_MAX)
-    for start in range(match_ea, start_min - 1, -1):
-        insn = _decode_insn_at(start)
-        if insn is None:
-            continue
-        end_ea = start + insn.size
-        if not (start <= match_ea < end_ea):
-            continue
-        for i in range(8):
-            op_type = insn.ops[i].type
-            if op_type == ida_ua.o_void:
+def _immediate_sites(value: int, offset: int, limit: int) -> tuple[list[int], bool]:
+    """Code heads with an operand equal to *value*, any operand width (caller holds the main thread)."""
+    import ida_search
+
+    wanted = offset + limit + 1
+    flags = ida_search.SEARCH_DOWN | ida_search.SEARCH_NEXT
+    found: set[int] = set()
+    for form in _immediate_forms(value):
+        ea, hits = compat.inf_get_min_ea(), 0
+        while hits < wanted:
+            result = ida_search.find_imm(ea, flags, form)
+            ea = result[0] if isinstance(result, tuple) else result
+            if ea == idaapi.BADADDR:
                 break
-            if op_type != ida_ua.o_imm:
-                continue
-            op_val = _operand_value(insn, i)
-            if op_val is None:
-                continue
-            # IDA sign-extends imm32 operands to 64 bits (`cmp dword [x], 9E3779B9h` -> 0xffffffff9e3779b9).
-            width = ida_ua.get_dtype_size(insn.ops[i].dtype)
-            mask = (1 << (8 * width)) - 1 if width in (1, 2, 4) else 0xFFFFFFFFFFFFFFFF
-            wanted = {v & mask for v in (value, alt_value) if v is not None and -(mask >> 1) - 1 <= v <= mask}
-            if op_val & mask in wanted:
-                offb = getattr(insn.ops[i], "offb", 0)
-                if offb and start + offb != match_ea:
-                    continue
-                return start
-    return None
+            if ida_bytes.is_code(ida_bytes.get_flags(ea)) and ea not in found:
+                found.add(ea)
+                hits += 1
+    ordered = sorted(found)
+    return ordered[offset : offset + limit], len(ordered) > offset + limit
 
 
 def _parse_optional_int(value: object, field: str) -> int | None:
@@ -160,16 +135,16 @@ def _parse_optional_int(value: object, field: str) -> int | None:
 
 
 def _resolve_function_start(query: object) -> tuple[int | None, str | None]:
-    from .utils import resolve_address_or_name
+    from .utils import parse_address
 
     q = str(query or "").strip()
     if not q:
         return None, "Function query is required"
 
     try:
-        ea = resolve_address_or_name(q)
-    except IDAError:
-        return None, f"Failed to resolve function: {q}"
+        ea = parse_address(q)
+    except IDAError as exc:
+        return None, f"Failed to resolve function: {exc}"
 
     func = ida_funcs.get_func(ea)
     if not func:
@@ -189,6 +164,11 @@ def _capped(name: str, count_key: str, items: list, limit: int) -> dict:
     """List section: first *limit* items, total count, truncation flag."""
     limited, truncated = _limit_items(items, limit)
     return {name: limited, count_key: len(items), f"{name}_truncated": truncated}
+
+
+def _display_rows(rows: list[dict]) -> list[dict]:
+    """{addr, name} rows with agent-friendly (demangled, short) names."""
+    return [{"addr": row["addr"], "name": display_name(int(row["addr"], 16))} for row in rows]
 
 
 def _basic_blocks(
@@ -220,11 +200,11 @@ def _decompile_section(func: ida_funcs.func_t) -> tuple[str | None, str | None, 
     return None, error, failure or None
 
 
-def _xrefs_section(ea: int) -> dict:
-    """Xrefs to/from *ea*, each side capped at 200."""
+def _xrefs_section(ea: int, limit: int = 200) -> dict:
+    """Xrefs to/from *ea*, each side capped at *limit*."""
     xrefs = get_all_xrefs(ea)
-    to_xrefs, to_truncated = _limit_items(xrefs["to"], 200)
-    from_xrefs, from_truncated = _limit_items(xrefs["from"], 200)
+    to_xrefs, to_truncated = _limit_items(xrefs["to"], limit)
+    from_xrefs, from_truncated = _limit_items(xrefs["from"], limit)
     return {
         "to": to_xrefs,
         "from": from_xrefs,
@@ -233,6 +213,56 @@ def _xrefs_section(ea: int) -> dict:
         "to_count": len(xrefs["to"]),
         "from_count": len(xrefs["from"]),
     }
+
+
+_EA_MARKER = re.compile(r"\s*/\*0x[0-9a-fA-F]+\*/$")
+_FUNC_PTR_DECL = re.compile(r"\(\s*(?:__\w+\s*)?\*")
+_STATEMENT_KEYWORDS = ("return", "goto", "break", "continue", "if", "while", "for", "do", "switch")
+
+
+def _is_declaration(line: str) -> bool:
+    if line.strip().startswith("//"):
+        return True  # e.g. Hex-Rays' collapsed-declarations banner
+    text = _EA_MARKER.sub("", line).split("//", 1)[0].strip()
+    if not text.endswith(";") or "=" in text or text.split(" ", 1)[0].rstrip(";") in _STATEMENT_KEYWORDS:
+        return False
+    return "(" not in text or bool(_FUNC_PTR_DECL.search(text))
+
+
+def decompile_view(code: str, include_declarations: bool) -> tuple[list[str], int, int]:
+    """(lines, body_start_line, declaration_count) of rendered pseudocode.
+
+    Hex-Rays prints locals right after the body `{`, then one blank line. Without
+    include_declarations that block (and its blank line) is dropped from the view.
+    body_start_line indexes the first statement line in the returned view."""
+    lines = code.split("\n")
+    brace = next((i for i, line in enumerate(lines) if line.strip() == "{"), None)
+    if brace is None:
+        return lines, 0, 0
+    start = brace + 1
+    end = start
+    while end < len(lines) and lines[end].strip() and _is_declaration(lines[end]):
+        end += 1
+    count = end - start
+    if not count or end >= len(lines) or lines[end].strip():
+        return lines, start, 0  # no "decls + blank line" block
+    if include_declarations:
+        return lines, end + 1, count
+    return lines[:start] + lines[end + 1 :], start, count
+
+
+def decompile_excerpt(code: str, max_body_lines: int, include_declarations: bool) -> dict:
+    """Header + first *max_body_lines* statement lines; next_line_offset continues via decompile()."""
+    view, body_start, declarations = decompile_view(code, include_declarations)
+    end = body_start + max(0, max_body_lines)
+    more = end < len(view)
+    return {
+        "decompiled": "\n".join(view[:end]),
+        "declarations": declarations,
+        "decompile_truncated": more,
+        "next_line_offset": end if more else None,
+    }
+
 
 
 def _profile_function(
@@ -278,23 +308,21 @@ def _profile_function(
 @tool_timeout(90.0)
 def decompile(
     addr: Annotated[str, "Function address or name to decompile"],
+    line_offset: Annotated[int, "First line to return (0-based, in the selected view)"] = 0,
+    line_limit: Annotated[int, "Max lines to return (default 400, max 5000)"] = 400,
+    include_declarations: Annotated[
+        bool, "Keep the local-variable declaration block (default true)"
+    ] = True,
 ) -> dict:
-    """Canonical decompiler (listed in CANONICAL_TOOLS).
-    WHEN: decompile one function to pseudocode with detailed error reporting and disassembly fallback.
-    RETURNS: {addr, function_addr?, function_name?, code?, error?, details?, fallback{tool:"disassemble", addr}?}.
-    LIMITS: non-function addresses return function_not_defined + fallback; Hex-Rays failures include details + diagnostic logs."""
+    """WHEN: read one function as Hex-Rays pseudocode, page by page.
+    RETURNS: {addr, function_addr, function_name, prototype, code, total_lines, body_start_line, declaration_count, next_line_offset|null}; on failure {addr, code:null, error, details?, fallback{tool:"disassemble", addr}?}.
+    LIMITS: line_limit lines per call (max 5000); line_offset/total_lines/body_start_line index the selected view (without declarations when include_declarations=false). A trailing /*0xEA*/ marker maps a line to its instruction address. Non-function addresses and Hex-Rays failures return error + details + disassemble fallback.
+    NEXT: call again with line_offset=next_line_offset (same include_declarations) until null; disassemble/graph_query for addresses from markers."""
     try:
         try:
             start = parse_address(addr)
-        except IDAError:
-            ea = idaapi.get_name_ea(idaapi.BADADDR, addr)
-            if ea == idaapi.BADADDR:
-                return {
-                    "addr": addr,
-                    "code": None,
-                    "error": f"Function not found: {addr!r}",
-                }
-            start = ea
+        except IDAError as exc:
+            return {"addr": addr, "code": None, "error": f"Function not found: {exc}"}
         if compat.IDA_VERSION >= (9, 2, 0):
             function_start = ida_funcs.get_func_start(start)
         else:
@@ -320,7 +348,7 @@ def decompile(
                 "fallback": {"tool": "disassemble", "addr": hex(start)},
             }
 
-        function_name = ida_funcs.get_func_name(function_start) or None
+        function_name = display_name(function_start)
         try:
             code = decompile_function_detailed(function_start)
         except DecompilationError as exc:
@@ -349,11 +377,19 @@ def decompile(
                     "addr": hex(function_start),
                 },
             }
+        view, body_start, declarations = decompile_view(code, include_declarations)
+        offset = max(0, int(line_offset))
+        end = offset + clamp_int(line_limit, 400, 1, 5000)
         return {
             "addr": addr,
             "function_addr": hex(function_start),
             "function_name": function_name,
-            "code": code,
+            "prototype": get_prototype(ida_funcs.get_func(function_start)),
+            "code": "\n".join(view[offset:end]),
+            "total_lines": len(view),
+            "body_start_line": body_start,
+            "declaration_count": declarations,
+            "next_line_offset": end if end < len(view) else None,
         }
     except Exception as exc:
         details = {
@@ -408,16 +444,8 @@ def disasm(
     try:
         try:
             start = parse_address(addr)
-        except IDAError:
-            ea = idaapi.get_name_ea(idaapi.BADADDR, addr)
-            if ea == idaapi.BADADDR:
-                return {
-                    "addr": addr,
-                    "asm": None,
-                    "error": f"Function not found: {addr!r}",
-                    "cursor": {"done": True},
-                }
-            start = ea
+        except IDAError as exc:
+            return {"addr": addr, "asm": None, "error": f"Function not found: {exc}", "cursor": {"done": True}}
         func = ida_funcs.get_func(start)
 
         # Get segment info
@@ -662,8 +690,8 @@ def analyze_batch(
 ) -> list[dict]:
     """Prefer analysis_run(mode="batch", targets=..., options=...) for canonical batch analysis.
     WHEN: comprehensive per-function analysis with selectable sections (decompile/disasm/xrefs/callers/callees/strings/constants/blocks/proto).
-    RETURNS: [{query, addr, name, analysis{sections...}, error}] per query.
-    LIMITS: per-section max_* caps apply (disasm 50000, strings/callees 5000, constants/blocks 10000); missing query is an error entry."""
+    RETURNS: [{query, addr, name, analysis{size, <enabled sections only>}, error}] per query.
+    LIMITS: per-section max_* caps apply (disasm 50000, strings/callees 5000, constants/blocks 10000); max_decompile_lines>0 keeps header + that many statement lines (include_declarations controls the locals block); missing query is an error entry."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -719,7 +747,7 @@ def analyze_batch(
             if not fn:
                 raise RuntimeError(f"Function not found: {q}")
 
-            fn_name = ida_funcs.get_func_name(fn.start_ea) or "<unnamed>"
+            fn_name = display_name(fn.start_ea)
             size_int = fn.end_ea - fn.start_ea
 
             include_decompile = bool(query.get("include_decompile", True))
@@ -742,41 +770,27 @@ def analyze_batch(
                 query.get("max_constants", 200), 200, 0, 10000
             )
             max_blocks = clamp_int(query.get("max_blocks", 500), 500, 0, 10000)
+            max_decompile_lines = clamp_int(query.get("max_decompile_lines", 0), 0, 0, 100_000)
 
-            analysis: dict = {
-                "size": hex(size_int),
-                "prototype": None,
-                "decompile": None,
-                "decompile_error": None,
-                "decompile_error_details": None,
-                "disasm": None,
-                "xrefs": None,
-                "callers": None,
-                "caller_count": 0,
-                "callers_truncated": False,
-                "callees": None,
-                "callee_count": 0,
-                "callees_truncated": False,
-                "strings": None,
-                "string_ref_count": 0,
-                "strings_truncated": False,
-                "constants": None,
-                "constant_count": 0,
-                "constants_truncated": False,
-                "basic_blocks": None,
-                "basic_block_count": 0,
-                "basic_blocks_truncated": False,
-            }
+            analysis: dict = {"size": hex(size_int)}
 
             if include_proto:
                 analysis["prototype"] = get_prototype(fn)
 
             if include_decompile:
-                (
-                    analysis["decompile"],
-                    analysis["decompile_error"],
-                    analysis["decompile_error_details"],
-                ) = _decompile_section(fn)
+                code, error, error_details = _decompile_section(fn)
+                if code is None:
+                    analysis["decompile"] = None
+                    analysis["decompile_error"] = error
+                    analysis["decompile_error_details"] = error_details
+                elif max_decompile_lines:
+                    excerpt = decompile_excerpt(
+                        code, max_decompile_lines, bool(query.get("include_declarations", False))
+                    )
+                    analysis["decompile"] = excerpt.pop("decompiled")
+                    analysis.update(excerpt)
+                else:
+                    analysis["decompile"] = code
 
             if include_disasm:
                 items = islice(idautils.FuncItems(fn.start_ea), max_disasm_insns + 1)
@@ -793,19 +807,16 @@ def analyze_batch(
                 analysis["xrefs"] = _xrefs_section(fn.start_ea)
 
             if include_callers:
-                analysis.update(
-                    _capped("callers", "caller_count", _collect_callers(fn), max_callers)
-                )
+                section = _capped("callers", "caller_count", _collect_callers(fn), max_callers)
+                section["callers"] = _display_rows(section["callers"])
+                analysis.update(section)
 
             if include_callees:
-                analysis.update(
-                    _capped(
-                        "callees",
-                        "callee_count",
-                        _collect_callees(fn, call_only=True),
-                        max_callees,
-                    )
+                section = _capped(
+                    "callees", "callee_count", _collect_callees(fn, call_only=True), max_callees
                 )
+                section["callees"] = _display_rows(section["callees"])
+                analysis.update(section)
 
             if include_strings:
                 analysis.update(
@@ -861,6 +872,14 @@ def analyze_batch(
 # ============================================================================
 
 
+def _func_ref(ea: int) -> dict | None:
+    """{addr, name} of the function containing *ea*, or None."""
+    func = ida_funcs.get_func(ea)
+    if func is None:
+        return None
+    return {"addr": hex(func.start_ea), "name": display_name(func.start_ea)}
+
+
 @tool
 @idasync
 def xref_query(
@@ -908,12 +927,7 @@ def xref_query(
         try:
             if not q:
                 raise ValueError("query is required")
-            try:
-                target = parse_address(q)
-            except Exception:
-                target = idaapi.get_name_ea(idaapi.BADADDR, q)
-                if target == idaapi.BADADDR:
-                    raise ValueError(f"Failed to resolve address/name: {q}")
+            target = parse_address(q)
 
             rows: list[dict] = []
             if direction in {"to", "both"}:
@@ -929,7 +943,7 @@ def xref_query(
                         "type": kind,
                     }
                     if include_fn:
-                        row["fn"] = get_function(xr.frm, raise_error=False)
+                        row["fn"] = _func_ref(xr.frm)
                     rows.append(row)
 
             if direction in {"from", "both"}:
@@ -945,7 +959,7 @@ def xref_query(
                         "type": kind,
                     }
                     if include_fn:
-                        row["fn"] = get_function(xr.to, raise_error=False)
+                        row["fn"] = _func_ref(xr.to)
                     rows.append(row)
 
             if dedup:
@@ -997,107 +1011,94 @@ def xref_query(
     return results
 
 
+def _split_field_target(text: str) -> tuple[str, str]:
+    """'Struct.field' or 'Struct::field' -> (struct, field)."""
+    sep = "." if "." in text else "::"
+    struct_name, found, field_name = str(text).strip().rpartition(sep)
+    if not found or not struct_name or not field_name:
+        raise ValueError(f"Expected 'Struct.field' or 'Struct::field', got {text!r}")
+    return struct_name, field_name
+
+
+def _field_xrefs(struct_name: str, field_name: str, offset: int, limit: int) -> dict:
+    """IDA member xrefs plus Hex-Rays member accesses for one struct field."""
+    til = ida_typeinf.get_idati()
+    tif = ida_typeinf.tinfo_t()
+    if not til or not tif.get_named_type(til, struct_name, ida_typeinf.BTF_STRUCT, True, False):
+        raise ValueError(f"Struct '{struct_name}' not found")
+    udm = ida_typeinf.udm_t()
+    udm.name = field_name
+    idx = tif.find_udm(udm, ida_typeinf.STRMEM_NAME)
+    if idx == -1:
+        members = []
+        for i in range(tif.get_udt_nmembers()):
+            member = ida_typeinf.udm_t()
+            member.offset = i
+            if tif.find_udm(member, ida_typeinf.STRMEM_INDEX) != -1:
+                members.append(member.name)
+        raise ValueError(f"Field '{field_name}' not found in '{struct_name}'; members: {', '.join(members[:20])}")
+    byte_offset = int(udm.offset) // 8
+    wanted = offset + limit + 1
+    rows: dict[int, dict] = {}
+    tid = tif.get_udm_tid(idx)
+    if tid != ida_idaapi.BADADDR:
+        for xref in islice(idautils.XrefsTo(tid), wanted):
+            rows[xref.frm] = {"addr": hex(xref.frm), "type": "code" if xref.iscode else "data", "fn": _func_ref(xref.frm)}
+    result: dict = {"struct": struct_name, "field": field_name, "offset": hex(byte_offset)}
+    from .hexrays_ctree import field_accesses
+    from ida_pro_mcp.vnext.contracts import VNextError
+
+    try:
+        scan = field_accesses(struct_name, byte_offset, tid, wanted)
+    except VNextError as exc:
+        result["warnings"] = [f"Decompiler accesses unavailable: {exc}"]
+    else:
+        for match in scan["matches"]:
+            ea = int(match["addr"], 16) if match.get("addr") else int(match["func"], 16)
+            rows[ea] = {
+                "addr": hex(ea),
+                "type": "decompiler",
+                "fn": {"addr": match["func"], "name": match["func_name"]},
+                "text": match["text"],
+            }
+        if scan["scan_capped"]:
+            result["warnings"] = [f"Decompiler scan stopped after {scan['scanned_functions']} functions"]
+    ordered = [rows[ea] for ea in sorted(rows)]
+    result["xrefs"] = ordered[offset : offset + limit]
+    result["next_offset"] = offset + limit if len(ordered) > offset + limit else None
+    return result
+
+
 @tool
 @idasync
+@tool_timeout(120.0)
 def xrefs_to_field(
-    queries: list[StructFieldQuery] | StructFieldQuery,
+    queries: Annotated[
+        list[StructFieldQuery] | StructFieldQuery | list[str] | str,
+        "{struct, field[, offset]} records or 'Struct.field' / 'Struct::field' strings",
+    ],
     limit: Annotated[int, "Max xrefs per query (default: 100, max: 1000)"] = 100,
 ) -> list[dict]:
-    """Legacy struct-field xref lookup (no canonical equivalent).
-    WHEN: find code/data xrefs to {struct, field} members across the IDB.
-    RETURNS: [{struct, field, xrefs[{addr, ...}], more, error}] per query.
-    LIMITS: limit max 1000; missing type library returns error entries; unqualified field names may match multiple structs."""
-    if isinstance(queries, dict):
+    """Prefer graph_query(kind="field_xrefs", targets=["Struct.field"]) for canonical use.
+    WHEN: find code that reads/writes one struct member across the IDB.
+    RETURNS: [{struct, field, offset, xrefs[{addr, type(code|data|decompiler), fn{addr,name}, text?}], next_offset, warnings?, error?}] per query.
+    LIMITS: limit max 1000; decompiler hits come from functions whose prototype, IDA member xrefs, or referenced globals use the struct (500 decompilations max)."""
+    if isinstance(queries, (dict, str)):
         queries = [queries]
-    if limit <= 0 or limit > 1000:
-        limit = 1000
-
+    limit = clamp_int(limit, 100, 1, 1000)
     results = []
-    til = ida_typeinf.get_idati()
-    if not til:
-        return [
-            {
-                "struct": q.get("struct"),
-                "field": q.get("field"),
-                "xrefs": [],
-                "more": False,
-                "error": "Failed to retrieve type library",
-            }
-            for q in queries
-        ]
-
     for query in queries:
-        struct_name = query.get("struct", "")
-        field_name = query.get("field", "")
-
         try:
-            tif = ida_typeinf.tinfo_t()
-            if not tif.get_named_type(
-                til, struct_name, ida_typeinf.BTF_STRUCT, True, False
-            ):
-                results.append(
-                    {
-                        "struct": struct_name,
-                        "field": field_name,
-                        "xrefs": [],
-                        "more": False,
-                        "error": f"Struct '{struct_name}' not found",
-                    }
-                )
-                continue
-
-            idx = ida_typeinf.get_udm_by_fullname(None, struct_name + "." + field_name)
-            if idx == -1:
-                results.append(
-                    {
-                        "struct": struct_name,
-                        "field": field_name,
-                        "xrefs": [],
-                        "more": False,
-                        "error": f"Field '{field_name}' not found in '{struct_name}'",
-                    }
-                )
-                continue
-
-            tid = tif.get_udm_tid(idx)
-            if tid == ida_idaapi.BADADDR:
-                results.append(
-                    {
-                        "struct": struct_name,
-                        "field": field_name,
-                        "xrefs": [],
-                        "more": False,
-                        "error": "Unable to get tid",
-                    }
-                )
-                continue
-
-            xrefs = []
-            xref: ida_xref.xrefblk_t
-            for xref in idautils.XrefsTo(tid):
-                xrefs.append(
-                    Xref(
-                        addr=hex(xref.frm),
-                        type="code" if xref.iscode else "data",
-                        fn=get_function(xref.frm, raise_error=False),
-                    )
-                )
-                if len(xrefs) > limit:
-                    break
-            more = len(xrefs) > limit
-            xrefs = xrefs[:limit]
-            results.append({"struct": struct_name, "field": field_name, "xrefs": xrefs, "more": more})
+            if isinstance(query, str):
+                struct_name, field_name = _split_field_target(query)
+                offset = 0
+            else:
+                struct_name, field_name = str(query.get("struct", "")), str(query.get("field", ""))
+                offset = clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
+            results.append(_field_xrefs(struct_name, field_name, offset, limit))
         except Exception as e:
-            results.append(
-                {
-                    "struct": struct_name,
-                    "field": field_name,
-                    "xrefs": [],
-                    "more": False,
-                    "error": str(e),
-                }
-            )
-
+            target = query if isinstance(query, str) else f"{query.get('struct')}.{query.get('field')}"
+            results.append({"query": target, "xrefs": [], "next_offset": None, "error": str(e)})
     return results
 
 
@@ -1131,7 +1132,10 @@ def callees(
                     {"addr": fn_addr, "callees": None, "error": "No function found"}
                 )
                 continue
-            found = _collect_callees(func, call_only=True)
+            found = [
+                {**row, "name": display_name(int(row["addr"], 16))}
+                for row in _collect_callees(func, call_only=True)
+            ]
             results.append(
                 {"addr": fn_addr, "callees": found[:limit], "more": len(found) > limit}
             )
@@ -1388,58 +1392,19 @@ def find(
                 try:
                     value = int(value, 0)
                 except ValueError:
-                    value = 0
-
-            matches = []
-            skipped = 0
-            more = False
-            try:
-                candidates = _value_candidates_for_immediate(value)
-                if not candidates:
                     results.append(
-                        {
-                            "query": value,
-                            "matches": [],
-                            "count": 0,
-                            "cursor": {"done": True},
-                            "error": "Immediate out of range",
-                        }
+                        {"query": value, "matches": [], "count": 0, "cursor": {"done": True}, "error": f"Invalid immediate: {value!r}"}
                     )
                     continue
 
-                seen_insn = set()
-                for seg_start, seg_end in _segments(exec_only=True):
-                    for normalized, size, pattern_bytes in candidates:
-                        ea = seg_start
-                        while ea != idaapi.BADADDR and ea < seg_end:
-                            ea = compat.raw_bin_search(
-                                ea, seg_end, pattern_bytes, b"\xff" * size, _BIN_SEARCH_FLAGS
-                            )
-                            if ea == idaapi.BADADDR:
-                                break
-
-                            insn_start = _resolve_immediate_insn_start(
-                                ea, value, seg_start, normalized
-                            )
-                            if insn_start is not None and insn_start not in seen_insn:
-                                seen_insn.add(insn_start)
-                                if skipped < offset:
-                                    skipped += 1
-                                else:
-                                    matches.append(hex(insn_start))
-                                    if len(matches) > limit:
-                                        more = True
-                                        matches = matches[:limit]
-                                        break
-
-                            ea += 1
-
-                        if more:
-                            break
-                    if more:
-                        break
-            except Exception:
-                pass
+            try:
+                matches, more = _immediate_sites(value, offset, limit)
+            except ValueError as exc:
+                results.append(
+                    {"query": value, "matches": [], "count": 0, "cursor": {"done": True}, "error": str(exc)}
+                )
+                continue
+            matches = [hex(ea) for ea in matches]
 
             results.append(
                 {
@@ -1601,6 +1566,24 @@ def _resolve_insn_scan_ranges(
     return exec_segments, None
 
 
+def _operands_match_text(ea: int, insn: ida_ua.insn_t, op_texts: dict[int | str, str]) -> bool:
+    """Case-insensitive operand-text substring filters; key "any" matches any operand."""
+    import idc
+
+    texts = []
+    for i in range(8):
+        if insn.ops[i].type == ida_ua.o_void:
+            break
+        texts.append((idc.print_operand(ea, i) or "").lower())
+    for key, needle in op_texts.items():
+        if key == "any":
+            if not any(needle in text for text in texts):
+                return False
+        elif key >= len(texts) or needle not in texts[key]:
+            return False
+    return True
+
+
 def _scan_insn_ranges(
     ranges: list[tuple[int, int]],
     mnem: str,
@@ -1611,6 +1594,7 @@ def _scan_insn_ranges(
     limit: int,
     offset: int,
     max_scan_insns: int,
+    op_texts: dict[int | str, str] | None = None,
 ) -> tuple[list[str], bool, int, bool, int | None]:
     matches: list[str] = []
     skipped = 0
@@ -1660,6 +1644,9 @@ def _scan_insn_ranges(
                         break
                 if not found_any:
                     match = False
+
+            if op_texts and match:
+                match = _operands_match_text(ea, insn, op_texts)
 
             if match:
                 if skipped < offset:
@@ -1757,6 +1744,11 @@ def insn_query(
                 count,
                 offset,
                 max_scan_insns,
+                {
+                    key: str(pattern[field]).lower()
+                    for key, field in ((0, "op0_text"), (1, "op1_text"), (2, "op2_text"), ("any", "op_any_text"))
+                    if pattern.get(field)
+                },
             )
 
             rows = []
@@ -1884,6 +1876,231 @@ def export_funcs(
 # ============================================================================
 
 
+_INDIRECT_CAP = 20
+_PATH_EXPANSION_CAP = 5000
+
+
+def _is_func_start(ea: int) -> bool:
+    func = ida_funcs.get_func(ea)
+    return func is not None and func.start_ea == ea
+
+
+def _code_pointer_at(ea: int) -> int | None:
+    """Function start stored in the pointer slot at *ea* (function-pointer globals)."""
+    import ida_ida
+
+    value = ida_bytes.get_qword(ea) if ida_ida.inf_is_64bit() else ida_bytes.get_dword(ea)
+    return value if value and _is_func_start(value) else None
+
+
+def _calls_out(func_ea: int, cap: int, include_indirect: bool) -> tuple[list, list, bool]:
+    """([(site, callee, type)], unresolved indirect call sites, capped) for one function."""
+    import ida_idp
+
+    func = ida_funcs.get_func(func_ea)
+    edges: list[tuple[int, int, str]] = []
+    unresolved: list[dict] = []
+    seen: set[int] = set()
+    capped = False
+    if func is None:
+        return edges, unresolved, capped
+    for site in idautils.FuncItems(func.start_ea):
+        insn = _decode_insn_at(site)
+        if insn is None or not ida_idp.is_call_insn(insn):
+            continue
+        op = insn.ops[0]
+        if op.type in (ida_ua.o_near, ida_ua.o_far):
+            targets, kind = [op.addr], "call"
+        elif op.type == ida_ua.o_mem:
+            pointee = _code_pointer_at(op.addr)
+            targets, kind = ([pointee], "indirect") if pointee is not None else ([op.addr], "call")
+        else:
+            targets = [ref for ref in idautils.CodeRefsFrom(site, 0) if _is_func_start(ref)]
+            kind = "indirect"
+            if not targets and include_indirect and len(unresolved) < _INDIRECT_CAP:
+                unresolved.append({"site": hex(site), "text": disasm_text(site)})
+        if kind == "indirect" and not include_indirect:
+            continue
+        for target in targets:
+            callee = ida_funcs.get_func(target)
+            target = callee.start_ea if callee is not None else target
+            if target in seen:
+                continue
+            if len(seen) >= cap:
+                capped = True
+                break
+            seen.add(target)
+            edges.append((site, target, kind))
+    return edges, unresolved, capped
+
+
+def _calls_in(ea: int, cap: int, include_indirect: bool) -> tuple[list, list, bool]:
+    """([(site, caller, type)], address-taken references, capped) for one function or import."""
+    import ida_idp
+    from .hexrays_ctree import with_thunks
+
+    edges: list[tuple[int, int, str]] = []
+    taken: list[dict] = []
+    seen: set[int] = set()
+    capped = False
+    for target in sorted(with_thunks(ea)):
+        for xref in idautils.XrefsTo(target, 0):
+            caller = ida_funcs.get_func(xref.frm)
+            if caller is not None and caller.flags & ida_funcs.FUNC_THUNK:
+                continue  # thunk hops are folded into with_thunks
+            insn = _decode_insn_at(xref.frm) if caller is not None else None
+            if insn is not None and ida_idp.is_call_insn(insn):
+                if caller.start_ea in seen:
+                    continue
+                if len(seen) >= cap:
+                    capped = True
+                    continue
+                seen.add(caller.start_ea)
+                edges.append((xref.frm, caller.start_ea, "call"))
+            elif include_indirect and not xref.iscode and len(taken) < _INDIRECT_CAP:
+                row = {"site": hex(xref.frm), "text": disasm_text(xref.frm)}
+                if caller is not None:
+                    row["func"] = display_name(caller.start_ea)
+                taken.append(row)
+    return edges, taken, capped
+
+
+def call_graph(
+    root: str,
+    direction: str = "callees",
+    max_depth: int = 3,
+    max_nodes: int = 1000,
+    offset: int = 0,
+    max_edges_per_func: int = 100,
+    include_indirect: bool = True,
+) -> dict:
+    """Breadth-first call graph page from one root (caller holds the IDA main thread).
+
+    Nodes are numbered in BFS order; a page is nodes [offset, offset+max_nodes)
+    plus the edges those nodes expand, so depth is always the shortest hop count.
+    """
+    root_ea = parse_address(root)
+    func = ida_funcs.get_func(root_ea)
+    if func is not None:
+        root_ea = func.start_ea
+    elif direction == "callees":
+        raise IDAError(f"Not a function: {root}")
+    expand = _calls_out if direction == "callees" else _calls_in
+    unresolved_key = "indirect_calls" if direction == "callees" else "address_taken"
+    order = [root_ea]
+    depth = {root_ea: 0}
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    capped_funcs: list[str] = []
+    end = offset + max_nodes
+    index = 0
+    while index < len(order) and index < end:
+        ea = order[index]
+        in_page = index >= offset
+        index += 1
+        node: dict = {"addr": hex(ea), "name": display_name(ea), "depth": depth[ea]}
+        is_func = ida_funcs.get_func(ea) is not None
+        if not is_func:
+            node["external"] = True
+        if depth[ea] < max_depth and (is_func or direction == "callers"):
+            found, unresolved, capped = expand(ea, max_edges_per_func, include_indirect)
+            for site, other, kind in found:
+                if other not in depth:
+                    depth[other] = depth[ea] + 1
+                    order.append(other)
+                if in_page:
+                    src, dst = (ea, other) if direction == "callees" else (other, ea)
+                    edges.append({"from": hex(src), "to": hex(dst), "site": hex(site), "type": kind})
+            if in_page and unresolved:
+                node[unresolved_key] = unresolved
+            if in_page and capped:
+                capped_funcs.append(hex(ea))
+        if in_page:
+            nodes.append(node)
+    result: dict = {
+        "root": str(root),
+        "addr": hex(root_ea),
+        "name": display_name(root_ea),
+        "nodes": nodes,
+        "edges": edges,
+        "max_edges_per_func": max_edges_per_func,
+        "next_offset": end if len(order) > end else None,
+    }
+    if result["next_offset"] is not None:
+        result["limit_reason"] = "nodes"
+    if capped_funcs:
+        result["per_func_capped"] = capped_funcs
+    return result
+
+
+def call_paths(
+    source: str,
+    target: str,
+    max_depth: int = 3,
+    max_paths: int = 10,
+    max_edges_per_func: int = 100,
+    include_indirect: bool = True,
+) -> dict:
+    """Shortest forward call paths source -> target (caller holds the IDA main thread)."""
+    from .hexrays_ctree import with_thunks
+
+    src = parse_address(source)
+    func = ida_funcs.get_func(src)
+    if func is None:
+        raise IDAError(f"Not a function: {source}")
+    src = func.start_ea
+    dst = parse_address(target)
+    dst_func = ida_funcs.get_func(dst)
+    if dst_func is not None:
+        dst = dst_func.start_ea
+    goal = with_thunks(dst)
+    parents: dict[int, list[tuple[int, int]]] = {src: []}
+    depth = {src: 0}
+    frontier = [src]
+    hits = [src] if src in goal else []
+    expanded = 0
+    truncated = False
+    while frontier and not hits and not truncated and depth[frontier[0]] < max_depth:
+        next_frontier: list[int] = []
+        for ea in frontier:
+            if expanded >= _PATH_EXPANSION_CAP:
+                truncated = True
+                break
+            expanded += 1
+            for site, other, _kind in _calls_out(ea, max_edges_per_func, include_indirect)[0]:
+                if other not in depth:
+                    depth[other] = depth[ea] + 1
+                    parents[other] = [(ea, site)]
+                    next_frontier.append(other)
+                elif depth[other] == depth[ea] + 1:
+                    parents[other].append((ea, site))
+        hits = [ea for ea in next_frontier if ea in goal]
+        frontier = next_frontier
+
+    paths: list[list[dict]] = []
+
+    def walk(ea: int, suffix: list[dict]) -> None:
+        if len(paths) >= max_paths:
+            return
+        if not parents[ea]:
+            paths.append([{"addr": hex(ea), "name": display_name(ea)}, *suffix])
+            return
+        for parent, site in parents[ea]:
+            walk(parent, [{"addr": hex(ea), "name": display_name(ea), "site": hex(site)}, *suffix])
+
+    for hit in hits:
+        walk(hit, [])
+    result: dict = {
+        "from": hex(src),
+        "to": hex(dst),
+        "paths": paths,
+        "length": len(paths[0]) - 1 if paths else None,
+    }
+    if truncated or len(paths) >= max_paths:
+        result["truncated"] = True
+    return result
+
+
 @tool
 @idasync
 def callgraph(
@@ -1892,141 +2109,23 @@ def callgraph(
     ],
     max_depth: Annotated[int, "Maximum depth for call graph traversal (default: 5, max: 20)"] = 5,
     max_nodes: Annotated[
-        int, "Max nodes across the graph (default: 1000, max: 100000)"
+        int, "Max nodes per root page (default: 1000, max: 100000)"
     ] = 1000,
-    max_edges: Annotated[
-        int, "Max edges across the graph (default: 5000, max: 200000)"
-    ] = 5000,
     max_edges_per_func: Annotated[
-        int, "Max edges per function (default: 200, max: 5000)"
+        int, "Max distinct callees per function (default: 200, max: 5000)"
     ] = 200,
 ) -> list[dict]:
     """Prefer graph_query(kind="calls", targets=..., max_depth=...) for canonical call graphs.
-    WHEN: bounded multi-hop call-graph traversal from root functions with node/edge budgets.
-    RETURNS: [{root, nodes[{addr, name, depth}], edges[{from, to, type}], truncated, limit_reason?, per_func_capped, error}].
-    LIMITS: depth max 20, nodes max 100000, edges max 200000, per-func edges max 5000; truncated signals budget hit."""
-    roots = normalize_list_input(roots)
-    if max_depth < 0:
-        max_depth = 0
-    if max_depth > 20:
-        max_depth = 20
-    if max_nodes <= 0 or max_nodes > 100000:
-        max_nodes = 100000
-    if max_edges <= 0 or max_edges > 200000:
-        max_edges = 200000
-    if max_edges_per_func <= 0 or max_edges_per_func > 5000:
-        max_edges_per_func = 5000
+    WHEN: bounded breadth-first callee graph from root functions.
+    RETURNS: [{root, addr, name, nodes[{addr, name, depth, external?, indirect_calls?}], edges[{from, to, site, type}], next_offset, limit_reason?, per_func_capped?, error?}].
+    LIMITS: depth max 20, nodes max 100000, per-func callees max 5000; next_offset set when the node budget cut the graph."""
+    max_depth = clamp_int(max_depth, 5, 0, 20)
+    max_nodes = clamp_int(max_nodes, 1000, 1, 100000) if max_nodes > 0 else 100000
+    max_edges_per_func = clamp_int(max_edges_per_func, 200, 1, 5000) if max_edges_per_func > 0 else 5000
     results = []
-
-    for root in roots:
+    for root in normalize_list_input(roots):
         try:
-            ea, resolve_error = _resolve_function_start(root)
-            if ea is None:
-                results.append(
-                    {
-                        "root": root,
-                        "error": resolve_error or "Function not found",
-                        "nodes": [],
-                        "edges": [],
-                    }
-                )
-                continue
-            func = ida_funcs.get_func(ea)
-            if not func:
-                results.append(
-                    {
-                        "root": root,
-                        "error": "Function not found",
-                        "nodes": [],
-                        "edges": [],
-                    }
-                )
-                continue
-
-            nodes: dict[str, dict] = {}
-            edges: list[dict] = []
-            edge_keys: set[tuple[int, int]] = set()
-            expanded: set[int] = set()
-            truncated = False
-            per_func_capped = False
-            limit_reason = None
-
-            def hit_limit(reason: str):
-                nonlocal truncated, limit_reason
-                truncated = True
-                limit_reason = reason
-
-            def add_node(addr: int, depth: int) -> bool:
-                key = hex(addr)
-                if key in nodes:
-                    return True
-                if len(nodes) >= max_nodes:
-                    hit_limit("nodes")
-                    return False
-                f = ida_funcs.get_func(addr)
-                if not f:
-                    return False
-                nodes[key] = {
-                    "addr": key,
-                    "name": ida_funcs.get_func_name(f.start_ea),
-                    "depth": depth,
-                }
-                return True
-
-            def traverse(addr: int, depth: int) -> None:
-                nonlocal per_func_capped
-                if addr in expanded or not add_node(addr, depth):
-                    return
-                expanded.add(addr)
-                if depth >= max_depth:
-                    return
-                f = ida_funcs.get_func(addr)
-                if not f:
-                    return
-
-                edges_added = 0
-                for callee_info in _collect_callees(f, call_only=True):
-                    if truncated:
-                        break
-                    callee_func = ida_funcs.get_func(int(callee_info["addr"], 16))
-                    if not callee_func:
-                        continue
-                    if edges_added >= max_edges_per_func:
-                        per_func_capped = True
-                        break
-                    callee = callee_func.start_ea
-                    edge_key = (addr, callee)
-                    if edge_key in edge_keys:
-                        continue
-                    if len(edges) >= max_edges:
-                        hit_limit("edges")
-                        break
-                    if not add_node(callee, depth + 1):
-                        break
-                    edge_keys.add(edge_key)
-                    edges.append({"from": hex(addr), "to": hex(callee), "type": "call"})
-                    edges_added += 1
-                    traverse(callee, depth + 1)
-
-            traverse(ea, 0)
-
-            results.append(
-                {
-                    "root": root,
-                    "nodes": list(nodes.values()),
-                    "edges": edges,
-                    "max_depth": max_depth,
-                    "truncated": truncated,
-                    "limit_reason": limit_reason,
-                    "max_nodes": max_nodes,
-                    "max_edges": max_edges,
-                    "max_edges_per_func": max_edges_per_func,
-                    "per_func_capped": per_func_capped,
-                    "error": None,
-                }
-            )
-
+            results.append(call_graph(root, "callees", max_depth, max_nodes, 0, max_edges_per_func))
         except Exception as e:
             results.append({"root": root, "error": str(e), "nodes": [], "edges": []})
-
     return results

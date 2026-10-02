@@ -101,118 +101,81 @@ def test_vnext_internal_legacy_call_dispatches_preserved_method_map():
             rpc.MCP_SERVER.tools._all_methods = previous
 
 
-def test_memory_read_normalizes_string_byte_queries():
+def test_memory_read_normalizes_shorthand_queries():
     _rpc, api_vnext = _load_vnext_api()
-    assert api_vnext._normalize_memory_queries("bytes", ["0x401000"]) == [
-        {"addr": "0x401000", "size": 16}
+    normalize = api_vnext._normalize_memory_queries
+    # Bare byte reads leave size unset so the reader uses the item size.
+    assert normalize("bytes", ["0x401000", {"addr": "main", "size": 4}]) == [{"addr": "0x401000"}, {"addr": "main", "size": 4}]
+    assert normalize("integer", ["g_count:u32", ".text:401000:i16be", "g_count"]) == [
+        {"addr": "g_count", "ty": "u32"},
+        {"addr": ".text:401000", "ty": "i16be"},
+        {"addr": "g_count"},
     ]
-    assert api_vnext._normalize_memory_queries(
-        "bytes", [{"addr": "0x401000", "size": 4}]
-    ) == [{"addr": "0x401000", "size": 4}]
-    assert api_vnext._normalize_memory_queries("string", ["0x401000"]) == ["0x401000"]
-    with pytest.raises(VNextError, match=r"\{addr, ty\}"):
-        api_vnext._normalize_memory_queries("integer", ["0x401000"])
+    assert normalize("struct", ["g_point"]) == [{"addr": "g_point"}]
+    assert normalize("string", ["0x401000"]) == ["0x401000"]
 
 
-def test_text_search_uses_and_returns_canonical_cursor(monkeypatch):
+def test_memory_read_bytes_rows_are_compact_hex():
     _rpc, api_vnext = _load_vnext_api()
-    calls = []
-
-    def fake_legacy_call(name, arguments=None):
-        calls.append((name, arguments))
-        return {"n": 1, "hits": [], "cursor": {"next": "0x401010"}}
-
-    monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
-    incoming = api_vnext._encode_cursor(0x401000)
-    result = api_vnext.search("text", ["needle"], 10, incoming)
-
-    assert calls == [
-        (
-            "search_text",
-            {
-                "pattern": "needle",
-                "limit": 10,
-                "start": "0x401000",
-                "end": "",
-                "regex": False,
-                "case_sensitive": False,
-                "include": "all",
-                "code_only": False,
-            },
-        )
-    ]
-    assert result["truncated"] is True
-    assert result["next_cursor"] == api_vnext._encode_cursor(0x401010)
+    row = api_vnext._compact_memory_row("bytes", {"addr": "main", "data": "0x59 0x5 0x0"})
+    assert row == {"addr": "main", "size": 3, "hex": "590500"}
+    failed = api_vnext._compact_memory_row("bytes", {"addr": "nope", "data": None, "error": "Unknown address or symbol 'nope'"})
+    assert failed == {"addr": "nope", "error": "Unknown address or symbol 'nope'"}
 
 
-def test_constant_search_maps_to_legacy_immediate(monkeypatch):
+def test_instruction_target_syntax_maps_to_operand_filters():
     _rpc, api_vnext = _load_vnext_api()
-    calls = []
-
-    def fake_legacy_call(name, arguments=None):
-        calls.append((name, arguments))
-        return [{"cursor": {"next": 35}, "matches": []}]
-
-    monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
-    incoming = api_vnext._encode_cursor(10)
-    result = api_vnext.search("constant", ["0x1234"], 25, incoming)
-
-    assert calls == [
-        (
-            "find",
-            {
-                "type": "immediate",
-                "targets": ["0x1234"],
-                "limit": 25,
-                "offset": 10,
-            },
-        )
-    ]
-    assert result["provenance"]["legacy_tool"] == "find"
-    assert result["next_cursor"] == api_vnext._encode_cursor(35)
-
-
-def test_instruction_search_maps_to_broad_insn_query(monkeypatch):
-    _rpc, api_vnext = _load_vnext_api()
-    calls = []
-
-    def fake_legacy_call(name, arguments=None):
-        calls.append((name, arguments))
-        return [
-            {"cursor": {"next": 17}, "matches": []},
-            {"cursor": {"next": 17}, "matches": []},
-        ]
-
-    monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
-    incoming = api_vnext._encode_cursor(7)
-    result = api_vnext.search("instruction", ["mov", "xor"], 10, incoming)
-
-    assert calls == [
-        (
-            "insn_query",
-            {
-                "queries": [
-                    {
-                        "mnem": mnemonic,
-                        "offset": 7,
-                        "count": 10,
-                        "max_scan_insns": 200000,
-                        "allow_broad": True,
-                        "include_disasm": True,
-                    }
-                    for mnemonic in ("mov", "xor")
-                ]
-            },
-        )
-    ]
-    assert result["provenance"]["legacy_tool"] == "insn_query"
-    assert result["next_cursor"] == api_vnext._encode_cursor(17)
+    parse = api_vnext._parse_instruction_target
+    assert parse("LEA op1=rip any=0x10") == {"mnem": "lea", "op1_text": "rip", "op_any": 16}
+    assert parse("* op0=eax") == {"mnem": "", "op0_text": "eax"}
+    assert parse("op2=8") == {"mnem": "", "op2": 8}
+    for bad in ("mov op3=eax", "mov op0", "mov any="):
+        with pytest.raises(VNextError, match="Bad instruction filter"):
+            parse(bad)
 
 
 def test_analysis_run_rejects_unknown_mode_with_allowed_list():
     _rpc, api_vnext = _load_vnext_api()
     with pytest.raises(VNextError, match="Allowed:"):
         api_vnext._analysis_sync("nope", [], {})
+
+
+def test_text_search_pages_each_target_independently(monkeypatch):
+    _rpc, api_vnext = _load_vnext_api()
+    calls = []
+
+    def fake_legacy_call(name, arguments=None):
+        calls.append((name, arguments))
+        if arguments["pattern"] == "alpha" and not arguments["start"]:
+            hit = {"addr": "0x401000", "function": "main", "matches": [{"kind": "disasm", "text": "lea rdi, alpha"}]}
+            return {"hits": [hit], "cursor": {"next": "0x401005"}}
+        return {"hits": [], "cursor": {"done": True}}
+
+    monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
+    first = api_vnext.search("text", ["alpha", "beta"], 1)
+    assert first["data"] == [
+        {"target": "alpha", "matches": [{"addr": "0x401000", "function": "main", "text": "lea rdi, alpha"}]},
+        {"target": "beta", "matches": []},
+    ]
+    assert first["truncated"] is True
+
+    calls.clear()
+    second = api_vnext.search("text", ["alpha", "beta"], 1, first["next_cursor"])
+    assert [(args["pattern"], args["start"]) for _name, args in calls] == [("alpha", "0x401005")]
+    assert second["data"] == [{"target": "alpha", "matches": []}]
+    assert "next_cursor" not in second or second["next_cursor"] is None
+
+
+def test_search_cursor_is_bound_to_kind_and_targets(monkeypatch):
+    _rpc, api_vnext = _load_vnext_api()
+    monkeypatch.setattr(
+        api_vnext, "_legacy_call", lambda name, arguments=None: {"hits": [], "cursor": {"next": "0x401010"}}
+    )
+    cursor = api_vnext.search("text", ["needle"], 10)["next_cursor"]
+    with pytest.raises(VNextError, match="belongs to search kind 'text'"):
+        api_vnext.search("instruction", ["mov"], 10, cursor)
+    with pytest.raises(VNextError, match="does not match targets"):
+        api_vnext.search("text", ["needle", "other"], 10, cursor)
 
 
 def test_instruction_search_resumes_after_scan_budget(monkeypatch):
@@ -237,10 +200,11 @@ def test_instruction_search_resumes_after_scan_budget(monkeypatch):
     second = api_vnext.search("instruction", ["mov"], 10, first["next_cursor"])
 
     assert first["truncated"] is True
+    assert first["data"][0]["partial"] == "scan_budget"
     assert calls[1][1]["queries"][0]["start"] == "0x401100"
     assert calls[1][1]["queries"][0]["offset"] == 0
-    assert second["truncated"] is False
-    assert second["next_cursor"] is None
+    assert second.get("truncated", False) is False
+    assert second.get("next_cursor") is None
 
 
 def test_graph_query_tracks_target_specific_pagination(monkeypatch):
@@ -257,23 +221,26 @@ def test_graph_query_tracks_target_specific_pagination(monkeypatch):
         return [{"items": [], "next_offset": None, "truncated": False}]
 
     monkeypatch.setattr(api_vnext, "_legacy_call", fake_legacy_call)
-    first = api_vnext.graph_query("xrefs_from", ["main", "helper"], limit=4)
+    first = api_vnext.graph_query("xrefs_from", ["main", "helper"], limit=4, options={"xref_type": "code"})
     second = api_vnext.graph_query(
         "xrefs_from",
         ["main", "helper"],
+        max_depth=5,
         limit=4,
         cursor=first["next_cursor"],
     )
 
     assert first["truncated"] is True
+    assert "warnings" not in first
     assert calls[0][1]["queries"] == [
-        {"query": "main", "direction": "from", "offset": 0, "count": 4},
-        {"query": "helper", "direction": "from", "offset": 0, "count": 4},
+        {"query": "main", "direction": "from", "xref_type": "code", "offset": 0, "count": 4},
+        {"query": "helper", "direction": "from", "xref_type": "code", "offset": 0, "count": 4},
     ]
     assert calls[1][1]["queries"] == [
-        {"query": "main", "direction": "from", "offset": 4, "count": 4}
+        {"query": "main", "direction": "from", "xref_type": "any", "offset": 4, "count": 4}
     ]
-    assert second["truncated"] is False
+    assert second["warnings"] == ["max_depth is ignored for kind=xrefs_from"]
+    assert "truncated" not in second
 
 
 def test_mutation_aliases_reshape_set_name_and_rename_func():
@@ -313,8 +280,8 @@ def test_mutation_aliases_reshape_set_name_and_rename_func():
         ]
     )
     assert [op.kind for op in global_ops] == ["rename", "rename"]
-    assert global_ops[0].arguments == {"func": [{"addr": "0x58ABC1B8", "name": "g_pSecurityContext"}]}
-    assert global_ops[1].arguments == {"global": [{"addr": "0x58ABC230", "name": "g_pK32GetMappedFileNameW"}]}
+    assert global_ops[0].arguments == {"func": [{"addr": "0x58abc1b8", "name": "g_pSecurityContext"}]}
+    assert global_ops[1].arguments == {"global": [{"addr": "0x58abc230", "name": "g_pK32GetMappedFileNameW"}]}
 
 
 def test_parse_operations_keeps_flat_sibling_fields():
@@ -387,14 +354,84 @@ def test_parse_operations_rejects_empty_or_incomplete_payloads():
         )
 
 
-def test_mutation_preview_schema_documents_flat_and_nested_shapes():
-    rpc, _module = _load_vnext_api()
+def test_mutation_preview_schema_accepts_every_kind_and_documented_field():
+    import re
+
+    rpc, api_vnext = _load_vnext_api()
     tools = call_rpc(rpc.MCP_SERVER, "tools/list")["tools"]
     preview = next(tool for tool in tools if tool["name"] == "mutation_preview")
-    description = preview["inputSchema"]["properties"]["operations"]["description"]
-    assert "arguments" in description
-    assert "addr" in description
-    assert "{kind, addr, name}" in description or "kind, addr, name" in description
+    operations = preview["inputSchema"]["properties"]["operations"]
+    item = operations["items"]
+    assert item["required"] == ["kind"]
+    assert set(item["properties"]["kind"]["enum"]) == set(api_vnext._OPERATION_TARGETS) | set(api_vnext._MUTATION_KIND_ALIASES)
+    # Clients validate with additionalProperties:false: every documented flat field must be declared.
+    documented = {
+        token
+        for group in re.findall(r"\{([^}]*)\}", operations["description"])
+        for token in re.findall(r"[a-z_]+", group)
+    } - {"func"}  # func is the nested arguments{} batch key
+    assert documented <= set(item["properties"]), documented - set(item["properties"])
+
+
+def test_mutation_addresses_resolve_symbols_to_canonical_hex(monkeypatch):
+    _rpc, api_vnext = _load_vnext_api()
+    symbols = {"sub_1020": "0x1020", "check_pw": "0x11a9"}
+
+    def resolve(text):
+        if text not in symbols:
+            raise ValueError(f"Unknown address or symbol '{text}'")
+        return symbols[text]
+
+    monkeypatch.setattr(api_vnext, "_resolve_address_text", resolve)
+    ops = api_vnext._parse_operations(
+        [
+            {"kind": "rename", "addr": "sub_1020", "name": "init_plt"},
+            {"kind": "set_type", "addr": "check_pw", "type": "int check_pw(char *pw)"},
+            {"kind": "define_function", "addr": "check_pw", "end": 4608},
+        ]
+    )
+    assert ops[0].arguments == {"func": [{"addr": "0x1020", "name": "init_plt"}]}
+    assert ops[1].arguments == {"edits": [{"addr": "0x11a9", "type": "int check_pw(char *pw)"}]}
+    assert ops[2].arguments == {"addr": "0x11a9", "end": "0x1200"}
+    with pytest.raises(VNextError, match="operation 0.*Unknown address or symbol 'nope'"):
+        api_vnext._parse_operations([{"kind": "comment", "addr": "nope", "comment": "x"}])
+
+
+def test_parse_operations_flat_forms_for_enum_stack_operand_and_named_renames():
+    _rpc, api_vnext = _load_vnext_api()
+    ops = api_vnext._parse_operations(
+        [
+            {"kind": "upsert_enum", "name": "Color", "members": [{"name": "RED", "value": 1}]},
+            {"kind": "declare_stack", "addr": "0x401000", "offset": -8, "name": "buf", "type": "int"},
+            {"kind": "set_operand_type", "addr": "0x401000", "op_n": 1, "operand_kind": "enum", "enum": "Color"},
+            {"kind": "rename", "old_name": "g_old", "new_name": "g_new"},
+            {"kind": "rename", "old_name": "v1", "new_name": "len", "func_addr": "0x401000"},
+        ]
+    )
+    assert [(op.kind, op.scope.value) for op in ops] == [
+        ("upsert_enum", "annotate"),
+        ("declare_stack", "annotate"),
+        ("set_operand_type", "annotate"),
+        ("rename", "annotate"),
+        ("rename", "annotate"),
+    ]
+    assert ops[0].arguments == {"queries": [{"name": "Color", "members": [{"name": "RED", "value": 1}]}]}
+    assert ops[1].arguments == {"addr": "0x401000", "offset": -8, "name": "buf", "ty": "int"}
+    assert ops[2].arguments == {"addr": "0x401000", "op_n": 1, "kind": "enum", "enum": "Color"}
+    assert ops[3].arguments == {"data": [{"old": "g_old", "new": "g_new"}]}
+    assert ops[4].arguments == {"local": [{"old": "v1", "new": "len", "func_addr": "0x401000"}]}
+
+
+def test_preview_commit_flag_rejects_non_annotate_operations():
+    _rpc, api_vnext = _load_vnext_api()
+    with pytest.raises(VNextError, match="only allowed for annotate-scope"):
+        api_vnext.mutation_preview(
+            [
+                {"kind": "comment", "addr": "0x401000", "comment": "ok"},
+                {"kind": "patch_bytes", "addr": "0x401000", "data": "90"},
+            ],
+            commit=True,
+        )
 
 
 def test_apply_operation_uses_reshaped_flat_rename(monkeypatch):

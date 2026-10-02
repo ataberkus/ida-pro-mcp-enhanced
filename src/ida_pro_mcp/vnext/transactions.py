@@ -180,6 +180,7 @@ class TransactionManager:
                     + ([f"Automatic recovery failed: {recovery_error}"] if recovery_error else []),
                     applied_operations=applied_operations,
                     error=error,
+                    required_scopes=list(preview.required_scopes),
                 )
                 self._receipts[transaction_id] = receipt
                 self._previews.pop(transaction_id, None)
@@ -197,6 +198,7 @@ class TransactionManager:
                 undo_available=undo is not None,
                 warnings=commit_warnings,
                 applied_operations=applied_operations,
+                required_scopes=list(preview.required_scopes),
             )
             self._receipts[transaction_id] = receipt
             self._previews.pop(transaction_id, None)
@@ -220,11 +222,20 @@ class TransactionManager:
         transaction_id: str,
         *,
         rollback_undo: Callable[[], bool] | None = None,
+        enabled_scopes: Iterable[SafetyScope | str] | None = None,
     ) -> MutationReceipt:
         with self._lock:
             receipt = self._receipts.get(transaction_id)
             if receipt is None:
                 raise VNextError(ErrorCode.TRANSACTION_NOT_FOUND, f"No committed transaction: {transaction_id}")
+            if enabled_scopes is not None:
+                enabled = {SafetyScope(scope) for scope in enabled_scopes}
+                if missing := {SafetyScope(scope) for scope in receipt.required_scopes} - enabled:
+                    raise VNextError(
+                        ErrorCode.PROFILE_DENIED,
+                        "Rollback requires the safety scopes of the committed transaction",
+                        details={"missing": sorted(scope.value for scope in missing)},
+                    )
             if receipt.status != "committed":
                 raise VNextError(
                     ErrorCode.INVALID_OPERATION,

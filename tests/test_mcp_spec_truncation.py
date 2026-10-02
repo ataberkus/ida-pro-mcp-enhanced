@@ -39,31 +39,9 @@ def _fresh_truncated_server() -> McpServer:
     rpc = load_ida_rpc_module()
     srv = rpc.McpServer("truncation-test")
     original = srv.registry.methods["tools/call"]
-    limit = rpc.OUTPUT_LIMIT_MAX_CHARS
 
     def patched(name, arguments=None, _meta=None):
-        response = original(name, arguments, _meta)
-        if response.get("isError"):
-            return response
-        structured = response.get("structuredContent")
-        if structured is None:
-            return response
-        serialized = json.dumps(structured)
-        if len(serialized) <= limit:
-            return response
-        output_id = rpc._generate_output_id()
-        rpc._cache_output(output_id, structured)
-        preview = rpc._truncate_value(structured)
-        download_meta = rpc._build_download_meta(output_id, len(serialized))
-        return {
-            "structuredContent": preview,
-            "content": [
-                {"type": "text", "text": json.dumps(preview, separators=(",", ":"))},
-                {"type": "text", "text": download_meta["download_hint"]},
-            ],
-            "isError": False,
-            "_meta": {"ida_mcp": download_meta},
-        }
+        return rpc.limit_output(original(name, arguments, _meta))
 
     srv.registry.methods["tools/call"] = patched
     return srv
@@ -122,6 +100,48 @@ class TruncationInvariantTests(unittest.TestCase):
         self.assertTrue(meta["output_truncated"])
         self.assertTrue(meta["download_url"].startswith("http://"))
         self.assertIn("/output/", meta["download_url"])
+
+    def test_truncation_notice_tells_agent_how_to_page(self):
+        srv = _fresh_truncated_server()
+        _, result = self._call_large_list_tool(srv)
+        notice = result["content"][0]["text"]
+        total = result["_meta"]["ida_mcp"]["total_chars"]
+        self.assertTrue(notice.startswith(f"Output truncated ({total} chars)."))
+        self.assertIn("next_cursor", notice)
+        self.assertIn("line_offset/line_limit", notice)
+        self.assertNotIn("curl", notice)
+        # Second block is the parseable preview, under the size limit.
+        preview = json.loads(result["content"][1]["text"])
+        self.assertEqual(preview, result["structuredContent"])
+
+    def test_supervised_worker_omits_unreachable_download_url(self):
+        rpc = load_ida_rpc_module()
+        srv = _fresh_truncated_server()
+        old = rpc.OUTPUT_DOWNLOADS_ENABLED
+        rpc.OUTPUT_DOWNLOADS_ENABLED = False
+        try:
+            _, result = self._call_large_list_tool(srv)
+        finally:
+            rpc.OUTPUT_DOWNLOADS_ENABLED = old
+        meta = result["_meta"]["ida_mcp"]
+        self.assertTrue(meta["output_truncated"])
+        self.assertNotIn("download_url", meta)
+        self.assertNotIn("http", result["content"][0]["text"])
+
+    def test_long_string_preview_stays_readable_and_under_limit(self):
+        rpc = load_ida_rpc_module()
+        srv = _fresh_truncated_server()
+
+        @srv.tool
+        def big_code() -> dict:
+            """Returns a huge pseudocode string."""
+            return {"code": "x" * 200_000}
+
+        result = call_rpc(srv, "tools/call", name="big_code", arguments={})
+        code = result["structuredContent"]["code"]
+        self.assertTrue(code.startswith("x" * rpc.OUTPUT_LIMIT_PREVIEW_STR_LEN))
+        self.assertIn("[200000 chars total]", code)
+        self.assertLessEqual(len(result["content"][1]["text"]), rpc.OUTPUT_LIMIT_MAX_CHARS)
 
     def test_content_text_blocks_are_valid(self):
         srv = _fresh_truncated_server()

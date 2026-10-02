@@ -32,6 +32,8 @@ _MAX_WRITE_EVENTS = 200_000
 _MAX_WRITE_RANGES = 64
 _MAX_WRITE_BYTES = 256
 _MAX_IMPORT_LOG = 100
+_MODELLED_IMPORTS = frozenset({"malloc", "calloc", "memcpy", "memmove", "memset", "strlen"})
+_STACK_ARG_SCAN = 4  # leading import args checked for pointers into written stack bytes
 _STRING_CAP = 256
 
 
@@ -49,7 +51,7 @@ def _invalid(message: str) -> VNextError:
 
 def _arg_value(spec: Any) -> int | bytes:
     """int/address/name -> int; {bytes|string|wstring|buffer} -> bytes placed on the scratch heap."""
-    from .utils import resolve_address_or_name
+    from .utils import parse_address
 
     if isinstance(spec, bool):
         raise _invalid("Boolean emulation arguments are ambiguous; pass 0 or 1")
@@ -60,7 +62,7 @@ def _arg_value(spec: Any) -> int | bytes:
             return int(spec, 0)
         except ValueError:
             try:
-                return resolve_address_or_name(spec)
+                return parse_address(spec)
             except IDAError as exc:
                 raise _invalid(f"Unknown emulation argument {spec!r}: {exc}") from exc
     if isinstance(spec, dict) and len(spec) == 1:
@@ -100,7 +102,7 @@ def _segment_bytes(start: int, end: int) -> bytes:
 
 @idasync
 def _snapshot(target: str, calls: list[list[Any]]) -> dict[str, Any]:
-    from .utils import resolve_address_or_name
+    from .utils import display_name, parse_address
 
     if ida_ida.inf_is_be():
         raise VNextError(ErrorCode.NOT_SUPPORTED, "Big-endian targets are not supported by the emulator")
@@ -113,7 +115,7 @@ def _snapshot(target: str, calls: list[list[Any]]) -> dict[str, Any]:
     else:
         raise VNextError(ErrorCode.NOT_SUPPORTED, f"Emulation supports x86, x64, ARM, and ARM64, not {proc}")
     try:
-        ea = resolve_address_or_name(target)
+        ea = parse_address(target)
     except IDAError as exc:
         raise _invalid(str(exc)) from exc
 
@@ -145,7 +147,7 @@ def _snapshot(target: str, calls: list[list[Any]]) -> dict[str, Any]:
 
     return {
         "ea": int(ea),
-        "name": ida_name.get_name(ea) or hex(ea),
+        "name": display_name(ea),
         "arch": arch,
         "windows": ida_ida.inf_get_filetype() == ida_ida.f_PE,
         "thumb": arch == "arm" and idc.get_sreg(ea, "T") == 1,
@@ -324,12 +326,40 @@ def _run_one(snap: dict[str, Any], spans: list[tuple[int, int]], arg_specs: list
         return 0
 
     import_log: list[dict[str, str]] = []
+    unmodelled: dict[str, int] = {}
+    # Stack bytes the emulated code wrote; buffers handed to imports are reported from it.
+    stack_written = bytearray(_STACK_SIZE)
+    stack_buffers: list[dict[str, Any]] = []
+
+    def capture_stack_args(short: str) -> None:
+        for index in range(_STACK_ARG_SCAN):
+            try:
+                start = call_arg(index) - stack
+            except uc.UcError:
+                return
+            if not 0 <= start < _STACK_SIZE or not stack_written[start]:
+                continue
+            end = start
+            while end < min(start + _MAX_WRITE_BYTES, _STACK_SIZE) and stack_written[end]:
+                end += 1
+            data = bytes(mu.mem_read(stack + start, end - start))
+            entry: dict[str, Any] = {"addr": hex(stack + start), "size": end - start, "hex": data.hex(),
+                                     "passed_to": f"{short} arg{index}"}
+            text = _text(data)
+            if text is not None:
+                entry["text"] = text
+            if len(stack_buffers) < _MAX_WRITE_RANGES and entry not in stack_buffers:
+                stack_buffers.append(entry)
 
     def on_stub(emu, address, _size, _user):
         name = names.get(address, hex(address))
+        short = _strip_import(name)
+        modelled = short in _MODELLED_IMPORTS
         if len(import_log) < _MAX_IMPORT_LOG:
-            import_log.append({"name": name, "stubbed": "modelled" if _strip_import(name) in
-                               ("malloc", "calloc", "memcpy", "memmove", "memset", "strlen") else "returned 0"})
+            import_log.append({"name": name, "stubbed": "modelled" if modelled else "returned 0"})
+        if not modelled:
+            unmodelled[short] = unmodelled.get(short, 0) + 1
+            capture_stack_args(short)
         emu.reg_write(spec["ret"], builtin(name) & mask)
         if spec["lr"] is None:
             current_sp = emu.reg_read(spec["sp"])
@@ -340,6 +370,13 @@ def _run_one(snap: dict[str, Any], spans: list[tuple[int, int]], arg_specs: list
 
     for lo, hi in stub_ranges:
         mu.hook_add(uc.UC_HOOK_CODE, on_stub, begin=lo, end=hi - 1)
+
+    def on_stack_write(_emu, _access, address, size, _value, _user):
+        offset = address - stack
+        size = min(size, _STACK_SIZE - offset)
+        stack_written[offset : offset + size] = b"\x01" * size
+
+    mu.hook_add(uc.UC_HOOK_MEM_WRITE, on_stack_write, begin=stack, end=stack + _STACK_SIZE - 1)
 
     write_events: list[tuple[int, int]] = []
     writes_truncated = [False]
@@ -383,7 +420,13 @@ def _run_one(snap: dict[str, Any], spans: list[tuple[int, int]], arg_specs: list
         if text is not None:
             entry["text"] = text
         row["writes"].append(entry)
+    row["writes"].extend(stack_buffers)
     row["writes_truncated"] = writes_truncated[0] or len(ranges) > _MAX_WRITE_RANGES
+    if unmodelled:
+        row["warnings"] = [
+            f"{name} called {count}x: not modelled, returned 0 (results depending on it may be wrong)"
+            for name, count in unmodelled.items()
+        ]
     return row
 
 

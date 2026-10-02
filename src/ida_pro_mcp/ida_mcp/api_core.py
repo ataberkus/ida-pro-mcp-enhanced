@@ -14,13 +14,17 @@ import ida_lines
 import idautils
 import ida_loader
 import ida_nalt
+import ida_name
+import ida_segment
 import ida_strlist
 import ida_typeinf
+import ida_xref
 import idc
 
 from . import compat
 from .rpc import tool, unsafe
 from .sync import (
+    IDAError,
     get_pending_ui_request_count,
     get_search_page_budget_seconds,
     get_tool_deadline,
@@ -36,10 +40,12 @@ from .utils import (
     Page,
     ImportQuery,
     get_function,
+    get_stack_frame_variables_internal,
+    display_name,
     normalize_dict_list,
     normalize_list_input,
     parse_address,
-    resolve_address_or_name,
+    pretty_name,
     clamp_int,
     paginate,
     pattern_filter,
@@ -173,6 +179,99 @@ def _primary_text_key(kind: str) -> str:
     return "name"
 
 
+def _name_fields(raw: str) -> dict:
+    """`name` is the agent-facing display name; `mangled` only when it differs."""
+    name = pretty_name(raw)
+    return {"name": name, "mangled": raw} if name != raw else {"name": name}
+
+
+def _xref_count(ea: int, cap: int = 10000) -> int:
+    count = 0
+    for xref in idautils.XrefsTo(ea, 0):
+        if xref.type == ida_xref.fl_F:
+            continue
+        count += 1
+        if count >= cap:  # ponytail: per-row cap keeps hub symbols bounded; report exact counts via xref_query
+            break
+    return count
+
+
+_MAX_LOCALS_TARGETS = 64
+
+
+def _resolve_function_targets(raw: object) -> list[int]:
+    items = raw if isinstance(raw, list) else normalize_list_input(raw or "")
+    if not items:
+        raise ValueError("kind=locals requires targets (function names or addresses)")
+    if len(items) > _MAX_LOCALS_TARGETS:
+        raise ValueError(f"kind=locals accepts at most {_MAX_LOCALS_TARGETS} targets")
+    eas = []
+    for item in items:
+        ea = parse_address(item.get("addr", "") if isinstance(item, dict) else item)
+        func = compat.get_func(ea)
+        if func is None:
+            raise ValueError(f"Not a function: {item}")
+        eas.append(int(func.start_ea))
+    return eas
+
+
+def _lvar_rows(func_ea: int, func_name: str) -> list[dict] | None:
+    """Hex-Rays locals, or None when the decompiler is unavailable for this function."""
+    try:
+        if not ida_hexrays.init_hexrays_plugin():
+            return None
+        cfunc = ida_hexrays.decompile(func_ea)
+    except Exception:
+        return None
+    if cfunc is None:
+        return None
+    rows = []
+    for lvar in cfunc.lvars:
+        if not lvar.name:
+            continue
+        if lvar.is_stk_var():
+            location = f"stack:{lvar.get_stkoff():#x}"
+        elif lvar.is_reg_var():
+            location = f"reg:{ida_hexrays.get_mreg_name(lvar.get_reg1(), lvar.width)}"
+        else:
+            location = ""
+        rows.append(
+            {
+                "kind": "local",
+                "addr": hex(func_ea),
+                "func": func_name,
+                "name": lvar.name,
+                "type": str(lvar.type()),
+                "is_arg": bool(lvar.is_arg_var() if callable(lvar.is_arg_var) else lvar.is_arg_var),
+                "location": location,
+            }
+        )
+    return rows
+
+
+def _collect_locals(func_eas: list[int]) -> list[dict]:
+    rows: list[dict] = []
+    for func_ea in func_eas:
+        func_name = display_name(func_ea)
+        lvars = _lvar_rows(func_ea, func_name)
+        if lvars is not None:
+            rows.extend(lvars)
+            continue
+        for var in get_stack_frame_variables_internal(func_ea, False):
+            rows.append(
+                {
+                    "kind": "local",
+                    "addr": hex(func_ea),
+                    "func": func_name,
+                    "name": var["name"],
+                    "type": var["type"],
+                    "location": f"stack:{var['offset']}",
+                    "size": var["size"],
+                }
+            )
+    return rows
+
+
 def _collect_entities(kind: str, query: dict | None = None) -> list[dict]:
     if kind == "functions":
         rows: list[dict] = []
@@ -185,7 +284,7 @@ def _collect_entities(kind: str, query: dict | None = None) -> list[dict]:
                 {
                     "kind": "function",
                     "addr": hex(fn.start_ea),
-                    "name": ida_funcs.get_func_name(fn.start_ea) or "<unnamed>",
+                    **_name_fields(ida_funcs.get_func_name(fn.start_ea) or f"sub_{fn.start_ea:X}"),
                     "size": hex(size_int),
                     "size_int": size_int,
                     "segment": compat.get_segment_name(fn.start_ea),
@@ -203,7 +302,7 @@ def _collect_entities(kind: str, query: dict | None = None) -> list[dict]:
                 {
                     "kind": "global",
                     "addr": hex(ea),
-                    "name": name,
+                    **_name_fields(name),
                     "size": idc.get_item_size(ea),
                     "segment": compat.get_segment_name(ea),
                 }
@@ -217,7 +316,7 @@ def _collect_entities(kind: str, query: dict | None = None) -> list[dict]:
                 {
                     "kind": "import",
                     "addr": imp["addr"],
-                    "name": imp["imported_name"],
+                    **_name_fields(imp["imported_name"]),
                     "module": imp["module"],
                 }
             )
@@ -247,13 +346,54 @@ def _collect_entities(kind: str, query: dict | None = None) -> list[dict]:
                 {
                     "kind": "name",
                     "addr": hex(ea),
-                    "name": name,
+                    **_name_fields(name),
                     "segment": compat.get_segment_name(ea),
                     "is_function": is_function,
                     "is_import": is_import,
                 }
             )
         return rows
+
+    if kind == "segments":
+        from .api_survey import _build_segments
+
+        rows = []
+        for seg in _build_segments():
+            start = int(seg["start"], 16)
+            try:
+                sclass = ida_segment.get_segm_class(ida_segment.getseg(start)) or ""
+            except Exception:
+                sclass = ""
+            rows.append(
+                {
+                    "kind": "segment",
+                    "addr": seg["start"],
+                    "name": seg["name"],
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "size": seg["size"],
+                    "perms": seg["permissions"],
+                    "class": sclass,
+                }
+            )
+        return rows
+
+    if kind == "entrypoints":
+        from .api_survey import _build_entrypoints
+
+        rows = []
+        for entry in _build_entrypoints():
+            raw = ida_name.get_name(int(entry["addr"], 16)) or entry["name"]
+            row = {"kind": "entrypoint", "addr": entry["addr"], "name": entry["name"]}
+            if raw != entry["name"]:
+                row["mangled"] = raw
+            if "ordinal" in entry:
+                row["ordinal"] = entry["ordinal"]
+            rows.append(row)
+        return rows
+
+    if kind == "locals":
+        return _collect_locals(_resolve_function_targets((query or {}).get("targets")))
 
     if kind in {"switches", "patches", "classes", "vtables", "signatures", "type_libraries"}:
         from . import api_recovery
@@ -418,11 +558,12 @@ def int_convert(
         "Convert numbers to various formats (hex, decimal, binary, ascii)",
     ],
 ) -> list[dict]:
-    """Canonical number conversion (listed in CANONICAL_TOOLS).
-    WHEN: render numbers as decimal/hex/bytes/ascii/binary (string form means {"text": s, size 64}).
-    RETURNS: [{input, result{decimal, hexadecimal, bytes, ascii, binary}, error}] per input.
-    LIMITS: unparsable text and values too big for size return error entries, result None."""
-    inputs = normalize_dict_list(inputs, lambda s: {"text": s, "size": 64})
+    """Convert numbers between decimal, hex, little-endian bytes, ascii and binary.
+    WHEN: interpret a constant/immediate (e.g. is 0x6c6c6548 ASCII?) without a round trip through Python.
+    RETURNS: [{input, result{decimal, hexadecimal, bytes, ascii, binary}, error}] per input; bytes are little-endian two's complement, space-separated hex.
+    LIMITS: text accepts decimal, 0x/0o/0b prefixes and negatives; size (bytes) defaults to the minimal signed width; unparsable text or values too big for size return an error entry with result None.
+    NEXT: search(kind="constant") to find where the value is used."""
+    inputs = normalize_dict_list(inputs, lambda s: {"text": s})
 
     results = []
     for item in inputs:
@@ -521,32 +662,44 @@ def entity_query(
         "Generic entity query with filtering, projection, and pagination",
     ],
 ) -> list[dict]:
-    """Canonical entity search (listed in CANONICAL_TOOLS).
-    WHEN: filtered/paginated listing of functions|globals|imports|strings|names|switches|patches|classes|vtables|signatures|type_libraries with glob/regex filter, projection, sorting.
-    RETURNS: [{kind, data[rows], next_offset, total, error}] per query.
-    LIMITS: count max 5000; bad kind returns an error entry listing Allowed values; regex errors surface in error, not raises."""
+    """List IDB entities with filtering, sorting, projection and pagination.
+    WHEN: enumerate or filter entities of one kind; for one known address use memory_read / type_query.
+    RETURNS: [{kind, data[rows], next_offset, total, error}] per query. `name` is the demangled display name; `mangled` appears only when different. segments {name,start,end,size,perms,class}; entrypoints {name, ordinal?}; locals {func,name,type,is_arg,location}.
+    LIMITS: count max 5000; locals needs targets (max 64 functions); include_counts adds xref_count (capped 10000) and allows sort_by="xref_count"; unknown kind/sort_by and bad regex return error.
+    NEXT: decompile a function row; graph_query(kind="xrefs") on interesting rows."""
     queries = normalize_dict_list(
         queries,
         lambda s: {"kind": s, "offset": 0, "count": 100, "sort_by": "addr"},
     )
     results: list[dict] = []
 
+    def error_page(kind: str, message: str) -> dict:
+        return {"kind": kind, "data": [], "next_offset": None, "total": 0, "error": message}
+
     for query in queries:
         kind = str(query.get("kind", "functions") or "functions").lower()
-        allowed_entity_kinds = ("functions", "globals", "imports", "strings", "names", "switches", "patches", "classes", "vtables", "signatures", "type_libraries")
+        allowed_entity_kinds = ("functions", "globals", "imports", "strings", "names", "segments", "entrypoints", "locals", "switches", "patches", "classes", "vtables", "signatures", "type_libraries")
         if kind not in set(allowed_entity_kinds):
+            results.append(error_page(kind, f"Unsupported kind: {kind}. Allowed: {', '.join(allowed_entity_kinds)}"))
+            continue
+
+        try:
+            rows = _collect_entities(kind, query)
+        except (IDAError, ValueError) as exc:
+            results.append(error_page(kind, str(exc)))
+            continue
+        include_counts = bool(query.get("include_counts", False))
+        sortable = {"addr"} | {key for row in rows for key in row} - {"kind", "size_int"}
+        if include_counts:
+            sortable.add("xref_count")
+        sort_by = str(query.get("sort_by", "addr") or "addr")
+        if rows and sort_by not in sortable:
+            hint = " (requires include_counts=true)" if sort_by == "xref_count" else ""
             results.append(
-                {
-                    "kind": kind,
-                    "data": [],
-                    "next_offset": None,
-                    "total": 0,
-                    "error": f"Unsupported kind: {kind}. Allowed: {', '.join(allowed_entity_kinds)}",
-                }
+                error_page(kind, f"Unknown sort_by '{sort_by}' for kind {kind}{hint}. Allowed: {', '.join(sorted(sortable))}")
             )
             continue
 
-        rows = _collect_entities(kind, query)
         primary_key = _primary_text_key(kind)
         filter_pattern = str(query.get("filter", "") or "")
         if filter_pattern:
@@ -571,25 +724,22 @@ def entity_query(
         if module_filter and kind == "imports":
             rows = pattern_filter(rows, module_filter, "module")
 
-        min_addr = query.get("min_addr")
-        if min_addr not in (None, "") and query_error is None:
+        for bound, keep in (("min_addr", lambda ea, b: ea >= b), ("max_addr", lambda ea, b: ea <= b)):
+            value = query.get(bound)
+            if value in (None, "") or query_error is not None:
+                continue
             try:
-                min_ea = resolve_address_or_name(min_addr)
-                rows = [row for row in rows if int(str(row["addr"]), 16) >= min_ea]
-            except Exception:
-                query_error = f"Invalid min_addr: {min_addr!r}"
+                limit_ea = parse_address(value)
+            except IDAError as exc:
+                query_error = f"Invalid {bound}: {exc}"
                 rows = []
+                continue
+            rows = [row for row in rows if keep(int(str(row["addr"]), 16), limit_ea)]
 
-        max_addr = query.get("max_addr")
-        if max_addr not in (None, "") and query_error is None:
-            try:
-                max_ea = resolve_address_or_name(max_addr)
-                rows = [row for row in rows if int(str(row["addr"]), 16) <= max_ea]
-            except Exception:
-                query_error = f"Invalid max_addr: {max_addr!r}"
-                rows = []
+        if include_counts:
+            for row in rows:
+                row["xref_count"] = _xref_count(int(str(row["addr"]), 16))
 
-        sort_by = str(query.get("sort_by", "addr") or "addr")
         descending = bool(query.get("descending", False))
         if sort_by == "addr":
             rows.sort(key=lambda row: int(str(row.get("addr", "0x0")), 16), reverse=descending)
@@ -599,7 +749,12 @@ def entity_query(
                 reverse=descending,
             )
         else:
-            rows.sort(key=lambda row: str(row.get(sort_by, "")).lower(), reverse=descending)
+            rows.sort(
+                key=lambda row: (0, row[sort_by], "")
+                if isinstance(row.get(sort_by), int)
+                else (1, 0, str(row.get(sort_by, "")).lower()),
+                reverse=descending,
+            )
 
         offset = clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
         count = clamp_int(query.get("count", 100), 100, 0, 5000)
@@ -920,9 +1075,7 @@ def search_text(
                 entry: SearchTextHit = {"addr": hex(head_ea), "matches": lines}
                 func = compat.get_func(head_ea)
                 if func is not None:
-                    fname = ida_funcs.get_func_name(func.start_ea)
-                    if fname:
-                        entry["function"] = fname
+                    entry["function"] = display_name(func.start_ea)
                 sname = compat.get_segment_name(head_ea)
                 if sname:
                     entry["segment"] = sname

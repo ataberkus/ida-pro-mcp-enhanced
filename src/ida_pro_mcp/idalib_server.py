@@ -25,6 +25,7 @@ from ida_pro_mcp.ida_mcp.discovery import (
 )
 from ida_pro_mcp.ida_mcp.http import IdaMcpHttpRequestHandler
 from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile, load_profile_scopes
+from ida_pro_mcp.ida_mcp.sync import run_main_thread_work
 from ida_pro_mcp.ida_mcp.rpc import (
     LEGACY_TOOLS_ENABLED,
     get_workspace_policy,
@@ -381,6 +382,9 @@ def main():
             port=args.port,
             background=False,
             request_handler=IdaMcpHttpRequestHandler,
+            # Background jobs reach IDA only through this loop; 20 ms bounds their per-call latency.
+            poll_interval=0.02,
+            idle_callback=run_main_thread_work,
         )
     finally:
         # Reached when MCP_SERVER.serve returns: either signal handler called

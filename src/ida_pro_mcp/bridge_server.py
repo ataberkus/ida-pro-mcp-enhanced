@@ -22,11 +22,13 @@ try:
         write_token_file,
     )
     from .vnext.contracts import VNextError
+    from .vnext.guide import BRIDGE_GUIDE
 except ImportError:
     from vnext.auth import (
         AuthPolicy, create_token, default_token_path, load_token_file, write_token_file
     )
     from vnext.contracts import VNextError
+    from vnext.guide import BRIDGE_GUIDE
 
 if TYPE_CHECKING:
     from ida_pro_mcp.ida_mcp.zeromcp import (
@@ -107,6 +109,7 @@ def _get_bridge_timeout_seconds() -> float:
 
 
 mcp = McpServer("ida-pro-mcp")
+mcp.instructions = BRIDGE_GUIDE
 dispatch_original = mcp.registry.dispatch
 
 # Discovery-driven routing table. Rebuilt whenever the live instance set changes.

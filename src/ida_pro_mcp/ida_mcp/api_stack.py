@@ -37,11 +37,9 @@ def stack_frame(addrs: Annotated[list[str] | str, "Address(es)"]) -> list[dict]:
     addrs = normalize_list_input(addrs)
     results = []
 
-    from .utils import resolve_address_or_name
-
     for addr in addrs:
         try:
-            ea = resolve_address_or_name(addr)
+            ea = parse_address(addr)
             vars = get_stack_frame_variables_internal(ea, True)
             results.append({"addr": addr, "vars": vars})
         except Exception as e:

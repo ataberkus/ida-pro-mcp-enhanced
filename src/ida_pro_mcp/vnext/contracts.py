@@ -109,7 +109,17 @@ class ToolEnvelope(Generic[T]):
     schema_version: str = API_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        return normalize_public_addresses(asdict(self))
+        value: dict[str, Any] = {"data": self.data}
+        if self.warnings:
+            value["warnings"] = list(self.warnings)
+        if self.provenance:
+            value["provenance"] = dict(self.provenance)
+        if self.truncated:
+            value["truncated"] = True
+        if self.next_cursor is not None:
+            value["next_cursor"] = self.next_cursor
+        value["schema_version"] = self.schema_version
+        return normalize_public_addresses(value)
 
 
 class JobState(str, Enum):
@@ -246,8 +256,24 @@ class MutationPreview:
     schema_version: str = API_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        value = asdict(self)
-        value["operations"] = [operation.to_dict() for operation in self.operations]
+        """Compact wire form: each operation carries its own preview fields."""
+        operations = []
+        for index, operation in enumerate(self.operations):
+            entry = operation.to_dict()
+            change = self.changes[index] if index < len(self.changes) else {}
+            entry.update({key: val for key, val in change.items() if key not in entry})
+            operations.append(entry)
+        value: dict[str, Any] = {
+            "transaction_id": self.transaction_id,
+            "database": self.database,
+            "revision": self.revision,
+            "operations": operations,
+            "required_scopes": list(self.required_scopes),
+            "expires_at": self.expires_at,
+            "schema_version": self.schema_version,
+        }
+        if self.warnings:
+            value["warnings"] = list(self.warnings)
         return value
 
 
@@ -264,6 +290,7 @@ class MutationReceipt:
     warnings: list[str] = field(default_factory=list)
     applied_operations: int = 0
     error: dict[str, Any] | None = None
+    required_scopes: list[str] = field(default_factory=list)
     schema_version: str = API_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:

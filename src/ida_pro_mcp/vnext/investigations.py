@@ -9,6 +9,54 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from .contracts import Evidence, Finding, InvestigationRecord, VNextError, ErrorCode
+from .jobs import StateSaver
+
+_EVIDENCE_ADDRESS_KEYS = ("addr", "address", "ea")
+_EVIDENCE_TEXT_KEYS = ("description", "text", "data", "note")
+
+
+def _first_present(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _parse_evidence(
+    items: list[dict[str, Any]],
+    resolve_address: Callable[[str], str] | None,
+) -> list[Evidence]:
+    parsed = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"Evidence {index} must be an object")
+        address = _first_present(item, _EVIDENCE_ADDRESS_KEYS)
+        text = _first_present(item, _EVIDENCE_TEXT_KEYS)
+        if address is None and text is None:
+            raise VNextError(
+                ErrorCode.INVALID_OPERATION,
+                f"Evidence {index} needs an address (addr/address/ea) or a description (description/text/data/note)",
+            )
+        if address is not None:
+            address = hex(address) if isinstance(address, int) else str(address).strip()
+            if resolve_address is not None:
+                try:
+                    address = resolve_address(address)
+                except Exception:
+                    pass  # keep the caller's text when it does not resolve
+        if text is not None and not isinstance(text, str):
+            text = json.dumps(text, sort_keys=True, default=str)
+        parsed.append(
+            Evidence(
+                address=address,
+                description=text or "",
+                source=str(item.get("source", "user")),
+                confidence=max(0.0, min(1.0, float(item.get("confidence", 1.0)))),
+                metadata=dict(item.get("metadata", {})),
+            )
+        )
+    return parsed
 
 
 def _utc_now() -> str:
@@ -25,7 +73,11 @@ class InvestigationManager:
     ) -> None:
         self._lock = RLock()
         self._records: dict[str, InvestigationRecord] = {}
-        self._save_state = save_state
+        self._saver = StateSaver(
+            self._lock,
+            lambda: {key: value.to_dict() for key, value in self._records.items()},
+            save_state,
+        )
         self._on_change = on_change
         if load_state is not None:
             self._restore(load_state() or {})
@@ -45,7 +97,7 @@ class InvestigationManager:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Investigation objective cannot be empty")
         with self._lock:
             self._records[record.investigation_id] = record
-            self._persist_locked()
+        self._saver.flush()
         self._notify(record)
         return record
 
@@ -63,7 +115,7 @@ class InvestigationManager:
             if record.state not in {"completed", "failed", "cancelled", "interrupted"}:
                 record.state = "running"
             record.updated_at = _utc_now()
-            self._persist_locked()
+        self._saver.flush()
         self._notify(record)
         return record
 
@@ -73,7 +125,7 @@ class InvestigationManager:
             record.state = state
             record.metadata.update(metadata)
             record.updated_at = _utc_now()
-            self._persist_locked()
+        self._saver.flush()
         self._notify(record)
         return record
 
@@ -87,17 +139,9 @@ class InvestigationManager:
         confidence: float = 0.5,
         evidence: list[dict[str, Any]] | None = None,
         tags: list[str] | None = None,
+        resolve_address: Callable[[str], str] | None = None,
     ) -> Finding:
-        parsed_evidence = [
-            Evidence(
-                address=item.get("address"),
-                description=str(item.get("description", "")),
-                source=str(item.get("source", "user")),
-                confidence=max(0.0, min(1.0, float(item.get("confidence", 1.0)))),
-                metadata=dict(item.get("metadata", {})),
-            )
-            for item in (evidence or [])
-        ]
+        parsed_evidence = _parse_evidence(list(evidence or []), resolve_address)
         finding = Finding(
             finding_id=str(uuid4()),
             title=title.strip(),
@@ -113,7 +157,7 @@ class InvestigationManager:
             record = self.get(investigation_id)
             record.findings.append(finding)
             record.updated_at = _utc_now()
-            self._persist_locked()
+        self._saver.flush()
         self._notify(record)
         return finding
 
@@ -136,15 +180,6 @@ class InvestigationManager:
         if normalized == "sarif":
             return json.dumps(_to_sarif(record), indent=2, sort_keys=True)
         raise VNextError(ErrorCode.NOT_SUPPORTED, f"Unsupported report format: {format}")
-
-    def _persist_locked(self) -> None:
-        if self._save_state is not None:
-            try:
-                self._save_state({key: value.to_dict() for key, value in self._records.items()})
-            except Exception:
-                # Keep investigations usable when an IDB is closing or its
-                # persistence backend is temporarily unavailable.
-                pass
 
     def _notify(self, record: InvestigationRecord) -> None:
         if self._on_change is not None:

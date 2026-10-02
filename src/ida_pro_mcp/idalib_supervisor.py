@@ -38,6 +38,7 @@ from ida_pro_mcp.vnext.auth import (
     load_token_file,
 )
 from ida_pro_mcp.vnext.contracts import API_SCHEMA_VERSION, VNextError
+from ida_pro_mcp.vnext.guide import SUPERVISOR_GUIDE
 
 
 logger = logging.getLogger(__name__)
@@ -45,14 +46,10 @@ logger = logging.getLogger(__name__)
 _DATABASE_ARG = "database"
 _DATABASE_ARG_SCHEMA = {
     "type": "string",
-    "description": (
-        "Session ID returned by idb_open. Use idb_list to enumerate "
-        "open sessions."
-    ),
+    "description": "Session id/prefix, filename, or path from idb_list; omit when one database is open.",
 }
-_DATABASE_REQUIRED_ERROR = (
-    "database is required. Pass database=<session_id> with every tool call. "
-    "Open a session with idb_open or enumerate with idb_list."
+_BINARY_DIFF_NOTE = (
+    " binary_diff (supervisor): database=left session, options.right_database=right session."
 )
 
 IDB_OPEN_MODES = {
@@ -86,6 +83,23 @@ def _get_worker_open_timeout_sec() -> float:
 
 
 WORKER_OPEN_TIMEOUT_SEC = _get_worker_open_timeout_sec()
+
+
+def _get_open_wait_sec() -> float:
+    """How long idb_open(wait=true) blocks before returning state='opening'.
+
+    Most MCP clients time out a tool call after 60-120 s; analysis keeps running
+    in the background past this budget. IDA_MCP_OPEN_WAIT_SEC=0 waits until done.
+    """
+    raw = os.environ.get("IDA_MCP_OPEN_WAIT_SEC", "90")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 90.0
+    if value != value or value < 0:
+        return 90.0
+    return value
+
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -140,7 +154,7 @@ def _discovered_instance_backend(instance: dict[str, Any]) -> str:
     return "gui"
 
 
-class IdalibSessionInfo(TypedDict):
+class _IdalibSessionCore(TypedDict):
     session_id: str
     input_path: str
     filename: str
@@ -148,6 +162,11 @@ class IdalibSessionInfo(TypedDict):
     last_accessed: str
     is_analyzing: bool
     metadata: dict[str, Any]
+
+
+class IdalibSessionInfo(_IdalibSessionCore, total=False):
+    state: str  # opening | ready | failed
+    error: str
 
 
 class IdalibSessionListInfo(IdalibSessionInfo, total=False):
@@ -164,6 +183,7 @@ class IdalibOpenResult(TypedDict, total=False):
     session: IdalibSessionInfo
     warmup: dict[str, Any] | None
     message: str
+    warning: str
     error: str
 
 
@@ -212,6 +232,7 @@ class WorkerSession:
             "last_accessed": self.last_accessed.isoformat(),
             "is_analyzing": self.is_analyzing,
             "metadata": self.metadata,
+            "state": "ready",
         }
 
     def to_list_dict(self, *, active: bool | None = None) -> IdalibSessionListInfo:
@@ -236,6 +257,60 @@ class WorkerSession:
         return self.process is not None and self.process.poll() is None
 
 
+@dataclass
+class OpenJob:
+    """A database whose idb_open is still running (or failed) in the background."""
+
+    session_id: str
+    input_path: str
+    filename: str
+    path_key: str
+    started: float = field(default_factory=time.monotonic)
+    created_at: datetime = field(default_factory=datetime.now)
+    state: str = "opening"
+    error: str | None = None
+
+    def elapsed_sec(self) -> int:
+        return int(time.monotonic() - self.started)
+
+    def to_dict(self) -> IdalibSessionInfo:
+        info: IdalibSessionInfo = {
+            "session_id": self.session_id,
+            "input_path": self.input_path,
+            "filename": self.filename,
+            "created_at": self.created_at.isoformat(),
+            "last_accessed": self.created_at.isoformat(),
+            "is_analyzing": self.state == "opening",
+            "metadata": {"elapsed_sec": self.elapsed_sec()},
+            "state": self.state,
+        }
+        if self.error:
+            info["error"] = self.error
+        return info
+
+    def to_list_dict(self) -> IdalibSessionListInfo:
+        return {
+            **self.to_dict(),
+            "is_active": False,
+            "backend": "worker",
+            "owned": True,
+            "adopted": True,
+            "pid": None,
+            "worker_pid": None,
+        }
+
+    def unavailable_error(self) -> RuntimeError:
+        if self.state == "failed":
+            return RuntimeError(
+                f"Session '{self.filename}' failed to open: {self.error}. "
+                f"Retry with idb_open(input_path={self.input_path!r})."
+            )
+        return RuntimeError(
+            f"Session '{self.filename}' is still analyzing (elapsed {self.elapsed_sec()}s); "
+            "retry or poll idb_list"
+        )
+
+
 class IdalibSupervisor:
     def __init__(
         self,
@@ -258,6 +333,8 @@ class IdalibSupervisor:
         self._pending_worker_requests: dict[tuple[str | None, Any], WorkerSession] = {}
         self._pending_opens: dict[str, threading.Event] = {}
         self._pending_slots = 0
+        # idb_open calls still analyzing (or failed) in the background, by session id.
+        self._open_jobs: dict[str, OpenJob] = {}
 
     # ------------------------------------------------------------------
     # Worker process lifecycle
@@ -349,6 +426,8 @@ class IdalibSupervisor:
             start_new_session = True
         worker_environment = os.environ.copy()
         worker_environment["IDA_MCP_AUTH_TOKEN"] = worker_token
+        # Worker ports are private: truncated outputs must not point at them.
+        worker_environment["IDA_MCP_SUPERVISED"] = "1"
         log_handle, log_path = self._open_worker_log(port)
         try:
             process = subprocess.Popen(
@@ -793,8 +872,8 @@ class IdalibSupervisor:
         matches, removed, added = self._match_functions(left, right)
         return {
             "data": {
-                "left_database": left_database,
-                "right_database": right_database,
+                "left_database": left_session.session_id,
+                "right_database": right_session.session_id,
                 "matches": matches,
                 "changed": [item for item in matches if item["changed"]],
                 "unchanged": [item for item in matches if not item["changed"]],
@@ -1247,6 +1326,68 @@ class IdalibSupervisor:
         if event is not None:
             event.set()
 
+    def start_open(
+        self,
+        input_path: str,
+        *,
+        wait_sec: float | None,
+        session_id: str | None = None,
+        **open_kwargs: Any,
+    ) -> WorkerSession | OpenJob:
+        """Run open_session in the background, waiting at most ``wait_sec``.
+
+        Returns the ready session, or the OpenJob still analyzing once the budget
+        runs out (``None`` waits until done). Failures inside the budget raise.
+        """
+        mode = open_kwargs.get("mode", "prefer_headless")
+        if mode not in IDB_OPEN_MODES:
+            raise ValueError(f"Unknown mode: {mode!r}. Expected one of: {sorted(IDB_OPEN_MODES)}.")
+        resolved = str(
+            self.workspace_policy.resolve(self._normalize_input_path(input_path), must_exist=True)
+        )
+        path_key = self._path_key(resolved)
+        with self._lock:
+            existing = self.sessions.get(self.path_to_session.get(path_key, ""))
+            if existing is not None and existing.is_alive():
+                existing.last_accessed = datetime.now()
+                return existing
+            for job in list(self._open_jobs.values()):
+                if job.path_key == path_key:
+                    if job.state == "opening":
+                        return job
+                    self._open_jobs.pop(job.session_id, None)  # retry after a failure
+            session_id = normalize_session_id(session_id)
+            if session_id in self.sessions or session_id in self._open_jobs:
+                raise ValueError(f"Session already exists: {session_id}")
+            job = OpenJob(session_id, resolved, Path(resolved).name, path_key)
+            self._open_jobs[session_id] = job
+
+        result: dict[str, WorkerSession] = {}
+        done = threading.Event()
+
+        def run() -> None:
+            # ponytail: supervisor shutdown mid-open orphans the worker until its idle TTL.
+            try:
+                result["session"] = self.open_session(resolved, session_id=session_id, **open_kwargs)
+                with self._lock:
+                    self._open_jobs.pop(session_id, None)
+            except Exception as exc:
+                with self._lock:
+                    job.state = "failed"
+                    job.error = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=run, daemon=True, name=f"idb-open-{session_id}").start()
+        done.wait(wait_sec)
+        if "session" in result:
+            return result["session"]
+        if job.state == "failed":
+            with self._lock:
+                self._open_jobs.pop(session_id, None)
+            raise RuntimeError(job.error)
+        return job
+
     def _resolve_gui_fallback_path(self, session: WorkerSession) -> str:
         candidates = [session.input_path]
         requested_path = session.metadata.get("requested_path")
@@ -1341,38 +1482,123 @@ class IdalibSupervisor:
             with self._lock:
                 self._pending_slots = max(0, self._pending_slots - 1)
 
-    def resolve_session(self, database: str) -> WorkerSession:
+    def _worker_busy(self, session: WorkerSession) -> bool:
+        with self._lock:
+            return any(worker is session for worker in self._pending_worker_requests.values())
+
+    def resolve_session(self, database: str | None) -> WorkerSession:
         session = self.peek_session(database)
-        if self._session_is_reachable(session):
+        # A worker serves one request at a time, so a ping behind an in-flight
+        # call times out; that is "busy", not "dead". Queue behind it instead.
+        if (self._worker_busy(session) and session.is_alive()) or self._session_is_reachable(session):
             session.last_accessed = datetime.now()
             return session
         if session.backend == "gui":
             return self._reopen_gui_session_headless(session)
+        raise self._drop_dead_worker(session)
+
+    def _drop_dead_worker(self, session: WorkerSession) -> RuntimeError:
+        """Unregister and reap an unreachable worker; return the error to raise."""
         session_id = session.session_id
         with self._lock:
-            current = self.sessions.get(session_id)
-            if current is session:
+            if self.sessions.get(session_id) is session:
                 self._unregister_session_locked(session_id)
         self._terminate_worker(session)
-        raise RuntimeError(f"Worker for session '{session_id}' is not reachable")
+        return RuntimeError(
+            f"Worker for session '{session_id}' ({session.filename}) is not reachable "
+            "(crashed or hung) and was closed. Reopen with "
+            f"idb_open(input_path={session.input_path!r})."
+        )
 
-    def peek_session(self, database: str) -> WorkerSession:
+    @staticmethod
+    def _database_choices(entries: list[WorkerSession | OpenJob]) -> str:
+        return json.dumps(
+            [
+                {"session_id": entry.session_id, "filename": entry.filename}
+                for entry in entries
+            ]
+        )
+
+    def _lookup_database_locked(self, database: str | None) -> WorkerSession | OpenJob:
+        """Resolve a database selector to a session or pending open. Caller holds the lock.
+
+        Empty selects the only open database. Otherwise: exact session id, unique
+        session-id prefix (6+ chars), filename, basename without extension, or
+        input/IDB path (case-insensitive where the OS is).
+        """
+        # A finishing open is briefly in both maps under one id; the session wins.
+        entries: list[WorkerSession | OpenJob] = list({**self._open_jobs, **self.sessions}.values())
         if not database:
-            raise RuntimeError(_DATABASE_REQUIRED_ERROR)
-        with self._lock:
-            session = self.sessions.get(database)
-            if session is None:
-                raise RuntimeError(f"Session not found: {database}")
-            session.last_accessed = datetime.now()
-            return session
+            live = [entry for entry in entries if not (isinstance(entry, OpenJob) and entry.state == "failed")]
+            if len(live) == 1:
+                return live[0]
+            if not live:
+                raise RuntimeError("No database is open. Open one with idb_open(input_path=...).")
+            raise RuntimeError(
+                f"{len(live)} databases are open; pass database=<session_id or filename>. "
+                f"Choices: {self._database_choices(live)}"
+            )
+        selector = database.strip()
+        exact = self.sessions.get(selector) or self._open_jobs.get(selector)
+        if exact is not None:
+            return exact
+        name_key = os.path.normcase(selector)
+        try:
+            path_key = self._path_key(selector)
+        except (OSError, ValueError):
+            path_key = None
+        path_owner = self.path_to_session.get(path_key) if path_key else None
+        matches: list[WorkerSession | OpenJob] = []
+        for entry in entries:
+            name = Path(entry.filename or entry.input_path).name
+            base = re.sub(r"\.(i64|idb)$", "", name, flags=re.IGNORECASE)
+            names = {os.path.normcase(value) for value in (name, base, Path(base).stem) if value}
+            if (
+                name_key in names
+                or (len(selector) >= 6 and entry.session_id.startswith(selector))
+                or (path_owner is not None and entry.session_id == path_owner)
+                or (isinstance(entry, OpenJob) and entry.path_key == path_key)
+            ):
+                matches.append(entry)
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise RuntimeError(
+                f"Database '{database}' is ambiguous; pass a session_id. "
+                f"Choices: {self._database_choices(matches)}"
+            )
+        raise RuntimeError(
+            f"Session not found: {database}. Open databases: {self._database_choices(entries)}. "
+            "Use idb_list, or idb_open(input_path=...) to open it."
+        )
 
-    def close_session(self, database: str, *, save: bool = True) -> IdalibCloseResult:
+    def peek_session(self, database: str | None) -> WorkerSession:
+        with self._lock:
+            entry = self._lookup_database_locked(database)
+            if isinstance(entry, OpenJob):
+                raise entry.unavailable_error()
+            entry.last_accessed = datetime.now()
+            return entry
+
+    def close_session(self, database: str | None, *, save: bool = True) -> IdalibCloseResult:
         """Save (optionally), unregister, and terminate a session's owned worker.
 
         Adopted GUI/worker instances (``owned`` is False) are detached rather
         than killed: they keep running so another supervisor can adopt them.
         """
-        session = self.peek_session(database)
+        with self._lock:
+            entry = self._lookup_database_locked(database)
+            if isinstance(entry, OpenJob):
+                if entry.state != "failed":
+                    raise entry.unavailable_error()
+                self._open_jobs.pop(entry.session_id, None)
+                return {
+                    "success": True,
+                    "session_id": entry.session_id,
+                    "message": f"Discarded failed open: {entry.filename} ({entry.session_id})",
+                }
+        session = entry
+        database = session.session_id
         saved: bool | None = None
         save_error: str | None = None
         if save and self._session_is_reachable(session):
@@ -1409,14 +1635,27 @@ class IdalibSupervisor:
 
     def list_sessions(self) -> list[IdalibSessionListInfo]:
         with self._lock:
+            # Owned workers whose process exited are gone for good; drop them.
+            for dead_id in [
+                session.session_id
+                for session in self.sessions.values()
+                if session.backend == "worker" and session.owned and not session.is_alive()
+            ]:
+                self._unregister_session_locked(dead_id)
             adopted = [
-                session.to_list_dict(active=self._session_is_reachable(session))
+                session.to_list_dict(
+                    active=(self._worker_busy(session) and session.is_alive())
+                    or self._session_is_reachable(session)
+                )
                 for session in self.sessions.values()
             ]
-            adopted_path_keys = {
-                key
-                for key in self.path_to_session
-            }
+            adopted += [
+                job.to_list_dict()
+                for job in self._open_jobs.values()
+                if job.session_id not in self.sessions
+            ]
+            adopted_path_keys = set(self.path_to_session)
+            adopted_path_keys.update(job.path_key for job in self._open_jobs.values())
 
         unadopted: list[IdalibSessionListInfo] = []
         try:
@@ -1482,11 +1721,29 @@ class IdalibSupervisor:
         schema = tool.setdefault("inputSchema", {"type": "object", "properties": {}})
         schema.setdefault("type", "object")
         props = schema.setdefault("properties", {})
-        props.setdefault(_DATABASE_ARG, _DATABASE_ARG_SCHEMA)
-        required = schema.setdefault("required", [])
-        if _DATABASE_ARG not in required:
-            required.append(_DATABASE_ARG)
+        props[_DATABASE_ARG] = dict(_DATABASE_ARG_SCHEMA)
+        if _DATABASE_ARG in schema.get("required", []):
+            schema["required"].remove(_DATABASE_ARG)
+        if tool.get("name") == "analysis_run":
+            self._advertise_binary_diff(tool)
         return tool
+
+    @staticmethod
+    def _advertise_binary_diff(tool: dict) -> None:
+        """binary_diff runs in the supervisor (it spans two workers); advertise it."""
+        props = tool["inputSchema"]["properties"]
+        enum = (props.get("mode") or {}).get("enum")
+        if isinstance(enum, list) and "binary_diff" not in enum:
+            enum.append("binary_diff")
+        options = props.get("options") or {}
+        for variant in [options, *options.get("anyOf", [])]:
+            if isinstance(variant, dict) and isinstance(variant.get("properties"), dict):
+                variant["properties"].setdefault(
+                    "right_database",
+                    {"type": "string", "description": "binary_diff only: right-hand database selector"},
+                )
+        if _BINARY_DIFF_NOTE.strip() not in tool.get("description", ""):
+            tool["description"] = tool.get("description", "") + _BINARY_DIFF_NOTE
 
     def worker_resources(self, method: str) -> list[dict]:
         with self._lock:
@@ -1503,6 +1760,7 @@ class IdalibSupervisor:
 
 
 mcp = McpServer("ida-pro-mcp")
+mcp.instructions = SUPERVISOR_GUIDE
 supervisor: IdalibSupervisor | None = None
 _original_dispatch = mcp.registry.dispatch
 
@@ -1553,12 +1811,21 @@ def idb_open(
     preferred_session_id: Annotated[
         str, "Preferred session ID (auto-generated if empty). Ignored if the file is already open in a GUI or worker session."
     ] = "",
+    wait: Annotated[
+        bool,
+        "true: block until analysis finishes, at most IDA_MCP_OPEN_WAIT_SEC (default 90s). "
+        "false: return immediately with state='opening'.",
+    ] = True,
 ) -> IdalibOpenResult:
-    """Open a binary and warm it up. Returns the existing session if the file is already open under the supervisor; otherwise creates one according to `mode`."""
+    """WHEN starting work on a binary (or reattaching to one already open).
+    RETURNS {success, session{session_id, filename, state, ...}, warmup, message, warning?}; state is ready or opening.
+    LIMITS large binaries can analyze for minutes: past the wait budget (or with wait=false) analysis continues in the background and calls to that database fail fast with 'still analyzing' until it is ready.
+    NEXT idb_list until state=ready, then analysis_run(mode='triage')."""
     sup = _require_supervisor()
     try:
-        session = sup.open_session(
+        opened = sup.start_open(
             input_path,
+            wait_sec=(_get_open_wait_sec() or None) if wait else 0,
             mode=mode,
             run_auto_analysis=run_auto_analysis,
             build_caches=build_caches,
@@ -1566,19 +1833,37 @@ def idb_open(
             idle_ttl_sec=idle_ttl_sec,
             session_id=preferred_session_id or None,
         )
-        return {
-            "success": True,
-            "session": session.to_dict(),
-            "warmup": session.last_warmup,
-            "message": f"Binary opened: {session.filename} ({session.session_id})",
-        }
     except Exception as e:
         return {"error": str(e)}
+    if isinstance(opened, OpenJob):
+        result: IdalibOpenResult = {
+            "success": True,
+            "session": opened.to_dict(),
+            "message": (
+                f"{opened.filename} is still analyzing ({opened.session_id}); "
+                "poll idb_list until state is ready."
+            ),
+        }
+        if wait:
+            result["warning"] = (
+                f"Not ready within the {_get_open_wait_sec():.0f}s wait budget "
+                f"(elapsed {opened.elapsed_sec()}s); analysis continues in the background."
+            )
+        return result
+    return {
+        "success": True,
+        "session": opened.to_dict(),
+        "warmup": opened.last_warmup,
+        "message": f"Binary opened: {opened.filename} ({opened.session_id})",
+    }
 
 
 @mcp.tool
 def idb_list() -> IdalibListResult:
-    """List adopted sessions and discovered GUI/worker instances not yet opened through idb_open."""
+    """WHEN choosing a database or waiting for an idb_open to finish.
+    RETURNS {sessions[{session_id, filename, input_path, state(opening|ready|failed), error?, is_active, backend, ...}], count}; also discovered GUI/worker instances not yet opened (adopted=false, empty session_id).
+    LIMITS sessions whose worker exited are dropped.
+    NEXT pass session_id or filename as database=, or idb_open a discovered instance."""
     sup = _require_supervisor()
     try:
         sessions = sup.list_sessions()
@@ -1589,13 +1874,13 @@ def idb_list() -> IdalibListResult:
 
 @mcp.tool
 def idb_close(
-    database: Annotated[str, "Session ID returned by idb_open (see idb_list)."],
+    database: Annotated[str, _DATABASE_ARG_SCHEMA["description"]] = "",
     save: Annotated[bool, "Save the database before closing"] = True,
 ) -> IdalibCloseResult:
     """
     Close a session: optionally save it, unregister it from the supervisor, and
     terminate its owned worker (freeing a worker slot). Adopted GUI/worker instances
-    are detached, not killed.
+    are detached, not killed. A failed open is discarded; one still analyzing cannot be closed yet.
     """
     sup = _require_supervisor()
     try:
@@ -1622,8 +1907,10 @@ def sessions_resource() -> dict:
 def _handle_tools_list(request_obj: dict[str, Any]) -> dict[str, Any]:
     sup = _require_supervisor()
     local_tools = mcp._mcp_tools_list().get("tools", [])
-    worker_tools = sup.worker_tools()
-    return _jsonrpc_result(request_obj.get("id"), {"tools": worker_tools + local_tools})
+    # Supervisor-local tools win over same-named worker tools.
+    tools = {tool["name"]: tool for tool in sup.worker_tools()}
+    tools.update((tool["name"], tool) for tool in local_tools)
+    return _jsonrpc_result(request_obj.get("id"), {"tools": list(tools.values())})
 
 
 def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
@@ -1637,13 +1924,8 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
 
     arguments = copy.deepcopy(params.get("arguments") or {})
     database = arguments.pop(_DATABASE_ARG, None)
-    if not isinstance(database, str) or not database:
-        return _jsonrpc_result(
-            request_id,
-            _call_tool_result({"error": _DATABASE_REQUIRED_ERROR}, is_error=True),
-        )
     try:
-        session = sup.resolve_session(database)
+        session = sup.resolve_session(database if isinstance(database, str) else None)
     except Exception as e:
         return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
 
@@ -1659,7 +1941,7 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
                 ),
             )
         try:
-            result = sup.binary_diff(database, right_database, options=options)
+            result = sup.binary_diff(session.session_id, right_database, options=options)
             return _jsonrpc_result(request_id, _call_tool_result(result))
         except Exception as exc:
             return _jsonrpc_result(
@@ -1673,7 +1955,9 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
     try:
         return sup._worker_rpc(session, forwarded)
     except Exception as e:
-        return _jsonrpc_result(request_id, _call_tool_result({"error": str(e)}, is_error=True))
+        dead = session.backend == "worker" and not session.is_alive()
+        message = str(sup._drop_dead_worker(session)) if dead else str(e)
+        return _jsonrpc_result(request_id, _call_tool_result({"error": message}, is_error=True))
     finally:
         sup._untrack_worker_request(request_scope, request_id, session)
 
@@ -1705,7 +1989,8 @@ def _handle_resources_read(request_obj: dict[str, Any]) -> dict[str, Any] | None
     match = re.match(r"^ida://sessions/([^/]+)(/.*)?$", uri)
     if match:
         try:
-            session = sup.resolve_session(unquote(match.group(1)))
+            selector = unquote(match.group(1))
+            session = sup.resolve_session(None if selector == "active" else selector)
             forwarded = copy.deepcopy(request_obj)
             forwarded["params"]["uri"] = (
                 f"ida://sessions/active{match.group(2) or ''}"
@@ -1717,7 +2002,7 @@ def _handle_resources_read(request_obj: dict[str, Any]) -> dict[str, Any] | None
         request_obj.get("id"),
         -32001,
         f"Resource '{uri}' is not routable from idalib-mcp. "
-        "Use tools with an explicit database= argument instead.",
+        "Use ida://sessions/<database>/... or tools with database=.",
     )
 
 
@@ -1856,7 +2141,8 @@ def main() -> None:
 
     if args.input_path is not None:
         try:
-            supervisor.open_session(str(args.input_path))
+            # Serve immediately; the database shows state='opening' until analyzed.
+            supervisor.start_open(str(args.input_path), wait_sec=0)
         except Exception as e:
             raise SystemExit(f"Failed to open initial binary: {e}")
 

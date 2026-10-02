@@ -11,18 +11,15 @@ import base64
 import json
 import os
 import platform
+import re
 import sys
 from pathlib import Path
 from threading import RLock
-from typing import Annotated, Any, Literal, NoReturn, TypedDict, get_args
+from typing import Annotated, Any, Callable, Literal, NoReturn, TypedDict, get_args
 from urllib.parse import quote, unquote
 from uuid import uuid4
 
-from ida_pro_mcp.vnext.analysis import (
-    node_matches,
-    normalize_reference_flow_graph,
-    normalized_match_token,
-)
+from ida_pro_mcp.vnext.analysis import normalize_reference_flow_graph
 from ida_pro_mcp.vnext.contracts import (
     AnalysisEngine,
     AnalysisGraph,
@@ -73,9 +70,9 @@ except ImportError:
 # Closed vocabularies. Signatures use Literal so MCP clients get `enum`
 # constraints; bodies still `.lower()` for case-insensitive callers.
 SearchKind = Literal["text", "regex", "bytes", "constant", "instruction", "crypto", "ctree"]
-MemoryReadKind = Literal["bytes", "integer", "string", "global", "patch_diff"]
+MemoryReadKind = Literal["bytes", "integer", "string", "global", "struct", "patch_diff"]
 AnalysisMode = Literal["triage", "function", "component", "batch", "similar", "deep", "emulate"]
-GraphKind = Literal["xrefs", "xrefs_from", "xrefs_both", "calls", "cfg", "callsite_args"]
+GraphKind = Literal["xrefs", "xrefs_from", "xrefs_both", "calls", "callers", "path", "field_xrefs", "cfg", "callsite_args"]
 DataflowDirection = Literal["forward", "backward", "both"]
 SignatureFormat = Literal["ida", "x64dbg", "mask", "bitmask"]
 InvestigationExportFormat = Literal["json", "markdown", "sarif"]
@@ -88,9 +85,30 @@ DebugMemoryAction = Literal["read", "write", "snapshot", "diff"]
 DebugTraceAction = Literal["start", "status", "stop", "export"]
 
 
+class SearchOptions(TypedDict, total=False):
+    case_sensitive: Annotated[bool, "text/regex: case-sensitive match (default false)"]
+    include: Annotated[
+        Literal["all", "disasm", "comments", "strings"],
+        "text/regex: all = listing lines + comments (default), disasm, comments, or strings = defined string literals only",
+    ]
+    code_only: Annotated[bool, "text/regex: skip non-executable segments (default false)"]
+    start: Annotated[str, "text/regex/instruction: lower bound address"]
+    end: Annotated[str, "text/regex/instruction: exclusive upper bound address"]
+    func: Annotated[str, "text/regex/instruction: restrict to one function (name or address)"]
+    segment: Annotated[str, "text/regex/instruction: restrict to one segment by name, e.g. .text"]
+
+
 class AnalysisOptions(TypedDict, total=False):
-    detail_level: Annotated[str, "triage verbosity: fast or full"]
+    detail_level: Annotated[str, "triage verbosity: fast (default) or full"]
     include_asm: Annotated[bool, "function mode: include disassembly"]
+    include_declarations: Annotated[bool, "function/batch: keep local-variable declarations in the decompile excerpt (default false)"]
+    include_comments: Annotated[bool, "function mode: include instruction comments; IDA auto-comments are included (default false)"]
+    max_lines: Annotated[int, "function/batch: statement lines in the decompile excerpt (default 120)"]
+    sections: Annotated[
+        list[str],
+        "batch mode: subset of decompile, disasm, callers, callees, strings, constants, blocks (default decompile, callees, strings)",
+    ]
+    skip_triage: Annotated[bool, "deep mode: skip the whole-binary triage (default true when targets are given)"]
     max_depth: Annotated[int, "deep mode: reference-flow depth per target (1-20)"]
     direction: Annotated[str, "deep mode: dataflow direction forward, backward, or both"]
     limit: Annotated[int, "similar mode: maximum matches"]
@@ -104,10 +122,26 @@ class AnalysisOptions(TypedDict, total=False):
     timeout_ms: Annotated[int, "emulate mode: wall-clock budget per call (default 10000)"]
 
 
+class GraphOptions(TypedDict, total=False):
+    xref_type: Annotated[Literal["any", "code", "data"], "xrefs/xrefs_from/xrefs_both: reference type filter (default any)"]
+    include_indirect: Annotated[
+        bool,
+        "calls/callers/path: follow resolved indirect calls and list unresolved indirect sites / address-taken references (default true)",
+    ]
+    max_edges_per_func: Annotated[int, "calls/callers/path: distinct callees or callers kept per function (1-5000, default 100)"]
+    max_paths: Annotated[int, "path: maximum shortest paths returned (1-1000, default 10)"]
+
+
+TaintDomain = Literal["register", "stack", "global", "memory"]
+
+
 class TaintOptions(TypedDict, total=False):
-    include_traces: Annotated[bool, "include per-source traces in the result"]
-    max_paths: Annotated[int, "maximum reported paths (1-1000)"]
-    domains: Annotated[list[str], "propagation domains subset of register, stack, global, memory"]
+    max_paths: Annotated[int, "maximum reported hits (1-1000, default 100)"]
+    domains: Annotated[list[TaintDomain], "location kinds propagation may pass through (default all)"]
+
+
+class DataflowOptions(TypedDict, total=False):
+    include_microcode: Annotated[bool, "add each node's raw Hex-Rays microcode (default false)"]
 
 
 class DebugTraceOptions(TypedDict, total=False):
@@ -123,8 +157,55 @@ class DebugTraceOptions(TypedDict, total=False):
 class InvestigationBudgets(TypedDict, total=False):
     detail_level: Annotated[str, "triage verbosity: fast or full"]
     include_asm: Annotated[bool, "per-seed function analysis: include disassembly"]
-    max_depth: Annotated[int, "per-seed dataflow depth (1-20)"]
-    direction: Annotated[str, "per-seed dataflow direction forward, backward, or both"]
+    max_lines: Annotated[int, "per-seed decompile excerpt statement lines (default 120)"]
+    max_seeds: Annotated[int, "seeds analyzed, 1-100 (default 20); the rest are listed in skipped_seeds"]
+    skip_triage: Annotated[bool, "skip the whole-binary triage (default false)"]
+
+
+MutationKind = Literal[
+    "rename", "comment", "append_comment", "bookmark", "declare_type", "set_type", "upsert_enum",
+    "declare_stack", "delete_stack", "patch_bytes", "write_integer", "patch_asm", "define_function",
+    "define_code", "undefine", "set_operand_type", "make_data", "apply_flirt", "load_til", "save_database",
+    "set_name", "rename_func", "rename_function", "rename_global", "rename_data", "enum_upsert",
+]
+
+
+class _MutationOpKind(TypedDict):
+    kind: MutationKind
+
+
+class MutationOp(_MutationOpKind, total=False):
+    arguments: Annotated[dict[str, Any], "nested form of the fields below"]
+    scope: Annotated[str, "raise the required safety scope"]
+    addr: Annotated[str, "hex address or symbol"]
+    name: str
+    comment: str
+    text: Annotated[str, "alias of comment"]
+    type: Annotated[str, "C type or prototype; __noreturn in a prototype marks the function no-return"]
+    decl: Annotated[str | list[str], "C declaration(s)"]
+    variable: Annotated[str, "set_type: local variable"]
+    old_name: str
+    new_name: str
+    func_addr: str
+    allow_overwrite: bool
+    members: Annotated[list[dict[str, Any]], "upsert_enum [{name, value}]"]
+    bitfield: bool
+    offset: Annotated[str | int, "declare_stack frame offset, e.g. -8"]
+    data: Annotated[str | list[dict[str, Any]], "patch_bytes hex bytes"]
+    value: Annotated[str, "write_integer value"]
+    ty: Annotated[str, "write_integer width (u8/u32/i64...)"]
+    size: int
+    asm: str
+    end: Annotated[str, "define_function end; on an existing function, resizes it"]
+    op_n: int
+    operand_kind: Literal["stroff", "offset", "stkvar", "hex", "dec", "char", "binary", "octal", "enum"]
+    struct: str
+    enum: str
+    delta: int
+    target_addr: str
+    prefix: Annotated[str, "bookmark title prefix"]
+    path: str
+    items: Annotated[list[dict[str, Any]], "batch of flat items for this kind"]
 
 
 def _unsupported(what: str, value: Any, allowed: tuple[str, ...] | list[str]) -> NoReturn:
@@ -186,11 +267,17 @@ def _investigation_changed(record: Any) -> None:
 def _jobs() -> JobManager:
     global _JOBS
     with _STATE_LOCK:
+        if _JOBS is not None:
+            return _JOBS
+    # Netnode reads hop to the main thread, whose closebase hook takes
+    # _STATE_LOCK: never load while holding it.
+    state = _load_idb_state("jobs")
+    with _STATE_LOCK:
         if _JOBS is None:
             _JOBS = JobManager(
                 max_workers=2,
                 max_jobs=256,
-                load_state=lambda: _load_idb_state("jobs"),
+                load_state=lambda: state,
                 save_state=lambda state: _save_idb_state("jobs", state),
                 on_change=_job_changed,
             )
@@ -200,9 +287,13 @@ def _jobs() -> JobManager:
 def _investigations() -> InvestigationManager:
     global _INVESTIGATIONS
     with _STATE_LOCK:
+        if _INVESTIGATIONS is not None:
+            return _INVESTIGATIONS
+    state = _load_idb_state("investigations")
+    with _STATE_LOCK:
         if _INVESTIGATIONS is None:
             _INVESTIGATIONS = InvestigationManager(
-                load_state=lambda: _load_idb_state("investigations"),
+                load_state=lambda: state,
                 save_state=lambda state: _save_idb_state("investigations", state),
                 on_change=_investigation_changed,
             )
@@ -274,6 +365,13 @@ def _revision_changed(event: str) -> None:
         invalidate_strings_cache()
     except Exception:
         pass
+    if event == "renamed":
+        try:
+            from .utils import invalidate_name_index
+
+            invalidate_name_index()
+        except Exception:
+            pass
     MCP_SERVER.notify_resource_updated(
         f"ida://sessions/{_resource_database(database)}/metadata"
     )
@@ -492,6 +590,35 @@ def _decode_cursor_value(cursor: str) -> dict[str, Any]:
         raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid pagination cursor") from exc
 
 
+def _search_cursor_states(cursor: str | None, kind: str, count: int) -> list[dict[str, Any] | None]:
+    """Per-target continuation states; a cursor is bound to its search kind and target count."""
+    if not cursor:
+        return [{} for _ in range(count)]
+    value = _decode_cursor_value(cursor)
+    if value.get("kind") != kind:
+        raise VNextError(
+            ErrorCode.INVALID_OPERATION,
+            f"Cursor belongs to search kind {value.get('kind')!r}, not {kind!r}; omit cursor to start over",
+        )
+    states = value.get("states")
+    if not isinstance(states, list) or len(states) != count or not all(s is None or isinstance(s, dict) for s in states):
+        raise VNextError(ErrorCode.INVALID_OPERATION, "Cursor does not match targets; pass the same targets as the first call")
+    return states
+
+
+def _search_cursor(kind: str, states: list[dict[str, Any] | None]) -> str | None:
+    if all(state is None for state in states):
+        return None
+    return _encode_cursor_value({"kind": kind, "states": states})
+
+
+def _state_offset(state: dict[str, Any]) -> int:
+    try:
+        return max(0, int(state.get("offset", 0)))
+    except (TypeError, ValueError) as exc:
+        raise VNextError(ErrorCode.INVALID_OPERATION, "Invalid pagination cursor") from exc
+
+
 def _encode_cursor(offset: int) -> str:
     return _encode_cursor_value({"offset": max(0, offset)})
 
@@ -617,171 +744,328 @@ def server_capabilities() -> dict[str, Any]:
     return _ida_capabilities().to_dict()
 
 
-@tool
-def search(
-    kind: Annotated[SearchKind, "text, regex, bytes, constant, instruction, crypto, or ctree"],
-    targets: Annotated[list[str], "Search values or patterns"],
-    limit: Annotated[int, "Maximum results"] = 100,
-    cursor: Annotated[str | None, "Opaque continuation cursor"] = None,
-) -> dict[str, Any]:
-    """WHEN exact-value lookup is enough, use memory_read/entity_query instead.
-    RETURNS {data, truncated, next_cursor} envelope; per-kind arity/pagination below.
-    LIMITS text/regex take exactly 1 target (offset cursor); bytes/constant take N targets (offset cursor); instruction takes N mnemonics (per-target {offset,start} cursor, legacy insn_query, max_scan_insns 200000); crypto scans known crypto/hash/encoding tables and code immediates (targets = algorithm substrings, [] = all; offset cursor); ctree takes N Hex-Rays patterns of space-separated key=value tokens: op=call|cmp|num, callee=<regex>, argN=const|!const|str|<int> (0-based), value=<int>, in=<function regex>; needs callee/value/in to bound the scan, decompiles at most 500 candidate functions (offset cursor). NEXT follow up with memory_read/disassemble/graph_query."""
-    normalized = str(kind).lower()
-    legacy_tool = normalized
-    if normalized == "instruction":
-        states = _per_target_cursor_states(cursor, len(targets), "instruction")
-        pending = [
-            (index, target, state)
-            for index, (target, state) in enumerate(zip(targets, states))
-            if state is not None
-        ]
-        queries = []
-        for _index, target, state in pending:
-            query = {
-                "mnem": target,
-                "offset": state["offset"],
+_INSTRUCTION_SCAN_BUDGET = 200000
+_INSTRUCTION_FILTERS = {"op0": "op0", "op1": "op1", "op2": "op2", "any": "op_any"}
+
+
+def _parse_instruction_target(target: str) -> dict[str, Any]:
+    """`mnem op0=x op1=x op2=x any=x` -> insn_query filters (int = operand value, else operand-text substring)."""
+    tokens = str(target).split()
+    query: dict[str, Any] = {"mnem": ""}
+    if tokens and "=" not in tokens[0]:
+        mnem = tokens.pop(0).lower()
+        query["mnem"] = "" if mnem in ("*", "any") else mnem
+    for token in tokens:
+        key, sep, value = token.partition("=")
+        field = _INSTRUCTION_FILTERS.get(key.lower())
+        if not sep or field is None or not value:
+            raise VNextError(
+                ErrorCode.INVALID_OPERATION,
+                f"Bad instruction filter {token!r}; use 'mnem op0=<text|int> op1=... op2=... any=...'",
+            )
+        try:
+            query[field] = int(value, 0)
+        except ValueError:
+            query[f"{field}_text"] = value
+    return query
+
+
+def _text_hit(hit: dict[str, Any]) -> dict[str, Any]:
+    row = {"addr": hit.get("addr")}
+    if hit.get("function"):
+        row["function"] = hit["function"]
+    for match in hit.get("matches") or []:
+        row.setdefault("comment" if match.get("kind") == "comment" else "text", match.get("text"))
+    return row
+
+
+def _hit_rows_impl(addrs: list[str]) -> list[dict[str, Any]]:
+    """{addr, function?, text?} for raw hit addresses; text only for code heads."""
+    import ida_bytes
+
+    from . import compat
+    from .utils import disasm_text, display_name
+
+    rows = []
+    for addr in addrs:
+        ea = int(str(addr), 16)
+        row: dict[str, Any] = {"addr": hex(ea)}
+        func = compat.get_func(ea)
+        if func is not None:
+            row["function"] = display_name(func.start_ea)
+        if ida_bytes.is_code(ida_bytes.get_flags(ea)) and ida_bytes.get_item_head(ea) == ea:
+            row["text"] = disasm_text(ea)
+        rows.append(row)
+    return rows
+
+
+_hit_rows = idasync(_hit_rows_impl)
+
+
+def _search_bounds_impl(options: dict[str, Any]) -> tuple[str, str]:
+    """Resolve options.func/segment/start/end to a hex [start, end) pair ("" = unbounded)."""
+    import ida_segment
+
+    from . import compat
+    from .utils import parse_address
+
+    if options.get("func"):
+        func = compat.get_func(parse_address(options["func"]))
+        if func is None:
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"Not inside a function: {options['func']}")
+        return hex(func.start_ea), hex(func.end_ea)
+    if options.get("segment"):
+        seg = ida_segment.get_segm_by_name(str(options["segment"]))
+        if seg is None:
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"Unknown segment: {options['segment']}")
+        return hex(seg.start_ea), hex(seg.end_ea)
+    start = hex(parse_address(options["start"])) if options.get("start") else ""
+    end = hex(parse_address(options["end"])) if options.get("end") else ""
+    return start, end
+
+
+_search_bounds = idasync(_search_bounds_impl)
+
+
+def _search_text_targets(
+    kind: str, targets: list[str], states: list[dict[str, Any] | None], limit: int, options: dict[str, Any], bounds: tuple[str, str]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any] | None]]:
+    include = str(options.get("include") or "all").lower()
+    if include not in ("all", "disasm", "comments", "strings"):
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"Unknown include {include!r}. Allowed: all, disasm, comments, strings")
+    case_sensitive = bool(options.get("case_sensitive", False))
+    start, end = bounds
+    data: list[dict[str, Any]] = []
+    next_states: list[dict[str, Any] | None] = []
+    for target, state in zip(targets, states):
+        if state is None:
+            next_states.append(None)
+            continue
+        if include == "strings":
+            query: dict[str, Any] = {
+                "kind": "strings",
+                "regex": target if kind == "regex" else re.escape(target),
+                "case_sensitive": case_sensitive,
+                "offset": _state_offset(state),
                 "count": limit,
-                "max_scan_insns": 200000,
-                "allow_broad": True,
-                "include_disasm": True,
             }
-            if state.get("start"):
-                query["start"] = state["start"]
-            queries.append(query)
-        result = _legacy_call("insn_query", {"queries": queries}) if queries else []
-        next_cursor = _per_target_next_cursor(result, pending, len(targets), "instruction")
-        legacy_tool = "insn_query"
-    else:
-        offset = _decode_cursor(cursor)
-        if normalized == "text":
-            if len(targets) != 1:
-                raise VNextError(ErrorCode.INVALID_OPERATION, "Text search accepts one pattern")
+            if start:
+                query["min_addr"] = start
+            if end:
+                query["max_addr"] = hex(int(end, 16) - 1)
+            page = _legacy_call("entity_query", {"queries": query})[0]
+            row: dict[str, Any] = {"target": target, "matches": [{"addr": r["addr"], "text": r["text"]} for r in page["data"]]}
+            if page.get("error"):
+                row["error"] = page["error"]
+            next_states.append({"offset": page["next_offset"]} if page.get("next_offset") is not None else None)
+        else:
             result = _legacy_call(
                 "search_text",
                 {
-                    "pattern": targets[0],
+                    "pattern": target,
                     "limit": limit,
-                    "start": hex(offset) if cursor else "",
-                    "end": "",
-                    "regex": False,
-                    "case_sensitive": False,
-                    "include": "all",
-                    "code_only": False,
+                    "start": state.get("start") or start,
+                    "end": end,
+                    "regex": kind == "regex",
+                    "case_sensitive": case_sensitive,
+                    "include": include,
+                    "code_only": bool(options.get("code_only", False)),
                 },
             )
-            legacy_tool = "search_text"
-        elif normalized == "regex":
-            if len(targets) != 1:
-                raise VNextError(ErrorCode.INVALID_OPERATION, "Regex search accepts one pattern")
-            result = _legacy_call(
-                "entity_query",
-                {"queries": {"kind": "strings", "regex": targets[0], "case_sensitive": False, "offset": offset, "count": limit}},
-            )
-            legacy_tool = "entity_query"
-        elif normalized == "bytes":
-            result = _legacy_call("find_bytes", {"patterns": targets, "limit": limit, "offset": offset})
-            legacy_tool = "find_bytes"
-        elif normalized == "constant":
-            result = _legacy_call(
-                "find",
-                {
-                    "type": "immediate",
-                    "targets": targets,
-                    "limit": limit,
-                    "offset": offset,
-                },
-            )
-            legacy_tool = "find"
-        elif normalized == "crypto":
-            from . import api_recovery
+            row = {"target": target, "matches": [_text_hit(hit) for hit in result.get("hits") or []]}
+            if result.get("error"):
+                row["error"] = result["error"]
+            if result.get("partial"):
+                row["partial"] = result.get("reason")
+            resume = (result.get("cursor") or {}).get("next")
+            next_states.append({"start": resume} if resume else None)
+        data.append(row)
+    return data, next_states
 
-            rows = idasync(api_recovery.collect_crypto_constants)(targets)
-            page = rows[offset : offset + limit]
-            more = len(rows) > offset + limit
-            result = {"matches": page, "count": len(page), "total": len(rows), "next_offset": offset + limit if more else None}
-            legacy_tool = "crypto_constants"
-        elif normalized == "ctree":
-            from .hexrays_ctree import pattern_search
 
-            result = [pattern_search(target, offset, limit) for target in targets]
-            legacy_tool = "hexrays_ctree"
+def _search_offset_targets(
+    kind: str, targets: list[str], states: list[dict[str, Any] | None], limit: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any] | None]]:
+    data: list[dict[str, Any]] = []
+    next_states: list[dict[str, Any] | None] = []
+    for target, state in zip(targets, states):
+        if state is None:
+            next_states.append(None)
+            continue
+        offset = _state_offset(state)
+        if kind == "bytes":
+            result = _legacy_call("find_bytes", {"patterns": [target], "limit": limit, "offset": offset})[0]
         else:
-            _unsupported("search kind", kind, get_args(SearchKind))
-        next_cursor = _search_next_cursor(result)
-    return ToolEnvelope(
-        result,
-        provenance={"legacy_tool": legacy_tool},
-        truncated=next_cursor is not None or _result_truncated(result),
-        next_cursor=next_cursor,
-    ).to_dict()
+            result = _legacy_call("find", {"type": "immediate", "targets": [target], "limit": limit, "offset": offset})[0]
+        addrs = result.get("matches") or []
+        row: dict[str, Any] = {"target": target, "matches": _hit_rows(addrs) if addrs else []}
+        if result.get("error"):
+            row["error"] = result["error"]
+        resume = (result.get("cursor") or {}).get("next")
+        next_states.append({"offset": int(resume)} if resume is not None else None)
+        data.append(row)
+    return data, next_states
 
 
-_DEFAULT_BYTES_READ_SIZE = 16
+def _search_instruction_targets(
+    targets: list[str], states: list[dict[str, Any] | None], limit: int, bounds: tuple[str, str]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any] | None]]:
+    start, end = bounds
+    pending = [(target, state) for target, state in zip(targets, states) if state is not None]
+    queries = []
+    for target, state in pending:
+        query = {
+            **_parse_instruction_target(target),
+            "offset": _state_offset(state),
+            "count": limit,
+            "max_scan_insns": _INSTRUCTION_SCAN_BUDGET,
+            "allow_broad": True,
+        }
+        if state.get("start") or start:
+            query["start"] = state.get("start") or start
+        if end:
+            query["end"] = end
+        queries.append(query)
+    results = iter(_legacy_call("insn_query", {"queries": queries}) if queries else [])
+    data: list[dict[str, Any]] = []
+    next_states: list[dict[str, Any] | None] = []
+    for target, state in zip(targets, states):
+        if state is None:
+            next_states.append(None)
+            continue
+        item = next(results)
+        addrs = [match["addr"] for match in item.get("matches") or []]
+        row: dict[str, Any] = {"target": target, "matches": _hit_rows(addrs) if addrs else []}
+        if item.get("error"):
+            row["error"] = item["error"]
+        resume = (item.get("cursor") or {}).get("next")
+        if item.get("truncated") and item.get("next_start"):
+            row["partial"] = "scan_budget"
+            next_states.append({"offset": 0, "start": str(item["next_start"])})
+        elif resume is not None:
+            next_states.append({"offset": int(resume), **({"start": state["start"]} if state.get("start") else {})})
+        else:
+            next_states.append(None)
+        data.append(row)
+    return data, next_states
+
+
+@tool
+def search(
+    kind: Annotated[SearchKind, "text, regex, bytes, constant, instruction, crypto, or ctree"],
+    targets: Annotated[list[str], "Patterns; each target is searched and paged independently"],
+    limit: Annotated[int, "Maximum matches per target per page"] = 100,
+    cursor: Annotated[str | None, "next_cursor from the previous call (same kind and targets)"] = None,
+    options: Annotated[SearchOptions | None, "Matching and scope options for text/regex/instruction"] = None,
+) -> dict[str, Any]:
+    """Find where text, bytes, constants, instructions, crypto tables, or Hex-Rays patterns occur.
+    WHEN: locating occurrences; to list entities use entity_query.
+    RETURNS {data, next_cursor?}. text/regex/bytes/constant/instruction: [{target, matches[{addr, function?, text?, comment?}], error?, partial?}] per unfinished target. crypto: {matches, total}. ctree: one page per pattern.
+    LIMITS: text (literal) and regex search disassembly and comments (options.include="strings" for string literals); constant matches any operand width. instruction: "mnem op0=x any=x" (int = operand value, else operand-text substring, "*" = any mnemonic). bytes: "48 8B ?? ??". ctree tokens: op=call|cmp|num, callee=, argN=, value=, in=. Resume partial pages with the cursor (same kind and targets).
+    NEXT: decompile the hit's function; graph_query(kind="xrefs") on hits."""
+    normalized = str(kind).lower()
+    if normalized not in get_args(SearchKind):
+        _unsupported("search kind", kind, get_args(SearchKind))
+    opts: dict[str, Any] = dict(options or {})
+    scoped = any(opts.get(key) for key in ("func", "segment", "start", "end"))
+    if scoped and normalized not in ("text", "regex", "instruction"):
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"options func/segment/start/end apply only to text/regex/instruction, not {normalized}")
+    bounds = _search_bounds(opts) if scoped else ("", "")
+    if normalized in ("text", "regex"):
+        states = _search_cursor_states(cursor, normalized, len(targets))
+        data, next_states = _search_text_targets(normalized, targets, states, limit, opts, bounds)
+    elif normalized in ("bytes", "constant"):
+        states = _search_cursor_states(cursor, normalized, len(targets))
+        data, next_states = _search_offset_targets(normalized, targets, states, limit)
+    elif normalized == "instruction":
+        states = _search_cursor_states(cursor, normalized, len(targets))
+        data, next_states = _search_instruction_targets(targets, states, limit, bounds)
+    elif normalized == "crypto":
+        from . import api_recovery
+
+        (state,) = _search_cursor_states(cursor, normalized, 1)
+        offset = _state_offset(state or {})
+        rows = idasync(api_recovery.collect_crypto_constants)(targets)
+        data = {"matches": rows[offset : offset + limit], "total": len(rows)}
+        next_states = [{"offset": offset + limit} if len(rows) > offset + limit else None]
+    else:
+        from .hexrays_ctree import pattern_search
+
+        states = _search_cursor_states(cursor, normalized, len(targets))
+        data, next_states = [], []
+        for target, state in zip(targets, states):
+            if state is None:
+                next_states.append(None)
+                continue
+            page = pattern_search(target, _state_offset(state), limit)
+            data.append(page)
+            next_states.append({"offset": page["next_offset"]} if page.get("next_offset") is not None else None)
+    next_cursor = _search_cursor(normalized, next_states)
+    return ToolEnvelope(data, truncated=next_cursor is not None, next_cursor=next_cursor).to_dict()
+
+
+_INT_SHORTHAND = re.compile(r"^(.+):([ui](?:nt)?(?:8|16|32|64)(?:_t)?(?:le|be)?)$", re.IGNORECASE)
 
 
 def _normalize_memory_queries(kind: str, queries: list[dict[str, Any]] | list[str]) -> list[Any]:
-    """Normalize memory_read queries to the shapes expected by legacy tools."""
-    if kind == "bytes":
+    """Normalize memory_read queries to the row shapes the readers expect."""
+    if kind in ("bytes", "integer", "struct"):
         normalized: list[Any] = []
         for item in queries:
-            if isinstance(item, str):
-                normalized.append({"addr": item, "size": _DEFAULT_BYTES_READ_SIZE})
-            elif isinstance(item, dict):
+            if isinstance(item, dict):
                 normalized.append(item)
+            elif isinstance(item, str):
+                shorthand = _INT_SHORTHAND.match(item.strip()) if kind == "integer" else None
+                normalized.append({"addr": shorthand[1], "ty": shorthand[2]} if shorthand else {"addr": item})
             else:
-                raise VNextError(
-                    ErrorCode.INVALID_OPERATION,
-                    "bytes queries must be address strings or {addr, size} objects",
-                )
+                raise VNextError(ErrorCode.INVALID_OPERATION, f"{kind} queries must be address strings or objects")
         return normalized
-
-    if kind == "integer":
-        for item in queries:
-            if isinstance(item, str):
-                raise VNextError(
-                    ErrorCode.INVALID_OPERATION,
-                    "integer queries require objects of shape {addr, ty}",
-                )
-        return list(queries)
-
     # string / global accept bare address/name strings.
     return list(queries)
 
 
+def _compact_memory_row(kind: str, row: Any) -> Any:
+    if not isinstance(row, dict):
+        return row
+    if kind == "bytes" and not row.get("error") and row.get("data") is not None:
+        raw = bytes(int(part, 16) for part in str(row["data"]).split())
+        return {"addr": row.get("addr"), "size": len(raw), "hex": raw.hex()}
+    return {key: value for key, value in row.items() if not (key in ("error", "data") and value is None)}
+
+
 @tool
 def memory_read(
-    kind: Annotated[MemoryReadKind, "bytes, integer, string, global, or patch_diff"],
+    kind: Annotated[MemoryReadKind, "bytes, integer, string, global, struct, or patch_diff"],
     queries: Annotated[
         list[dict[str, Any]] | list[str] | None,
-        "Address queries. bytes: '0x...' (size defaults to 16) or {addr,size}; "
-        "integer: {addr,ty} where ty is u8/u32/uint32/i16le/u64be/etc; string/global: address or name strings; "
-        "patch_diff: ignored (Phase C hook owns the IDA patched-bytes diff)",
+        "Per kind: bytes 'addr' or {addr, size}; integer 'addr', 'addr:u32' or {addr, ty}; "
+        "string/global 'addr'; struct 'addr' or {addr, struct}; patch_diff: omit",
     ] = None,
 ) -> dict[str, Any]:
-    """WHEN reading one static fact, use this; for live process memory use debug_memory.
-    RETURNS {data, truncated, next_cursor} envelope with per-kind rows below.
-    LIMITS bytes/integer/string/global delegate to one legacy read each (no pagination); patch_diff is reserved for the Phase C patched-bytes diff (queries ignored). NEXT disassemble/graph_query for code context."""
+    """Read static IDB data at addresses or symbols.
+    WHEN: you need bytes, an integer, string, typed global, or struct field values at a known address (live process memory: debug_memory).
+    RETURNS {data: [row per query]}: bytes {addr, size, hex}; integer {addr, ty, value}; string {addr, value}; global {query, addr, name, value}; struct {addr, struct, members[{name, offset, type, value}]}; patch_diff [{addr, size, original_hex, patched_hex, function?}]; failed rows carry error.
+    LIMITS: addresses accept hex, names, name+0x10, segment:addr; bytes size and integer ty default to the item size at addr (bytes max 65536); struct uses the applied type unless struct is given.
+    NEXT: decompile for code context; search(kind="bytes") for other occurrences."""
 
     mapping = {
         "bytes": ("get_bytes", "regions"),
         "integer": ("get_int", "queries"),
         "string": ("get_string", "addrs"),
         "global": ("get_global_value", "queries"),
+        "struct": ("read_struct", "queries"),
     }
     normalized_kind = str(kind).lower()
     if normalized_kind == "patch_diff":
-        from . import api_recovery
+        from . import api_memory
 
-        return ToolEnvelope({"text": idasync(api_recovery.patch_diff_text)()}, provenance={"legacy_tool": "visit_patched_bytes"}).to_dict()
+        return ToolEnvelope(api_memory.patched_ranges()).to_dict()
     if normalized_kind not in mapping:
         _unsupported("memory read kind", kind, get_args(MemoryReadKind))
     name, argument_name = mapping[normalized_kind]
     normalized = _normalize_memory_queries(normalized_kind, list(queries or []))
-    return ToolEnvelope(
-        _legacy_call(name, {argument_name: normalized}),
-        provenance={"legacy_tool": name},
-    ).to_dict()
+    rows = _legacy_call(name, {argument_name: normalized})
+    return ToolEnvelope([_compact_memory_row(normalized_kind, row) for row in rows]).to_dict()
 
 
 @tool
@@ -791,11 +1075,11 @@ def disassemble(
     offset: Annotated[int, "Instruction offset"] = 0,
     include_total: Annotated[bool, "Include total instruction count"] = False,
 ) -> dict[str, Any]:
-    """WHEN one function body is enough, use this instead of analysis_run(function).
-    RETURNS {data, truncated} envelope with canonical hex addresses.
-    LIMITS offset/max_instructions paginate one function; large functions hit the rpc 50k download indirection. NEXT graph_query(cfg) for blocks."""
+    """WHEN you need exact instructions (decompiler failure, crypto, shellcode, or verifying pseudocode); for an overview use analysis_run(function).
+    RETURNS {data{addr, asm{name, start_ea, lines, stack_frame?, return_type?, arguments?}, instruction_count, total_instructions, cursor{next}|{done}}} with `addr  text` lines.
+    LIMITS max_instructions per call (max 50000); offset pages within one function, or walks linearly from addr when it is not in a function; total_instructions only with include_total. NEXT disassemble(offset=cursor.next) or graph_query(cfg) for blocks."""
     result = _legacy_call("disasm", {"addr": addr, "max_instructions": max_instructions, "offset": offset, "include_total": include_total})
-    return ToolEnvelope(result, provenance={"legacy_tool": "disasm"}).to_dict()
+    return ToolEnvelope(result).to_dict()
 
 
 @tool
@@ -803,24 +1087,67 @@ def signature_create(
     addrs: Annotated[list[str], "Functions or addresses to sign"],
     format: Annotated[SignatureFormat, "ida, x64dbg, mask, or bitmask"] = "ida",
     wildcard_operands: Annotated[bool, "Wildcard relocatable operands"] = True,
-    max_length: Annotated[int, "Maximum signature length"] = 250,
+    max_length: Annotated[int, "Maximum signature length in bytes before giving up"] = 1000,
+    anchor: Annotated[
+        Literal["function", "address"],
+        "function: sign each containing function's start; address: sign the exact address (mid-function OK)",
+    ] = "function",
 ) -> dict[str, Any]:
-    """WHEN matching this function elsewhere, use this; for callers/callees use graph_query.
-    RETURNS {data, truncated} envelope with one signature row per address.
-    LIMITS max_length caps signature bytes; wildcard_operands wildcards relocatable operands. NEXT search(bytes) to find matches."""
+    """WHEN matching this function or instruction in another build, use this; for callers/callees use graph_query.
+    RETURNS {data[{query, addr, name?, signature, format, unique, error?}]}; name only for anchor=function.
+    LIMITS shortest unique pattern from the anchor; errors when none fits in max_length bytes; anchor=function rejects addresses outside functions. NEXT search(bytes) to find matches."""
     normalized_format = str(format).lower()
     if normalized_format not in get_args(SignatureFormat):
         _unsupported("signature format", format, get_args(SignatureFormat))
-    result = _legacy_call("make_signature_for_function", {"addrs": addrs, "format": normalized_format, "wildcard_operands": wildcard_operands, "max_length": max_length})
-    return ToolEnvelope(result, provenance={"legacy_tool": "make_signature_for_function"}).to_dict()
+    if anchor not in ("function", "address"):
+        _unsupported("signature anchor", anchor, ("function", "address"))
+    tool_name = "make_signature_for_function" if anchor == "function" else "make_signature"
+    result = _legacy_call(tool_name, {"addrs": addrs, "format": normalized_format, "wildcard_operands": wildcard_operands, "max_length": max_length})
+    return ToolEnvelope(result).to_dict()
 
 
 @idasync
 def _similar_functions(target: str, limit: int, min_score: float) -> Any:
     from . import api_recovery
-    from .utils import resolve_address_or_name
+    from .utils import parse_address
 
-    return api_recovery.similar_functions(resolve_address_or_name(target), limit, min_score)
+    return api_recovery.similar_functions(parse_address(target), limit, min_score)
+
+
+_BATCH_SECTIONS = {
+    "decompile": "include_decompile",
+    "disasm": "include_disasm",
+    "callers": "include_callers",
+    "callees": "include_callees",
+    "strings": "include_strings",
+    "constants": "include_constants",
+    "blocks": "include_basic_blocks",
+}
+_DEFAULT_BATCH_SECTIONS = ("decompile", "callees", "strings")
+_DEFAULT_EXCERPT_LINES = 120
+
+
+def _batch_queries(targets: list[str], options: dict[str, Any]) -> list[dict[str, Any]]:
+    sections = [str(section).lower() for section in options.get("sections") or _DEFAULT_BATCH_SECTIONS]
+    for section in sections:
+        if section not in _BATCH_SECTIONS:
+            _unsupported("batch section", section, tuple(_BATCH_SECTIONS))
+    flags = {flag: name in sections for name, flag in _BATCH_SECTIONS.items()}
+    return [
+        {
+            "query": target,
+            **flags,
+            "include_xrefs": False,
+            "include_declarations": bool(options.get("include_declarations", False)),
+            "max_decompile_lines": max(1, int(options.get("max_lines") or _DEFAULT_EXCERPT_LINES)),
+            "max_callers": 50,
+            "max_callees": 50,
+            "max_strings": 50,
+            "max_constants": 50,
+            "max_blocks": 100,
+        }
+        for target in targets
+    ]
 
 
 def _analysis_sync(mode: str, targets: list[str], options: dict[str, Any]) -> Any:
@@ -829,11 +1156,20 @@ def _analysis_sync(mode: str, targets: list[str], options: dict[str, Any]) -> An
     if mode == "function":
         if len(targets) != 1:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Function analysis requires one target")
-        return _legacy_call("analyze_function", {"addr": targets[0], "include_asm": bool(options.get("include_asm", False))})
+        return _legacy_call(
+            "analyze_function",
+            {
+                "addr": targets[0],
+                "include_asm": bool(options.get("include_asm", False)),
+                "include_declarations": bool(options.get("include_declarations", False)),
+                "include_comments": bool(options.get("include_comments", False)),
+                "max_lines": max(1, int(options.get("max_lines") or _DEFAULT_EXCERPT_LINES)),
+            },
+        )
     if mode == "component":
         return _legacy_call("analyze_component", {"addrs": targets})
     if mode == "batch":
-        return _legacy_call("analyze_batch", {"queries": [{"addr": target} for target in targets]})
+        return _legacy_call("analyze_batch", {"queries": _batch_queries(targets, options)})
     if mode == "similar":
         if len(targets) != 1:
             raise VNextError(ErrorCode.INVALID_OPERATION, "Similar analysis requires one target")
@@ -857,20 +1193,30 @@ def analysis_run(
     targets: Annotated[list[str] | None, "Seed functions or addresses"] = None,
     options: Annotated[AnalysisOptions | None, "Analysis budgets and mode options"] = None,
 ) -> dict[str, Any]:
-    """WHEN choosing analysis depth, use this; for one disassembly use disassemble.
-    RETURNS inline {data,...} envelope, or a job record for deep. Per-mode arity below.
-    LIMITS triage takes no targets (detail_level fast/full); function/similar take 1 target (similar ranks mnemonic 3-gram matches, options limit/min_score); component/batch take N targets; emulate takes 1 target, runs it under Unicorn (x86/x64/ARM/ARM64) once per options.calls entry, returning {status, return, return_string?, imports, writes[{addr,size,hex,text?}]} per call; deep submits a cancellable job (options max_depth 1-20, direction forward/backward/both) and large outputs use the rpc 50k download indirection. NEXT dataflow_trace/taint_analyze on the targets."""
+    """WHEN choosing analysis depth; for exact instructions use disassemble, for full pseudocode use decompile.
+    RETURNS {data}; deep returns a job record. Modes:
+    triage (no targets): binary overview.
+    function (1 target): prototype, decompile excerpt, next_line_offset, strings, constants, callers/callees, xrefs, basic_blocks.
+    component (N): summaries, internal call graph, shared globals.
+    batch (N): options.sections per function.
+    similar (1): mnemonic 3-gram matches {addr, name, score, strings}.
+    emulate (1): Unicorn run per options.calls entry -> {status, return, writes, warnings}; only malloc/calloc/memcpy/memmove/memset/strlen are modelled.
+    deep (N): cancellable job, function analysis plus dataflow per target.
+    LIMITS one mode per call; lists capped at 50. NEXT decompile(line_offset=next_line_offset) for more pseudocode; job_status/job_result for deep."""
     normalized = str(mode).lower()
     effective_options = dict(options or {})
     if normalized not in get_args(AnalysisMode):
         _unsupported("analysis mode", mode, get_args(AnalysisMode))
     effective_targets = list(targets or [])
     if normalized != "deep":
-        return ToolEnvelope(_analysis_sync(normalized, effective_targets, effective_options), provenance={"mode": normalized}).to_dict()
+        return ToolEnvelope(_analysis_sync(normalized, effective_targets, effective_options)).to_dict()
+    skip_triage = bool(effective_options.get("skip_triage", True)) and bool(effective_targets)
 
     def run(context: JobContext) -> dict[str, Any]:
-        context.progress(0.05, "triage")
-        triage = _analysis_sync("triage", [], effective_options)
+        result: dict[str, Any] = {}
+        if not skip_triage:
+            context.progress(0.05, "triage")
+            result["triage"] = _analysis_sync("triage", [], effective_options)
         functions: list[dict[str, Any]] = []
         total = max(1, len(effective_targets))
         depth = max(1, min(int(effective_options.get("max_depth", 3) or 3), 20))
@@ -885,28 +1231,75 @@ def analysis_run(
             functions.append({"target": target, "analysis": analysis, "dataflow": flow})
             context.progress(0.1 + 0.8 * ((index + 1) / total), f"analyzed {target}")
         context.progress(0.95, "assembling result")
-        return ToolEnvelope(
-            {"triage": triage, "functions": functions},
-            provenance={"mode": "deep", "database": _database_id()},
-        ).to_dict()
+        result["functions"] = functions
+        return result
 
     return _jobs().submit("analysis.deep", run, database=_database_id()).to_dict(include_result=False)
 
 
+@idasync
+def _graph_pages(
+    kind: str,
+    pending: list[tuple[int, str, dict[str, Any]]],
+    max_depth: int,
+    limit: int,
+    options: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """calls/callers/field_xrefs page per pending target on the IDA main thread; failures become {query, error} rows."""
+    from .api_analysis import _field_xrefs, _split_field_target, call_graph
+
+    pages: list[dict[str, Any]] = []
+    for _index, target, state in pending:
+        try:
+            if kind == "field_xrefs":
+                page = _field_xrefs(*_split_field_target(target), state["offset"], limit)
+            else:
+                page = call_graph(
+                    target,
+                    "callees" if kind == "calls" else "callers",
+                    max_depth,
+                    limit,
+                    state["offset"],
+                    options["max_edges_per_func"],
+                    options["include_indirect"],
+                )
+        except (McpToolError, ValueError) as exc:  # bad target; cancellation/timeouts propagate
+            page = {"query": target, "error": str(exc)}
+        pages.append(page)
+    return pages
+
+
 @tool
 def graph_query(
-    kind: Annotated[GraphKind, "xrefs, xrefs_from, xrefs_both, calls, cfg, or callsite_args"],
-    targets: Annotated[list[str], "Root functions or addresses"],
-    max_depth: Annotated[int, "Maximum traversal depth"] = 3,
-    limit: Annotated[int, "Maximum nodes or blocks"] = 1000,
+    kind: Annotated[GraphKind, "xrefs, xrefs_from, xrefs_both, calls, callers, path, field_xrefs, cfg, or callsite_args"],
+    targets: Annotated[list[str], "Functions/addresses (path: [from, to]; field_xrefs: 'Struct.field')"],
+    max_depth: Annotated[int, "calls/callers/path: maximum call hops (0-20)"] = 3,
+    limit: Annotated[int, "Maximum rows per target page (nodes, xrefs, blocks, or calls)"] = 1000,
     cursor: Annotated[str | None, "Opaque continuation cursor"] = None,
+    options: Annotated[GraphOptions | None, "xref_type, include_indirect, max_edges_per_func, max_paths"] = None,
 ) -> dict[str, Any]:
-    """WHEN code references matter, use this instead of raw xrefs/disassembly.
-    RETURNS {data, truncated, next_cursor} envelope; per-kind arity/pagination below.
-    LIMITS xrefs/xrefs_from/xrefs_both take N targets (per-target offset cursor, legacy xref_query); cfg takes N targets (per-target offset cursor, legacy basic_blocks, max_blocks=limit); callsite_args takes N callee functions/imports and returns each decompiled call with args[{text, value?, addr?, string?}] (Hex-Rays required, thunks followed one hop, per-target offset cursor, limit calls per page); calls takes N roots (no cursor, max_nodes=limit, max_edges=2*limit). NEXT dataflow_trace for value flow; analysis_run(emulate) to run a decryptor on recovered args."""
+    """WHEN code relationships matter: who calls whom, who references an address or struct field, how A reaches B.
+    RETURNS {data, next_cursor, warnings?}, rows per target:
+    xrefs/xrefs_from/xrefs_both: {query, data[{addr, from, to, type, fn}], next_offset, total}.
+    calls/callers: {root, nodes[{addr, name, depth, indirect_calls?, address_taken?}], edges[{from, to, site, type}], per_func_capped?}.
+    path [from, to]: {paths[[{addr, name, site?}]], length}.
+    field_xrefs 'Struct.field': {offset, xrefs[{addr, type, fn, text?}]}.
+    cfg: basic blocks. callsite_args: calls to the target with decoded args.
+    LIMITS limit caps each target page; resume with next_cursor (same kind/targets); path is not paged; max_depth applies to calls/callers/path; failing targets yield {query, error}. NEXT decompile a node or site; dataflow_trace for value flow."""
     normalized = str(kind).lower()
+    opts = dict(options or {})
+    xref_type = str(opts.get("xref_type") or "any").lower()
+    if xref_type not in {"any", "code", "data"}:
+        _unsupported("xref_type", xref_type, ("any", "code", "data"))
+    graph_options = {
+        "include_indirect": bool(opts.get("include_indirect", True)),
+        "max_edges_per_func": max(1, min(int(opts.get("max_edges_per_func") or 100), 5000)),
+        "max_paths": max(1, min(int(opts.get("max_paths") or 10), 1000)),
+    }
+    depth = max(0, min(int(max_depth), 20))
+    warnings: list[str] = []
 
-    if normalized in {"xrefs", "xrefs_from", "xrefs_both", "cfg", "callsite_args"}:
+    if normalized in {"xrefs", "xrefs_from", "xrefs_both", "cfg", "callsite_args", "calls", "callers", "field_xrefs"}:
         states = _per_target_cursor_states(cursor, len(targets), "graph")
         pending = [
             (index, target, state)
@@ -929,6 +1322,10 @@ def graph_query(
             from .hexrays_ctree import callsite_args
 
             result = [callsite_args(target, state["offset"], limit) for _index, target, state in pending]
+        elif normalized in {"calls", "callers"}:
+            result = _graph_pages(normalized, pending, depth, max(1, min(int(limit), 100000)), graph_options)
+        elif normalized == "field_xrefs":
+            result = _graph_pages(normalized, pending, depth, max(1, min(int(limit), 1000)), graph_options)
         else:
             direction = {
                 "xrefs": "to",
@@ -942,6 +1339,7 @@ def graph_query(
                         {
                             "query": target,
                             "direction": direction,
+                            "xref_type": xref_type,
                             "offset": state["offset"],
                             "count": limit,
                         }
@@ -950,16 +1348,29 @@ def graph_query(
                 },
             )
         next_cursor = _per_target_next_cursor(result, pending, len(targets), "graph")
-    elif normalized == "calls":
+    elif normalized == "path":
+        if len(targets) != 2:
+            raise VNextError(ErrorCode.INVALID_OPERATION, f"kind=path takes exactly 2 targets [from, to], got {len(targets)}")
         if cursor:
-            raise VNextError(ErrorCode.INVALID_OPERATION, "Call graphs do not support cursor continuation")
-        result = _legacy_call("callgraph", {"roots": targets, "max_depth": max_depth, "max_nodes": limit, "max_edges": limit * 2, "max_edges_per_func": 100})
+            raise VNextError(ErrorCode.INVALID_OPERATION, "kind=path results are not paged; omit cursor")
+        from .api_analysis import call_paths
+
+        result = idasync(call_paths)(
+            targets[0],
+            targets[1],
+            max(1, depth),
+            graph_options["max_paths"],
+            graph_options["max_edges_per_func"],
+            graph_options["include_indirect"],
+        )
         next_cursor = None
     else:
         _unsupported("graph kind", kind, get_args(GraphKind))
+    if max_depth != 3 and normalized not in {"calls", "callers", "path"}:
+        warnings.append(f"max_depth is ignored for kind={normalized}")
     return ToolEnvelope(
         result,
-        provenance={"kind": normalized},
+        warnings=warnings,
         truncated=next_cursor is not None or _result_truncated(result),
         next_cursor=next_cursor,
     ).to_dict()
@@ -967,29 +1378,37 @@ def graph_query(
 
 @tool
 def dataflow_trace(
-    addr: Annotated[str, "Seed address, string, or function"],
-    direction: Annotated[DataflowDirection, "forward, backward, or both"] = "forward",
-    max_depth: Annotated[int, "Maximum reference depth"] = 3,
+    addr: Annotated[str, "Seed: address, function name, or 'func:var' (local variable or argument)"],
+    direction: Annotated[DataflowDirection, "forward (where the value goes), backward (where it comes from), or both"] = "forward",
+    max_depth: Annotated[int, "Maximum def-use hops from the seed"] = 3,
+    variable: Annotated[str | None, "Local variable or argument name in the function containing addr"] = None,
+    options: Annotated[DataflowOptions | None, "Output options"] = None,
 ) -> dict[str, Any]:
-    """WHEN asking where a value flows, use this; for sink matching use taint_analyze.
-    RETURNS {engine, fidelity, nodes, edges, warnings, truncated} graph dict.
-    LIMITS semantic microcode engine when Hex-Rays is present, else reference-flow fallback (unsupported_edges labeled); max_depth caps reference hops. NEXT taint_analyze for source/sink correlation."""
+    """WHEN asking where a value inside one function flows to (or comes from); for source->sink questions across calls use taint_analyze.
+    RETURNS {engine, fidelity, nodes[{id, address, line, defines, uses, microcode?}], edges[{source, target, variable, kind:must|may}], unsupported_edges, warnings, truncated}; line is the pseudocode statement, defines/uses are variable names.
+    LIMITS one function; values passed to calls are not followed into callees; memory through pointers is one location. Unknown variables error with the variable list. Without Hex-Rays, or for data addresses, engine=reference_flow (xref hops, not data flow). NEXT taint_analyze across calls; decompile for context."""
     normalized = str(direction).lower()
-
-    try:
-        from .hexrays_dataflow import trace_microcode
-
-        return trace_microcode(addr, direction=normalized, max_depth=max_depth)
-    except VNextError as exc:
-        if exc.code is not ErrorCode.NOT_SUPPORTED:
-            raise
-        fallback_warning = f"Semantic microcode trace unavailable: {exc}"
-
     if normalized not in get_args(DataflowDirection):
         _unsupported("data-flow direction", direction, get_args(DataflowDirection))
+    include_microcode = bool((options or {}).get("include_microcode", False))
+    try:
+        from .hexrays_dataflow import trace_function
+
+        return trace_function(
+            addr,
+            variable=variable,
+            direction=normalized,
+            max_depth=max_depth,
+            include_microcode=include_microcode,
+        )
+    except VNextError as exc:
+        if exc.code is not ErrorCode.NOT_SUPPORTED or variable is not None:
+            raise
+        fallback_warning = f"Semantic data flow unavailable: {exc}"
+
     result = _legacy_call("trace_data_flow", {"addr": addr, "direction": normalized, "max_depth": max_depth})
     nodes, edges, truncated = normalize_reference_flow_graph(result if isinstance(result, dict) else {})
-    warnings = [fallback_warning, "Result is reference flow, not semantic data flow"]
+    warnings = [fallback_warning, "Result is reference flow (xref hops), not semantic data flow"]
     if isinstance(result, dict) and result.get("error"):
         warnings.append(str(result["error"]))
     graph = AnalysisGraph(
@@ -998,7 +1417,7 @@ def dataflow_trace(
         nodes=nodes,
         edges=edges,
         unsupported_edges=[
-            {"kind": "semantic_def_use", "reason": "Hex-Rays microcode trace is unavailable for this seed"},
+            {"kind": "semantic_def_use", "reason": "no decompiled data flow for this seed"},
             {"kind": "memory_alias", "reason": "reference flow does not model aliases"},
         ],
         warnings=warnings,
@@ -1009,130 +1428,69 @@ def dataflow_trace(
 
 @tool
 def taint_analyze(
-    sources: Annotated[list[str], "Source addresses or symbols"],
-    sinks: Annotated[list[str], "Sink addresses or symbols"],
-    max_depth: Annotated[int, "Maximum propagation depth"] = 4,
-    sanitizers: Annotated[list[str] | None, "Known sanitizer symbols"] = None,
+    sources: Annotated[list[str], "Sources: addresses, 'func:var', function names (their parameters), or API/import names (their results and written buffers at every call site)"],
+    sinks: Annotated[list[str], "Sinks: function/import names (a call receiving the value as any argument) or statement addresses"],
+    max_depth: Annotated[int, "Maximum function hops into direct callees (0 = stay in the source function)"] = 2,
+    sanitizers: Annotated[list[str] | None, "Functions or addresses that stop propagation when the value reaches them"] = None,
     options: Annotated[TaintOptions | None, "Propagation domains and result budgets"] = None,
 ) -> dict[str, Any]:
-    """WHEN matching sources to sinks, use this instead of raw dataflow_trace walks.
-    RETURNS {engine, fidelity, hits, sanitizer_annotations, warnings, truncated} dict.
-    LIMITS BFS over reference/microcode graphs capped by max_depth and options.max_paths (1-1000); domains filter register/stack/global/memory; large outputs use the rpc 50k download indirection. NEXT investigation_add_finding to record hits."""
-    effective_sanitizers = list(sanitizers or [])
+    """WHEN asking whether data from a source can reach a sink (argv -> printf, recv -> memcpy).
+    RETURNS {engine, fidelity, hits[{source, sink, steps[{func, address, line}], hops, domains, confidence}], sanitizer_annotations, functions_analyzed, unsupported_edges, warnings, truncated}; steps are pseudocode statements from source to sink.
+    LIMITS needs Hex-Rays; follows def-use edges and direct calls into user functions (by parameter position) up to max_depth hops and 20 functions; no flow back through return values or indirect calls. A call result and pointer arguments are tainted when any argument is. confidence is a heuristic, not a proof. Unknown symbols error with suggestions. NEXT decompile the step functions to confirm; investigation_add_finding to record."""
+    from .hexrays_dataflow import taint
+
     effective_options = dict(options or {})
-    traces = [dataflow_trace(source, "forward", max_depth) for source in sources]
-    include_traces = bool(effective_options.get("include_traces", False))
+    all_domains = get_args(TaintDomain)
+    domains = set(effective_options.get("domains") or all_domains)
+    for domain in domains:
+        if domain not in all_domains:
+            _unsupported("taint domain", domain, all_domains)
     max_paths = max(1, min(int(effective_options.get("max_paths", 100)), 1000))
-    enabled_domains = set(effective_options.get("domains", ["register", "stack", "global", "memory"]))
-    sink_set = {normalized_match_token(sink) for sink in sinks}
-    sanitizer_set = {normalized_match_token(item) for item in effective_sanitizers}
-    hits: list[dict[str, Any]] = []
-    sanitizer_annotations: list[dict[str, Any]] = []
-    warnings: list[str] = []
-    for source, trace in zip(sources, traces):
-        nodes = {str(node["id"]): node for node in trace.get("nodes", []) if node.get("id") is not None}
-        adjacency: dict[str, list[str]] = {}
-        for edge in trace.get("edges", []):
-            src = edge.get("source") or edge.get("from")
-            dst = edge.get("target") or edge.get("to")
-            if src is None or dst is None:
-                continue
-            adjacency.setdefault(str(src), []).append(str(dst))
-        source_token = normalized_match_token(source)
-        starts = [node_id for node_id, node in nodes.items() if node_matches(node, {source_token})]
-        if not starts:
-            warnings.append(f"Source {source!r} was not found in the trace graph")
-            continue
-        queue = [(node_id, [node_id]) for node_id in starts]
-        visited = set(starts)
-        while queue and len(hits) < max_paths:
-            node_id, path = queue.pop(0)
-            node = nodes[node_id]
-            matched_sanitizers = sorted(token for token in sanitizer_set if node_matches(node, {token}))
-            if matched_sanitizers:
-                sanitizer_annotations.append(
-                    {"source": source, "node": node_id, "sanitizers": matched_sanitizers, "action": "propagation_stopped"}
-                )
-                continue
-            matched_sinks = sorted(token for token in sink_set if node_matches(node, {token}))
-            if matched_sinks:
-                domains = sorted(_node_domains([nodes[item] for item in path]) & enabled_domains)
-                fidelity = str(trace.get("fidelity", "reference"))
-                hits.append(
-                    {
-                        "source": source,
-                        "sinks": matched_sinks,
-                        "path": path,
-                        "addresses": [nodes[item].get("address") or nodes[item].get("addr") for item in path if nodes[item].get("address") or nodes[item].get("addr")],
-                        "domains": domains,
-                        "confidence": 0.9 if fidelity.startswith("semantic") else 0.4,
-                        "engine": trace.get("engine", AnalysisEngine.REFERENCE_FLOW.value),
-                    }
-                )
-            if len(path) > max_depth:
-                continue
-            for neighbor in adjacency.get(node_id, []):
-                if neighbor in nodes and neighbor not in visited:
-                    visited.add(neighbor)
-                    queue.append((neighbor, [*path, neighbor]))
-    engines = sorted({str(trace.get("engine", AnalysisEngine.REFERENCE_FLOW.value)) for trace in traces})
-    semantic = engines == [AnalysisEngine.HEXRAYS_MICROCODE.value]
-    if not semantic:
-        warnings.append("At least one trace used reference-flow fallback")
-    if not include_traces:
-        warnings.append("Per-source traces omitted (pass options.include_traces=true to include them).")
+    hops = max(0, int(max_depth))
+    result = taint(list(sources), list(sinks), list(sanitizers or []), max_hops=hops, max_paths=max_paths, domains=domains)
     return {
-        "engine": engines[0] if len(engines) == 1 else "mixed",
-        "fidelity": "semantic_intraprocedural" if semantic else "reference_or_mixed",
-        "sources": sources,
-        "sinks": sinks,
-        "sanitizers": effective_sanitizers,
-        "domains": sorted(enabled_domains),
-        "hits": hits,
-        "sanitizer_annotations": sanitizer_annotations,
-        "traces": traces if include_traces else [],
-        "truncated": len(hits) >= max_paths,
+        "engine": AnalysisEngine.HEXRAYS_MICROCODE.value,
+        "fidelity": "semantic_interprocedural" if hops else "semantic_intraprocedural",
+        "hits": result["hits"],
+        "sanitizer_annotations": result["sanitizer_annotations"],
+        "functions_analyzed": result["functions_analyzed"],
+        "truncated": result["truncated"],
         "unsupported_edges": [
-            {"kind": "interprocedural_alias", "reason": "callee summaries are not yet available for every call"},
+            {"kind": "callee_effects", "reason": "callee results and pointer writes are approximated at the call site"},
+            {"kind": "indirect_call", "reason": "indirect call targets are not followed"},
+            {"kind": "memory_alias", "reason": "stores and loads through pointers are joined conservatively"},
             {"kind": "thread_handoff", "reason": "concurrent taint propagation is not modeled"},
         ],
-        "warnings": warnings,
+        "warnings": result["warnings"],
     }
 
 
-def _node_domains(nodes: list[dict[str, Any]]) -> set[str]:
-    import re
-
-    domains: set[str] = set()
-    rendered = " ".join(
-        f"{node.get('definitions', '')} {node.get('uses', '')}".lower()
-        for node in nodes
-    )
-    if re.search(r"\b(sp|stk|stack|stackvar)\b|@sp", rendered):
-        domains.add("stack")
-    text = rendered
-    if "[" in text or re.search(r"\bmem\b", text):
-        domains.add("memory")
-    if re.search(r"\b(global|got|plt)\b|\.data\b|\.bss\b", text):
-        domains.add("global")
-    if rendered.strip() and not domains:
-        domains.add("register")
-    return domains
-
-
 @tool
-def job_status(job_id: Annotated[str, "Job identifier"]) -> dict[str, Any]:
-    """WHEN polling a deep analysis/investigation job, use this; for data use job_result.
-    RETURNS job record without the result payload.
-    LIMITS terminal states are persisted; interrupted jobs restore as interrupted. NEXT job_result when done."""
-    return _jobs().status(job_id, include_result=False)
+def job_status(
+    job_id: Annotated[str, "Job identifier"],
+    wait_sec: Annotated[float, "Block up to this many seconds (max 30) until the job ends"] = 0,
+) -> dict[str, Any]:
+    """WHEN a background job (analysis_run deep, investigation_start) is running; pass wait_sec instead of polling in a loop.
+    RETURNS {job_id, kind, state, progress, message, error} (error set when failed); no result payload.
+    LIMITS state is queued/running/completed/failed/cancelled/interrupted; wait_sec returns early once the state is terminal; jobs from a previous worker restore as interrupted. NEXT job_result once state=completed."""
+    import time
+
+    deadline = time.monotonic() + max(0.0, min(float(wait_sec or 0), 30.0))
+    while True:
+        status = _jobs().status(job_id, include_result=False)
+        if status["state"] not in ("queued", "running") or time.monotonic() >= deadline:
+            return status
+        from .sync import run_main_thread_work
+
+        run_main_thread_work()  # idalib: this request occupies the main loop the job needs
+        time.sleep(0.02)
 
 
 @tool
 def job_cancel(job_id: Annotated[str, "Job identifier"]) -> dict[str, Any]:
-    """WHEN a deep job is no longer needed, use this instead of waiting.
+    """WHEN a background job is no longer needed, use this instead of waiting.
     RETURNS {job_id, cancel_requested}.
-    LIMITS cooperative: running jobs observe cancellation at the next checkpoint. NEXT job_status to confirm."""
+    LIMITS cooperative: running jobs stop at their next checkpoint. NEXT job_status to confirm state=cancelled."""
     return {"job_id": job_id, "cancel_requested": _jobs().cancel(job_id)}
 
 
@@ -1142,9 +1500,9 @@ def job_result(
     cursor: Annotated[str | None, "Opaque result cursor"] = None,
     limit: Annotated[int, "Maximum list items"] = 100,
 ) -> dict[str, Any]:
-    """WHEN a deep job finished, use this; for progress use job_status.
-    RETURNS {data, truncated, next_cursor} envelope; lists paginate by cursor/limit.
-    LIMITS non-list results return whole; list pages cap at 1000 items and large outputs use the rpc 50k download indirection. NEXT investigation_add_finding to record conclusions."""
+    """WHEN job_status reports state=completed, use this to fetch the payload; poll job_status first.
+    RETURNS {data, next_cursor?} envelope; list results paginate by cursor/limit.
+    LIMITS raises JOB_INTERRUPTED with the current state while the job is not completed; list pages cap at 1000 items. NEXT investigation_add_finding to record conclusions."""
     result = _jobs().result(job_id)
     if not isinstance(result, list):
         return ToolEnvelope(result).to_dict()
@@ -1163,15 +1521,21 @@ def investigation_start(
 ) -> dict[str, Any]:
     """WHEN a multi-step question needs resumable evidence, use this instead of one-shot analysis_run.
     RETURNS the investigation record with its background job id.
-    LIMITS seeds fan out to one function analysis each; budgets carry detail_level/include_asm/max_depth/direction; findings arrive via investigation_add_finding. NEXT investigation_get/job_status to follow progress."""
+    LIMITS triage (unless budgets.skip_triage) plus one function analysis per seed, at most budgets.max_seeds (default 20); findings arrive via investigation_add_finding. NEXT job_status(wait_sec=...) then investigation_get."""
     effective_seeds = list(seeds or [])
     effective_budgets = dict(budgets or {})
+    max_seeds = max(1, min(int(effective_budgets.get("max_seeds") or 20), 100))
+    effective_seeds, skipped_seeds = effective_seeds[:max_seeds], effective_seeds[max_seeds:]
     manager = _investigations()
     record = manager.create(objective, database=_database_id(), seeds=effective_seeds)
+    if skipped_seeds:
+        manager.set_state(record.investigation_id, record.state, skipped_seeds=skipped_seeds)
     def run(context: JobContext) -> dict[str, Any]:
         try:
-            context.progress(0.05, "triage")
-            triage = _analysis_sync("triage", [], effective_budgets)
+            triage = None
+            if not effective_budgets.get("skip_triage"):
+                context.progress(0.05, "triage")
+                triage = _analysis_sync("triage", [], effective_budgets)
             analyses = []
             for index, seed in enumerate(effective_seeds):
                 context.check_cancelled()
@@ -1206,12 +1570,16 @@ def investigation_add_finding(
     description: Annotated[str, "Finding description"],
     severity: Annotated[InvestigationSeverity, "info, low, medium, high, or critical"] = "info",
     confidence: Annotated[float, "Confidence from 0 to 1"] = 0.5,
-    evidence: Annotated[list[dict[str, Any]] | None, "Evidence records"] = None,
+    evidence: Annotated[
+        list[dict[str, Any]] | None,
+        "Evidence items: {addr|address|ea, description|text|data|note, source?, confidence?}; each needs an address or a description",
+    ] = None,
     tags: Annotated[list[str] | None, "Finding tags"] = None,
+    apply_to_idb: Annotated[bool, "Also bookmark every evidence address as '[severity] title' (undoable commit)"] = False,
 ) -> dict[str, Any]:
     """WHEN a conclusion has tool evidence, use this; bare notes do not belong here.
-    RETURNS the created finding record.
-    LIMITS severity is info/low/medium/high/critical; confidence clamps to 0-1; evidence entries need addr or data. NEXT investigation_export for the report."""
+    RETURNS the finding record (evidence addresses canonical hex); with apply_to_idb also transaction_id of the bookmark commit, or apply_error.
+    LIMITS severity is info/low/medium/high/critical; confidence clamps to 0-1; evidence items without address and description raise INVALID_OPERATION; apply_to_idb needs annotate scope and resolvable addresses. NEXT investigation_export for the report; mutation_rollback(transaction_id) removes the bookmarks."""
     normalized_severity = str(severity).lower()
     if normalized_severity not in get_args(InvestigationSeverity):
         _unsupported("investigation severity", severity, get_args(InvestigationSeverity))
@@ -1224,8 +1592,26 @@ def investigation_add_finding(
         confidence=confidence,
         evidence=list(evidence or []),
         tags=list(tags or []),
+        resolve_address=_resolve_address_text,
     )
-    return finding.to_dict()
+    result = finding.to_dict()
+    if not apply_to_idb:
+        return result
+    addresses = list(dict.fromkeys(item.address for item in finding.evidence if item.address))
+    if not addresses:
+        result["apply_error"] = {"code": ErrorCode.INVALID_OPERATION.value, "message": "No evidence address to bookmark"}
+        return result
+    label = f"[{finding.severity}] {finding.title}"
+    try:
+        committed = mutation_preview(
+            [{"kind": "bookmark", "addr": addr, "name": label, "prefix": ""} for addr in addresses],
+            commit=True,
+        )
+    except VNextError as exc:
+        result["apply_error"] = exc.to_dict()
+        return result
+    result["transaction_id"] = committed["transaction_id"]
+    return result
 
 
 @tool
@@ -1262,10 +1648,11 @@ _OPERATION_TARGETS: dict[str, tuple[str, str, SafetyScope]] = {
     "define_function": ("define_func", "items", SafetyScope.MODIFY),
     "define_code": ("define_code", "items", SafetyScope.MODIFY),
     "undefine": ("undefine", "items", SafetyScope.MODIFY),
-    "set_operand_type": ("set_op_type", "items", SafetyScope.MODIFY),
+    "set_operand_type": ("set_op_type", "items", SafetyScope.ANNOTATE),
     "make_data": ("make_data", "items", SafetyScope.MODIFY),
     "declare_stack": ("declare_stack", "items", SafetyScope.ANNOTATE),
     "delete_stack": ("delete_stack", "items", SafetyScope.ANNOTATE),
+    "upsert_enum": ("enum_upsert", "queries", SafetyScope.ANNOTATE),
     "apply_flirt": ("apply_flirt_signature", "items", SafetyScope.MODIFY),
     "load_til": ("load_type_library", "items", SafetyScope.MODIFY),
     "save_database": ("idb_save", "path", SafetyScope.FILESYSTEM),
@@ -1277,6 +1664,7 @@ _MUTATION_KIND_ALIASES = {
     "rename_function": "rename",
     "rename_global": "rename",
     "rename_data": "rename",
+    "enum_upsert": "upsert_enum",
 }
 
 _RENAME_BATCH_KEYS = frozenset({"func", "data", "global", "globals", "local", "stack"})
@@ -1301,23 +1689,34 @@ def _as_dict_list(value: Any) -> list[dict[str, Any]] | None:
     return None
 
 
+@idasync
+def _resolve_address_text(text: str) -> str:
+    """Resolve a symbol/address expression to canonical hex on the IDA main thread."""
+    from .utils import parse_address
+
+    return hex(parse_address(text))
+
+
 def _parse_mutation_address(raw: Any, *, index: int, field: str = "addr") -> str:
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         raise VNextError(
             ErrorCode.INVALID_OPERATION,
             f"Mutation operation {index} has an empty address",
         )
-    if isinstance(raw, int):
+    if isinstance(raw, int) and not isinstance(raw, bool):
         return hex(raw)
     text = str(raw).strip()
     try:
-        int(text, 0)
-    except ValueError as exc:
+        return hex(int(text, 0))
+    except ValueError:
+        pass
+    try:
+        return _resolve_address_text(text)
+    except Exception as exc:
         raise VNextError(
             ErrorCode.INVALID_OPERATION,
-            f"Mutation operation {index} failed to parse {field}: {text}",
+            f"Mutation operation {index} failed to resolve {field}: {exc}",
         ) from exc
-    return text
 
 
 def _copy_passthrough(source: dict[str, Any], dest: dict[str, Any], keys: tuple[str, ...]) -> None:
@@ -1353,6 +1752,15 @@ def _reshape_mutation_arguments(kind: str, arguments: dict[str, Any], *, index: 
                     if "addr" in item:
                         item["addr"] = _parse_mutation_address(item["addr"], index=index)
             return canonical, args
+        if args.get("old_name") and args.get("new_name"):
+            item = {"old": str(args["old_name"]), "new": str(args["new_name"])}
+            group = "data"
+            if args.get("func_addr"):
+                item["func_addr"] = _parse_mutation_address(args["func_addr"], index=index, field="func_addr")
+                group = "local"
+            reshaped = {group: [item]}
+            _copy_passthrough(args, reshaped, _RENAME_PASSTHROUGH_KEYS)
+            return canonical, reshaped
         if "addr" in args or "name" in args:
             parsed_addr = _parse_mutation_address(args.get("addr"), index=index)
             if not args.get("name"):
@@ -1372,21 +1780,58 @@ def _reshape_mutation_arguments(kind: str, arguments: dict[str, Any], *, index: 
             return canonical, {"items": [_normalize_comment_item(args, index=index)]}
 
     elif canonical == "set_type":
-        edits = _as_dict_list(args.get("edits"))
+        edits = _as_dict_list(args.pop("edits", args.pop("items", None)))
         if edits is not None:
             for edit in edits:
                 if "addr" in edit:
                     edit["addr"] = _parse_mutation_address(edit["addr"], index=index)
             return canonical, {**args, "edits": edits}
-        if args.get("addr") and args.get("type"):
-            edit = {"addr": _parse_mutation_address(args["addr"], index=index), "type": str(args["type"])}
+        type_text = next((args[key] for key in _TYPE_TEXT_KEYS if args.get(key)), None)
+        if (args.get("addr") or args.get("name")) and type_text:
+            edit = {"type": str(type_text)}
+            if args.get("addr"):
+                edit["addr"] = _parse_mutation_address(args["addr"], index=index)
             _copy_passthrough(args, edit, ("kind", "name", "variable"))
             return canonical, {"edits": [edit]}
 
     elif canonical == "declare_type" and not args.get("decls") and args.get("decl"):
         return canonical, {"decls": args["decl"]}
 
+    elif canonical == "upsert_enum" and "queries" not in args and args.get("name"):
+        query = {"name": str(args["name"]), "members": args.get("members") or []}
+        _copy_passthrough(args, query, ("bitfield",))
+        return canonical, {"queries": [query]}
+
+    elif canonical == "declare_stack" and "items" not in args and "ty" not in args and args.get("type"):
+        args["ty"] = args.pop("type")
+
+    elif canonical == "set_operand_type" and "items" not in args and "operand_kind" in args:
+        args["kind"] = args.pop("operand_kind")
+
+    target = _OPERATION_TARGETS.get(canonical)
+    if target is not None and canonical not in {"rename", "comment", "append_comment", "set_type"}:
+        _canonicalize_item_addresses(target[1], args, index=index)
     return canonical, args
+
+
+_TYPE_TEXT_KEYS = ("type", "ty", "decl", "signature")
+_ITEM_ADDRESS_KEYS = ("addr", "func_addr", "target_addr", "end")
+
+
+def _payload_items(argument_name: str, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+    """Item dicts the legacy tool will receive (mirrors _apply_operation)."""
+    if argument_name == "item":
+        return [arguments]
+    if argument_name == "path":
+        return []
+    return _as_dict_list(arguments.get(argument_name, arguments.get("items", arguments))) or []
+
+
+def _canonicalize_item_addresses(argument_name: str, arguments: dict[str, Any], *, index: int) -> None:
+    for item in _payload_items(argument_name, arguments):
+        for key in _ITEM_ADDRESS_KEYS:
+            if item.get(key) not in (None, ""):
+                item[key] = _parse_mutation_address(item[key], index=index, field=key)
 
 
 def _operation_payload_empty(kind: str, arguments: dict[str, Any]) -> bool:
@@ -1538,71 +1983,287 @@ def _apply_operation(operation: MutationOperation) -> Any:
     return result
 
 
+def _hex_ea(raw: Any) -> int | None:
+    """Parse an address already canonicalized by _parse_operations."""
+    if raw in (None, ""):
+        return None
+    try:
+        return int(str(raw), 0)
+    except ValueError:
+        return None
+
+
+def _decl_text(decl: str) -> str:
+    text = decl.strip()
+    return text if text.endswith(";") else text + ";"
+
+
+def _declared_type_names(decl: str) -> list[str]:
+    """Names a C declaration string defines (first parsed type plus tagged/typedef names)."""
+    import re
+
+    import ida_typeinf
+
+    names: list[str] = []
+    try:
+        parsed = ida_typeinf.parse_decl(ida_typeinf.tinfo_t(), None, _decl_text(decl), ida_typeinf.PT_SIL | ida_typeinf.PT_TYP)
+        if parsed:
+            names.append(parsed)
+    except Exception:
+        pass
+    names += re.findall(r"\b(?:struct|union|enum|class)\s+([A-Za-z_]\w*)\s*(?::[^{;]*)?\{", decl)
+    names += re.findall(r"\btypedef\b[^;]*?\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*;", decl)
+    return list(dict.fromkeys(names))
+
+
+def _local_type_decl(name: str) -> str | None:
+    import ida_typeinf
+
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(ida_typeinf.get_idati(), name):
+        return None
+    try:
+        return tif._print(name, ida_typeinf.PRTYPE_1LINE | ida_typeinf.PRTYPE_TYPE | ida_typeinf.PRTYPE_DEF)
+    except Exception:
+        return str(tif)
+
+
+def _frame_member_type(func_ea: int, name: str) -> str | None:
+    import ida_frame
+    import ida_funcs
+    import ida_typeinf
+
+    func = ida_funcs.get_func(func_ea)
+    frame = ida_typeinf.tinfo_t()
+    if func is None or not ida_frame.get_func_frame(frame, func):
+        return None
+    _index, udm = frame.get_udm(name)
+    return str(udm.type) if udm else None
+
+
+def _user_lvar_type(func_ea: int, name: str) -> str | None:
+    import ida_funcs
+    import ida_hexrays
+
+    func = ida_funcs.get_func(func_ea)
+    lvinf = ida_hexrays.lvar_uservec_t()
+    if func is None or not ida_hexrays.restore_user_lvar_settings(lvinf, func.start_ea):
+        return None
+    for saved in lvinf.lvvec:
+        if saved.name == name:
+            return str(saved.type)
+    return None
+
+
+def _decl_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value or [] if str(item).strip()]
+
+
 @idasync
 def _mutation_before_state(operation: MutationOperation) -> Any:
-    """Capture current names/comments/bytes so preview is useful for reversing."""
+    """Capture the IDB state an operation targets; re-read to revalidate a stale preview."""
 
     try:
         import ida_bytes
+        import ida_funcs
+        import ida_lines
         import ida_name
+        import ida_ua
         import idaapi
-
-        from .utils import parse_address
+        import idc
     except Exception:
         return None
 
-    def _addr(item: Any) -> int | None:
-        if not isinstance(item, dict):
-            return None
-        raw = item.get("addr") or item.get("ea") or item.get("func_addr")
-        if raw is None:
-            return None
-        try:
-            return parse_address(str(raw))
-        except Exception:
-            return None
-
+    kind = operation.kind
+    arguments = operation.arguments
+    items = _payload_items(_OPERATION_TARGETS[kind][1], arguments)
     try:
-        if operation.kind == "rename":
-            before: dict[str, list[dict[str, str]]] = {}
-            for group, items in operation.arguments.items():
-                if not isinstance(items, list):
-                    continue
+        if kind == "rename":
+            before: dict[str, list[dict[str, Any]]] = {}
+            for group in _RENAME_BATCH_KEYS:
                 names = []
-                for item in items:
-                    ea = _addr(item)
-                    if ea is None:
-                        continue
-                    names.append({"addr": hex(ea), "name": ida_name.get_name(ea) or ""})
+                for item in _as_dict_list(arguments.get(group)) or []:
+                    ea = _hex_ea(item.get("addr") or item.get("func_addr"))
+                    if ea is not None:
+                        names.append({"addr": hex(ea), "name": ida_name.get_name(ea) or ""})
+                    elif item.get("old"):
+                        found = idaapi.get_name_ea(idaapi.BADADDR, str(item["old"]))
+                        names.append({"old": str(item["old"]), "addr": None if found == idaapi.BADADDR else hex(found)})
                 if names:
-                    before[str(group)] = names
+                    before[group] = names
             return before or None
-        if operation.kind in {"comment", "append_comment"}:
-            items = operation.arguments.get("items") or operation.arguments.get("item") or []
-            if isinstance(items, dict):
-                items = [items]
-            comments = []
-            for item in items:
-                ea = _addr(item)
-                if ea is None:
-                    continue
-                comments.append({"addr": hex(ea), "comment": idaapi.get_cmt(ea, False) or ""})
-            return comments or None
-        if operation.kind in {"patch_bytes", "patch_asm", "write_integer"}:
-            items = operation.arguments.get("items") or operation.arguments.get("patches") or []
-            if isinstance(items, dict):
-                items = [items]
-            snapshots = []
-            for item in items:
-                ea = _addr(item)
-                if ea is None:
-                    continue
-                size = max(1, min(int(item.get("size", 16) or 16), 64))
-                snapshots.append({"addr": hex(ea), "bytes": ida_bytes.get_bytes(ea, size).hex() if ida_bytes.get_bytes(ea, size) else None})
-            return snapshots or None
+        if kind == "declare_type":
+            return [
+                {"name": name, "decl": _local_type_decl(name)}
+                for decl in _decl_list(arguments.get("decls"))
+                for name in _declared_type_names(decl)
+            ]
+        if kind == "upsert_enum":
+            enums = []
+            for query in items:
+                enum_id = idc.get_enum(str(query.get("name", "")))
+                members = {}
+                for member in _as_dict_list(query.get("members")) or []:
+                    member_id = idc.get_enum_member_by_name(str(member.get("name", "")))
+                    members[str(member.get("name", ""))] = (
+                        None if member_id == idc.BADADDR else idc.get_enum_member_value(member_id)
+                    )
+                enums.append({"name": query.get("name"), "exists": enum_id != idc.BADADDR, "members": members})
+            return enums
+        if kind in {"apply_flirt", "load_til", "save_database"}:
+            return None
+        states = []
+        for item in items:
+            ea = _hex_ea(item.get("addr"))
+            if kind == "set_type" and ea is None and item.get("name"):
+                found = idaapi.get_name_ea(idaapi.BADADDR, str(item["name"]))
+                ea = None if found == idaapi.BADADDR else found
+            if ea is None:
+                return None
+            state: dict[str, Any] = {"addr": hex(ea)}
+            if kind in {"comment", "append_comment"}:
+                state["comment"] = idaapi.get_cmt(ea, False) or ""
+                func = ida_funcs.get_func(ea)
+                state["func_comment"] = (ida_funcs.get_func_cmt(func, False) or "") if func else None
+            elif kind == "bookmark":
+                from .api_modify import MAX_BOOKMARK_SLOTS
+
+                state["bookmark"] = next(
+                    (idc.get_bookmark_desc(slot) for slot in range(MAX_BOOKMARK_SLOTS) if idc.get_bookmark(slot) == ea),
+                    None,
+                )
+            elif kind in {"patch_bytes", "patch_asm", "write_integer"}:
+                size = item.get("size")
+                if not size and isinstance(item.get("data"), str):
+                    size = len(item["data"].replace(" ", "")) // 2
+                size = max(1, min(int(size or 16), 64))
+                raw = ida_bytes.get_bytes(ea, size)
+                state["bytes"] = raw.hex() if raw else None
+            elif kind == "set_type":
+                state["type"] = idc.get_type(ea)
+                if item.get("variable"):
+                    state["lvar_type"] = _user_lvar_type(ea, str(item["variable"]))
+                elif item.get("name") and item.get("addr"):
+                    state["frame_type"] = _frame_member_type(ea, str(item["name"]))
+            elif kind in {"declare_stack", "delete_stack"}:
+                state["name"] = str(item.get("name", ""))
+                state["type"] = _frame_member_type(ea, state["name"])
+            elif kind == "set_operand_type":
+                op_n = int(item.get("op_n", 0))
+                state["op_n"] = op_n
+                state["operand"] = ida_lines.tag_remove(ida_ua.print_operand(ea, op_n) or "")
+            else:  # define_function, define_code, undefine, make_data
+                func = ida_funcs.get_func(ea)
+                state.update(
+                    head=hex(ida_bytes.get_item_head(ea)),
+                    flags=ida_bytes.get_flags(ea) & (ida_bytes.MS_CLS | ida_bytes.DT_TYPE),
+                    size=ida_bytes.get_item_size(ea),
+                    func=hex(func.start_ea) if func else None,
+                    type=idc.get_type(ea),
+                )
+            states.append(state)
+        return states or None
     except Exception:
         return None
-    return None
+
+
+_UNCHECKED_KINDS = frozenset({"patch_asm", "apply_flirt", "load_til", "save_database"})
+_OPERAND_KINDS = ("stroff", "offset", "stkvar", "hex", "dec", "char", "binary", "octal", "enum")
+
+
+def _validate_operation(index: int, operation: MutationOperation, pending: set[str]) -> bool:
+    """Raise INVALID_OPERATION for unresolvable targets or unparsable types.
+
+    Returns False when content was not checked (assembly, FLIRT, TIL) or depends on
+    a type declared earlier in the same transaction. Must run on the main thread.
+    """
+    import re
+
+    import ida_bytes
+    import ida_typeinf
+    import idc
+
+    from .api_types import _parse_tinfo
+    from .utils import get_type_by_name
+
+    kind = operation.kind
+    items = _payload_items(_OPERATION_TARGETS[kind][1], operation.arguments)
+    deferred = False
+
+    def invalid(message: str) -> NoReturn:
+        raise VNextError(ErrorCode.INVALID_OPERATION, f"Mutation operation {index} {kind}: {message}")
+
+    def check_type(text: str, parse: Callable[[str], Any]) -> None:
+        nonlocal deferred
+        try:
+            parse(text)
+        except Exception as exc:
+            if any(re.search(rf"\b{re.escape(name)}\b", text) for name in pending):
+                deferred = True  # declared by an earlier operation of this transaction
+            else:
+                invalid(str(exc))
+
+    if kind not in {"rename", "declare_type", "upsert_enum", "apply_flirt", "load_til", "save_database"}:
+        for item in items:
+            for key in ("addr", "func_addr", "target_addr"):
+                ea = _hex_ea(item.get(key))
+                if ea is not None and not ida_bytes.is_mapped(ea):
+                    invalid(f"{key} {hex(ea)} is not a mapped address")
+
+    if kind == "set_type":
+        for edit in items:
+            text = next((str(edit[key]) for key in ("ty", "type", "decl", "declaration", "signature") if edit.get(key)), "")
+            if not text:
+                invalid("missing type")
+            is_func = str(edit.get("kind", "")).lower() == "function" or bool(edit.get("signature"))
+            check_type(text, lambda value: _parse_tinfo(value, func=is_func))
+    elif kind == "make_data":
+        for item in items:
+            check_type(str(item.get("type") or ""), _parse_tinfo)
+    elif kind == "declare_stack":
+        for item in items:
+            check_type(str(item.get("ty") or ""), get_type_by_name)
+    elif kind == "declare_type":
+        for decl in _decl_list(operation.arguments.get("decls")):
+
+            def parse_decl(text: str) -> None:
+                if ida_typeinf.parse_decl(ida_typeinf.tinfo_t(), None, _decl_text(text), ida_typeinf.PT_SIL | ida_typeinf.PT_TYP) is None:
+                    raise ValueError(f"declaration does not parse: {text}")
+
+            check_type(decl, parse_decl)
+            pending.update(_declared_type_names(decl))
+    elif kind == "upsert_enum":
+        pending.update(str(query.get("name")) for query in items if query.get("name"))
+    elif kind == "set_operand_type":
+        for item in items:
+            display = str(item.get("kind", "")).strip().lower()
+            if display not in _OPERAND_KINDS:
+                invalid(f"operand_kind must be one of {', '.join(_OPERAND_KINDS)}")
+            named = str(item.get("enum" if display == "enum" else "struct", "")).strip()
+            if display in {"enum", "stroff"}:
+                if not named:
+                    invalid(f"{display} requires {'enum' if display == 'enum' else 'struct'}")
+                exists = idc.get_enum(named) != idc.BADADDR if display == "enum" else _local_type_decl(named) is not None
+                if not exists and named not in pending:
+                    invalid(f"unknown {display} type {named}")
+                deferred = deferred or not exists
+    return not deferred and kind not in _UNCHECKED_KINDS
+
+
+@idasync
+def _preview_states(operations: list[MutationOperation]) -> list[dict[str, Any]]:
+    """Validate and snapshot every operation in one main-thread hop."""
+    pending: set[str] = set()
+    states = []
+    for index, operation in enumerate(operations):
+        state: dict[str, Any] = {"validated": _validate_operation(index, operation, pending)}
+        before = _mutation_before_state(operation)
+        if before is not None:
+            state["before"] = before
+        states.append(state)
+    return states
 
 
 def _revalidate_preview(preview: MutationPreview) -> bool:
@@ -1617,6 +2278,18 @@ def _revalidate_preview(preview: MutationPreview) -> bool:
         if _mutation_before_state(operation) != before:
             return False
     return True
+
+
+@idasync
+def _clear_decompiler_cache() -> None:
+    """Drop cached pseudocode so decompile reflects committed types/names."""
+    try:
+        import ida_hexrays
+
+        if ida_hexrays.init_hexrays_plugin():
+            ida_hexrays.clear_cached_cfuncs()
+    except Exception:
+        pass
 
 
 @idasync
@@ -1773,26 +2446,28 @@ def _debug_trace_export(path: str, description: str) -> dict[str, Any]:
 @tool
 def mutation_preview(
     operations: Annotated[
-        list[dict[str, Any]],
-        "Discriminated mutation operations. Each item needs kind plus either nested "
-        "arguments or flat sibling fields (kind, addr, name). Examples: "
-        "{kind, addr, name} or {kind, arguments: {addr, name}} for rename; "
-        "{kind, addr, comment} for comment (text aliases comment); "
-        "{kind, decl} for declare_type; {kind, addr, type} for set_type. "
-        "Batch form: {kind: rename, arguments: {func: [{addr, name}]}} or "
-        "{kind: comment, arguments: {items: [{addr, comment}]}}. "
-        "kind is one of: rename, comment, append_comment, bookmark, declare_type, "
-        "set_type, patch_bytes, write_integer, patch_asm, define_function, define_code, "
-        "undefine, set_operand_type, make_data, declare_stack, delete_stack, apply_flirt, "
-        "load_til, save_database. "
-        "Aliases set_name/rename_func map to rename.",
+        list[MutationOp],
+        "Operations applied in order; flat fields or nested arguments{}. Per kind: "
+        "rename {addr,name} | {old_name,new_name[,func_addr]}; comment/append_comment {addr,comment}; "
+        "bookmark {addr,name}; declare_type {decl}; set_type {addr|name,type[,variable]}; "
+        "upsert_enum {name,members[{name,value}][,bitfield]}; declare_stack {addr,offset,name,type}; "
+        "delete_stack {addr,name}; patch_bytes {addr,data}; write_integer {addr,ty,value}; patch_asm {addr,asm}; "
+        "define_function {addr[,end]}; define_code {addr}; undefine {addr[,end|size]}; make_data {addr,type[,name]}; "
+        "set_operand_type {addr,op_n,operand_kind[,struct|enum|target_addr]}; apply_flirt/load_til {name}; "
+        "save_database {path}. Batch: items[...] or arguments{func:[{addr,name}]}. addr takes hex or symbol names.",
     ],
+    commit: Annotated[bool, "Commit immediately; only when every operation is annotate scope"] = False,
 ) -> dict[str, Any]:
-    """WHEN staging any IDB change, use this; never call legacy mutators directly.
-    RETURNS staged transaction with per-operation before/after and warnings.
-    LIMITS rename dry-runs against legacy rename; other kinds are structural-only; commit requires the unchanged transaction id. NEXT mutation_status/mutation_commit."""
+    """WHEN staging any IDB change, use this; commit=true applies annotate-only edits (rename/comment/type/enum/operand display/bookmark/stack) in one call.
+    RETURNS {transaction_id, operations[{kind, scope, arguments, validated, before?}], required_scopes, warnings?, receipt? (commit=true)}.
+    LIMITS addresses must resolve and types/declarations must parse (INVALID_OPERATION names the operation index); validated=false means content was not checked (asm/FLIRT/TIL or types declared earlier in the batch); previews expire. NEXT mutation_commit(transaction_id), or mutation_rollback after commit=true."""
 
     parsed = _parse_operations(operations)
+    if commit and any(operation.scope is not SafetyScope.ANNOTATE for operation in parsed):
+        raise VNextError(
+            ErrorCode.INVALID_OPERATION,
+            "commit=true is only allowed for annotate-scope operations; call mutation_commit",
+        )
     for operation in parsed:
         if operation.kind != "rename":
             continue
@@ -1802,19 +2477,17 @@ def mutation_preview(
             detail = result.get("error") or "rename dry-run failed"
         if detail is not None:
             raise VNextError(ErrorCode.INVALID_OPERATION, f"mutation_preview: rename dry-run failed: {detail}")
+    states = iter(_preview_states(parsed))
     preview = _TRANSACTIONS.preview(
         _database_id(),
         parsed,
         enabled_scopes=get_active_scopes(),
-        preview_operation=lambda operation: {
-            "kind": operation.kind,
-            "arguments": operation.arguments,
-            "validated": True,
-            "before": _mutation_before_state(operation),
-            "after": operation.arguments,
-        },
+        preview_operation=lambda _operation: next(states),
     )
     result = preview.to_dict()
+    if commit:
+        result["receipt"] = _commit_transaction(preview.transaction_id)
+        return result
     try:
         from .http import recovery_checkpoints_enabled
     except Exception:
@@ -1826,30 +2499,36 @@ def mutation_preview(
     return result
 
 
+def _commit_transaction(transaction_id: str) -> dict[str, Any]:
+    try:
+        return _TRANSACTIONS.commit(
+            transaction_id,
+            database=_database_id(),
+            enabled_scopes=get_active_scopes(),
+            checkpoint=_commit_checkpoint,
+            apply_operation=_apply_operation,
+            undo=_perform_undo,
+            begin=_create_undo_point,
+            revalidate=_revalidate_preview,
+        ).to_dict()
+    finally:
+        _clear_decompiler_cache()
+
+
 @tool
 def mutation_commit(transaction_id: Annotated[str, "Preview transaction identifier"]) -> dict[str, Any]:
     """WHEN a staged transaction reviewed clean, use this; for state checks use mutation_status.
-    RETURNS the commit receipt with recovery outcome.
-    LIMITS commits the unchanged preview only; recovery checkpoints only when the dashboard option enables them. NEXT mutation_rollback on regret."""
+    RETURNS the receipt {transaction_id, status, revision_before, revision_after, applied_operations, checkpoint, undo_available, required_scopes, warnings}.
+    LIMITS needs every scope the preview listed (byte/code edits need modify); a changed target since preview raises STALE_REVISION; a failing operation undoes the applied ones; recovery checkpoints only when enabled in settings. NEXT mutation_rollback(transaction_id) to undo."""
 
-    receipt = _TRANSACTIONS.commit(
-        transaction_id,
-        database=_database_id(),
-        enabled_scopes=get_active_scopes(),
-        checkpoint=_commit_checkpoint,
-        apply_operation=_apply_operation,
-        undo=_perform_undo,
-        begin=_create_undo_point,
-        revalidate=_revalidate_preview,
-    )
-    return receipt.to_dict()
+    return _commit_transaction(transaction_id)
 
 
 @tool
 def mutation_status(transaction_id: Annotated[str, "Transaction identifier"]) -> dict[str, Any]:
     """WHEN following a staged transaction, use this instead of re-previewing.
-    RETURNS preview or committed transaction state.
-    LIMITS read-only view; expired transactions raise TRANSACTION_EXPIRED. NEXT mutation_commit/mutation_rollback."""
+    RETURNS the preview with status=previewed and expired, or the commit/rollback receipt.
+    LIMITS read-only; unknown ids raise TRANSACTION_NOT_FOUND. NEXT mutation_commit/mutation_rollback."""
 
     return _TRANSACTIONS.status(transaction_id)
 
@@ -1857,10 +2536,17 @@ def mutation_status(transaction_id: Annotated[str, "Transaction identifier"]) ->
 @tool
 def mutation_rollback(transaction_id: Annotated[str, "Committed transaction identifier"]) -> dict[str, Any]:
     """WHEN undoing the latest commit, use this; older transactions are rejected.
-    RETURNS the rollback receipt.
-    LIMITS latest committed transaction only; without a checkpoint it uses native undo, else raises REOPEN_REQUIRED with the checkpoint path. NEXT re-preview corrections via mutation_preview."""
+    RETURNS the receipt with status=rolled_back.
+    LIMITS latest commit only (any later IDB change raises STALE_REVISION); needs the committed transaction's scopes; uses native undo, else raises REOPEN_REQUIRED with the recovery checkpoint path. NEXT mutation_preview for corrections."""
 
-    return _TRANSACTIONS.rollback(transaction_id, rollback_undo=_perform_undo).to_dict()
+    try:
+        return _TRANSACTIONS.rollback(
+            transaction_id,
+            rollback_undo=_perform_undo,
+            enabled_scopes=get_active_scopes(),
+        ).to_dict()
+    finally:
+        _clear_decompiler_cache()
 
 
 @tool
@@ -1879,7 +2565,7 @@ def debug_session(action: Annotated[DebugSessionAction, "start, attach, detach, 
     name = mapping.get(normalized)
     if name is None:
         _unsupported("debug session action", action, get_args(DebugSessionAction))
-    return ToolEnvelope(_legacy_call(name, target or {}), provenance={"legacy_tool": name}).to_dict()
+    return ToolEnvelope(_legacy_call(name, target or {})).to_dict()
 
 
 @tool
@@ -1895,7 +2581,7 @@ def debug_control(action: Annotated[DebugControlAction, "continue, step_into, st
     name = mapping.get(normalized)
     if name is None:
         _unsupported("debugger control", action, get_args(DebugControlAction))
-    return ToolEnvelope(_legacy_call(name, {"addr": addr} if normalized == "run_to" else {}), provenance={"legacy_tool": name}).to_dict()
+    return ToolEnvelope(_legacy_call(name, {"addr": addr} if normalized == "run_to" else {})).to_dict()
 
 
 @tool
@@ -1914,11 +2600,15 @@ def debug_breakpoints(action: Annotated[DebugBreakpointAction, "list, add, delet
     if normalized not in mapping:
         _unsupported("breakpoint action", action, get_args(DebugBreakpointAction))
     name, arguments = mapping[normalized]
-    return ToolEnvelope(_legacy_call(name, arguments), provenance={"legacy_tool": name}).to_dict()
+    return ToolEnvelope(_legacy_call(name, arguments)).to_dict()
 
 
 @tool
-def debug_state(include: Annotated[list[str] | None, "registers, stack, breakpoints, or status"] = None) -> dict[str, Any]:
+def debug_state(
+    include: Annotated[list[str] | None, "registers, stack, breakpoints, or status"] = None,
+    thread: Annotated[int | None, "registers: thread id (default current)"] = None,
+    registers: Annotated[list[str] | None, "registers: names to return (default all)"] = None,
+) -> dict[str, Any]:
     """WHEN reading stopped state, use this instead of individual dbg_* tools.
     RETURNS {data} envelope keyed by the requested sections.
     LIMITS sections are status/registers/stack/breakpoints (default status+registers+stack); each delegates to one legacy dbg_* read. NEXT debug_control to resume."""
@@ -1928,7 +2618,8 @@ def debug_state(include: Annotated[list[str] | None, "registers, stack, breakpoi
     for item in effective:
         if item not in mapping:
             _unsupported("debugger state section", item, ("status", "registers", "stack", "breakpoints"))
-        result[item] = _legacy_call(mapping[item], {})
+        arguments = {"thread": thread, "names": registers} if item == "registers" else {}
+        result[item] = _legacy_call(mapping[item], arguments)
     return ToolEnvelope(result).to_dict()
 
 
@@ -1940,11 +2631,11 @@ def debug_memory(action: Annotated[DebugMemoryAction, "read, write, snapshot, or
     normalized = str(action).lower()
     effective_regions = list(regions or [])
     if normalized == "read":
-        return ToolEnvelope(_legacy_call("dbg_read", {"regions": effective_regions}), provenance={"legacy_tool": "dbg_read"}).to_dict()
+        return ToolEnvelope(_legacy_call("dbg_read", {"regions": effective_regions})).to_dict()
     if normalized == "write":
         if not confirm_nonrollbackable:
             raise VNextError(ErrorCode.PROFILE_DENIED, "Live-memory writes require confirm_nonrollbackable=true")
-        return ToolEnvelope(_legacy_call("dbg_write", {"regions": effective_regions}), provenance={"legacy_tool": "dbg_write"}).to_dict()
+        return ToolEnvelope(_legacy_call("dbg_write", {"regions": effective_regions})).to_dict()
     if normalized == "snapshot":
         value = _legacy_call("dbg_read", {"regions": effective_regions})
         identifier = str(uuid4())
@@ -1998,12 +2689,12 @@ def python_execute(mode: Annotated[PythonExecuteMode, "eval or file"], code: Ann
     if normalized not in get_args(PythonExecuteMode):
         _unsupported("python execute mode", mode, get_args(PythonExecuteMode))
     if normalized == "eval" and code is not None:
-        return ToolEnvelope(_legacy_call("py_eval", {"code": code}), provenance={"legacy_tool": "py_eval"}).to_dict()
+        return ToolEnvelope(_legacy_call("py_eval", {"code": code})).to_dict()
     if normalized == "file" and path is not None:
         if SafetyScope.FILESYSTEM not in get_active_scopes():
             raise VNextError(ErrorCode.PROFILE_DENIED, "Python file execution also requires filesystem scope")
         safe_path = get_workspace_policy().resolve(path, must_exist=True)
-        return ToolEnvelope(_legacy_call("py_exec_file", {"file_path": str(safe_path)}), provenance={"legacy_tool": "py_exec_file"}).to_dict()
+        return ToolEnvelope(_legacy_call("py_exec_file", {"file_path": str(safe_path)})).to_dict()
     raise VNextError(ErrorCode.INVALID_OPERATION, "python_execute requires code for eval or path for file")
 
 
@@ -2110,7 +2801,7 @@ def audit_resource() -> dict[str, Any]:
 
 
 def _prompt(objective: str, workflow: str, database: str = "") -> str:
-    database_line = f"Use database session `{database}`. " if database else ""
+    database_line = f"Pass database=`{database}` when several databases are open. " if database else ""
     return f"{database_line}Objective: {objective}\n\nWorkflow:\n{workflow}\n\nCite addresses and tool evidence; label uncertainty explicitly."
 
 
@@ -2118,42 +2809,42 @@ def _prompt(objective: str, workflow: str, database: str = "") -> str:
 def triage_binary(database: str = "") -> str:
     """Systematic first-pass binary triage."""
 
-    return _prompt("Triage the binary and identify the highest-value analysis targets.", "1. Read capabilities and metadata.\n2. Run analysis_run in triage mode.\n3. Rank imports, strings, entrypoints, and suspicious functions.\n4. Create an investigation for deeper work.", database)
+    return _prompt("Triage the binary and identify the highest-value analysis targets.", "1. analysis_run(mode=\"triage\") for entrypoints, imports, strings, and ranked functions.\n2. search/entity_query (small limits) to confirm suspicious imports and strings.\n3. analysis_run(mode=\"function\") on the top candidates.\n4. investigation_start to track deeper work.", database)
 
 
 @prompt
 def explain_function(target: str, database: str = "") -> str:
     """Evidence-backed function explanation."""
 
-    return _prompt(f"Explain function {target}.", "Decompile and disassemble it, inspect callers/callees and data references, then summarize inputs, outputs, side effects, and confidence.", database)
+    return _prompt(f"Explain function {target}.", "analysis_run(mode=\"function\") or decompile (page with line_offset/line_limit; /*0xEA*/ markers give line addresses). graph_query callers and callsite_args for how it is called, memory_read for referenced data. Summarize inputs, outputs, side effects, and confidence.", database)
 
 
 @prompt
 def trace_input_to_sink(source: str, sink: str, database: str = "") -> str:
     """Trace a source toward a security-relevant sink."""
 
-    return _prompt(f"Trace {source} to {sink}.", "Run dataflow_trace and taint_analyze. Distinguish microcode def-use from reference-flow fallback and preserve all supporting addresses.", database)
+    return _prompt(f"Trace {source} to {sink}.", "graph_query(kind=\"path\") for call-level reachability, callsite_args for the concrete arguments at each hop, then dataflow_trace/taint_analyze. Distinguish microcode def-use from reference-flow fallback and preserve all supporting addresses.", database)
 
 
 @prompt
 def deobfuscate_component(targets: str, database: str = "") -> str:
     """Plan evidence-preserving deobfuscation."""
 
-    return _prompt(f"Analyze obfuscation around {targets}.", "Identify the transformation, document invariants, stage all IDB changes through mutation_preview, and do not commit without explicit approval.", database)
+    return _prompt(f"Analyze obfuscation around {targets}.", "Identify the transformation and document invariants. Annotations (renames, comments, types) may use mutation_preview(commit=true); stage patches with mutation_preview and do not mutation_commit without explicit approval.", database)
 
 
 @prompt
 def review_patch(transaction_id: str, database: str = "") -> str:
     """Review a staged mutation before commit."""
 
-    return _prompt(f"Review mutation transaction {transaction_id}.", "Read mutation_status, verify every before/after change and warning, assess recovery checkpoint requirements, then recommend commit or rejection.", database)
+    return _prompt(f"Review mutation transaction {transaction_id}.", "Read mutation_status, verify every before/after change and warning, assess recovery checkpoint requirements, then recommend mutation_commit or rejection.", database)
 
 
 @prompt
 def generate_report(investigation_id: str, format: str = "markdown", database: str = "") -> str:
     """Generate an evidence-backed investigation report."""
 
-    return _prompt(f"Generate a {format} report for investigation {investigation_id}.", "Verify findings and evidence, identify unresolved hypotheses, and call investigation_export only after the record is complete.", database)
+    return _prompt(f"Generate a {format} report for investigation {investigation_id}.", "investigation_get to verify findings and evidence, identify unresolved hypotheses, and call investigation_export only after the record is complete.", database)
 
 
 _install_revision_hook()

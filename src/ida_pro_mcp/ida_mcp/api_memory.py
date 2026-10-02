@@ -18,19 +18,20 @@ from .utils import (
     IntWrite,
     MemoryPatch,
     MemoryRead,
+    display_name,
     normalize_list_input,
     parse_address,
 )
 
 
 def _resolve_read_address(addr: str | int) -> int:
-    from .utils import resolve_address_or_name
-
     try:
-        return resolve_address_or_name(addr)
+        return parse_address(addr)
     except IDAError as exc:
         raise ValueError(str(exc)) from exc
 
+
+MAX_DEFAULT_READ_BYTES = 256
 
 MAX_READ_BYTES = 65536
 MAX_PATCH_BYTES = 65536
@@ -68,16 +69,18 @@ def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[dict]:
     """Prefer memory_read(kind="bytes", queries=...).
     WHEN: read raw bytes from mapped static addresses (memory_read bytes delegates here).
     RETURNS: [{addr, data(hex str), error?}] per region.
-    LIMITS: size max 65536; unmapped range raises error entry; static IDB bytes, not live debuggee (see debug_memory)."""
+    LIMITS: size max 65536 (omitted size = item size at addr, max 256); unmapped range returns an error entry; static IDB bytes, not live debuggee (see debug_memory)."""
     if isinstance(regions, dict):
         regions = [regions]
 
     results = []
     for item in regions:
         addr = item.get("addr", "")
-        size = item.get("size", 0)
+        size = item.get("size")
 
         try:
+            if size is None:
+                size = min(max(1, ida_bytes.get_item_size(_resolve_read_address(addr))), MAX_DEFAULT_READ_BYTES)
             if int(size) > MAX_READ_BYTES:
                 raise ValueError(f"Read size {int(size)} exceeds limit {MAX_READ_BYTES}")
             data = _read_mapped_bytes(addr, int(size))
@@ -141,7 +144,7 @@ def get_int(
     """Prefer memory_read(kind="integer", queries=...).
     WHEN: read typed integers ({addr, ty}) from mapped static addresses (memory_read integer delegates here).
     RETURNS: [{addr, ty(normalized), value, error}] per query.
-    LIMITS: ty must match u8..u64/i8..i64 with optional le/be; static bytes only."""
+    LIMITS: ty must match u8..u64/i8..i64 with optional le/be (omitted ty = unsigned item size 1/2/4/8); static bytes only."""
     if isinstance(queries, dict):
         queries = [queries]
 
@@ -151,10 +154,14 @@ def get_int(
         ty = item.get("ty", "")
 
         try:
+            if not ty:
+                item_size = ida_bytes.get_item_size(_resolve_read_address(addr))
+                if item_size not in (1, 2, 4, 8):
+                    raise ValueError(f"Item at {addr} is {item_size} bytes, not an integer; pass ty (u8/u16/u32/u64/i32be/...)")
+                ty = f"u{item_size * 8}"
             bits, signed, byte_order, normalized = _parse_int_class(ty)
             size = bits // 8
             data = _read_mapped_bytes(addr, size)
-
             value = int.from_bytes(data, byte_order, signed=signed)
             results.append(
                 {"addr": addr, "ty": normalized, "value": value, "error": None}
@@ -253,27 +260,48 @@ def get_global_value(
 ) -> list[dict]:
     """Prefer memory_read(kind="global", queries=...).
     WHEN: read one typed global's current value by name/address (memory_read global delegates here).
-    RETURNS: [{query, value(rendered str), error}] per query.
+    RETURNS: [{query, addr, name, value(rendered str), error}] per query.
     LIMITS: >4096-byte values return "<too large>"; untyped/unknown names return error entries."""
-    from .utils import resolve_address_or_name
-
     queries = normalize_list_input(queries)
     results = []
 
     for query in queries:
         try:
             try:
-                ea = resolve_address_or_name(query)
-            except IDAError:
-                results.append({"query": query, "value": None, "error": "Not found"})
+                ea = parse_address(query)
+            except IDAError as exc:
+                results.append({"query": query, "value": None, "error": str(exc)})
                 continue
 
             value = get_global_variable_value_internal(ea)
-            results.append({"query": query, "value": value, "error": None})
+            results.append({"query": query, "addr": hex(ea), "name": display_name(ea), "value": value, "error": None})
         except Exception as e:
             results.append({"query": query, "value": None, "error": str(e)})
 
     return results
+
+
+@idasync
+def patched_ranges() -> list[dict]:
+    """Patched byte runs as {addr, size, original_hex, patched_hex, file_offset?, function?}."""
+    from . import api_recovery
+
+    rows = []
+    for patch_row in api_recovery.collect_patches():
+        ea = int(patch_row["addr"], 16)
+        row = {
+            "addr": patch_row["addr"],
+            "size": patch_row["size"],
+            "original_hex": patch_row["original"],
+            "patched_hex": patch_row["patched"],
+        }
+        if patch_row["file_offset"] >= 0:
+            row["file_offset"] = hex(patch_row["file_offset"])
+        func = compat.get_func(ea)
+        if func is not None:
+            row["function"] = display_name(func.start_ea)
+        rows.append(row)
+    return rows
 
 
 # ============================================================================

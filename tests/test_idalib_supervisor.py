@@ -1,6 +1,9 @@
 """idalib supervisor tests that do not require IDA/idalib."""
 
+import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -311,34 +314,17 @@ def test_failed_gui_fallback_cleans_new_parts_after_worker_failure(tmp_path):
     assert not Path(str(sample) + ".id1").exists()
 
 
-def test_worker_tools_inject_database_and_filter_management_tools():
+def test_worker_tools_inject_optional_database_and_filter_management_tools():
     sup = _FakeSupervisor()
     tools = sup.worker_tools()
     names = [tool["name"] for tool in tools]
     assert names == ["decompile"]
     schema = tools[0]["inputSchema"]
     assert "database" in schema["properties"]
-    assert "database" in schema.get("required", [])
+    assert schema["required"] == ["addr"]
 
 
-def test_inject_database_arg_marks_required():
-    sup = _FakeSupervisor()
-    injected = sup._inject_database_arg(
-        {
-            "name": "decompile",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"addr": {"type": "string"}},
-                "required": ["addr"],
-            },
-        }
-    )
-    schema = injected["inputSchema"]
-    assert "database" in schema["properties"]
-    assert "database" in schema["required"]
-
-
-def test_inject_database_arg_is_idempotent_in_required_list():
+def test_inject_database_arg_drops_worker_required_database():
     sup = _FakeSupervisor()
     injected = sup._inject_database_arg(
         {
@@ -350,51 +336,91 @@ def test_inject_database_arg_is_idempotent_in_required_list():
             },
         }
     )
-    required = injected["inputSchema"]["required"]
-    assert required.count("database") == 1
+    assert injected["inputSchema"]["required"] == ["addr"]
 
 
-def test_handle_tools_call_errors_when_database_missing():
-    old_supervisor = supmod.supervisor
-    supmod.supervisor = _FakeSupervisor()
-    try:
-        result = supmod._handle_tools_call(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": "decompile", "arguments": {"addr": "0x1000"}},
-            }
-        )
-        assert result is not None
-        assert result["result"]["isError"] is True
-        text = result["result"]["content"][0]["text"]
-        assert "database is required" in text
-        assert not supmod.supervisor.forwarded
-    finally:
-        supmod.supervisor = old_supervisor
-
-
-def test_handle_tools_call_errors_when_database_empty():
-    old_supervisor = supmod.supervisor
-    supmod.supervisor = _FakeSupervisor()
-    try:
-        result = supmod._handle_tools_call(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "decompile",
-                    "arguments": {"addr": "0x1000", "database": ""},
+def _analysis_run_schema():
+    return {
+        "name": "analysis_run",
+        "description": "Run analysis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["triage", "function"]},
+                "options": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {"max_functions": {"type": "integer"}},
+                            "required": [],
+                            "additionalProperties": False,
+                        },
+                        {"type": "null"},
+                    ]
                 },
-            }
-        )
-        assert result is not None
-        assert result["result"]["isError"] is True
-        assert "database is required" in result["result"]["content"][0]["text"]
-    finally:
-        supmod.supervisor = old_supervisor
+            },
+            "required": ["mode"],
+        },
+    }
+
+
+def test_tools_list_advertises_supervisor_binary_diff_once(monkeypatch):
+    sup = _FakeSupervisor()
+    original_rpc = sup._worker_rpc
+
+    def worker_rpc(worker, payload, *, timeout=None):
+        response = original_rpc(worker, payload, timeout=timeout)
+        if payload.get("method") == "tools/list":
+            response["result"]["tools"].append(_analysis_run_schema())
+        return response
+
+    sup._worker_rpc = worker_rpc
+    monkeypatch.setattr(supmod, "supervisor", sup)
+    for _ in range(2):  # second call is served from the cache
+        tools = supmod._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]
+        names = [tool["name"] for tool in tools]
+        assert len(names) == len(set(names))
+        assert {"idb_open", "idb_list", "idb_close"} <= set(names)
+        analysis = next(tool for tool in tools if tool["name"] == "analysis_run")
+        props = analysis["inputSchema"]["properties"]
+        assert props["mode"]["enum"] == ["triage", "function", "binary_diff"]
+        assert "right_database" in props["options"]["anyOf"][0]["properties"]
+        assert analysis["description"].count("binary_diff (supervisor)") == 1
+        assert "database" not in analysis["inputSchema"]["required"]
+
+
+def test_handle_tools_call_defaults_to_only_database(tmp_path, monkeypatch):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    sup.open_session(str(sample), session_id="sample")
+    monkeypatch.setattr(supmod, "supervisor", sup)
+    result = supmod._handle_tools_call(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "decompile", "arguments": {"addr": "0x1000", "database": ""}},
+        }
+    )
+    assert result["result"] == {"ok": True}
+    assert sup.forwarded[-1]["params"]["arguments"] == {"addr": "0x1000"}
+
+
+def test_handle_tools_call_without_database_errors_when_none_open(monkeypatch):
+    monkeypatch.setattr(supmod, "supervisor", _FakeSupervisor())
+    result = supmod._handle_tools_call(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "decompile", "arguments": {"addr": "0x1000"}},
+        }
+    )
+    assert result["result"]["isError"] is True
+    assert "No database is open" in result["result"]["content"][0]["text"]
+    assert "idb_open" in result["result"]["content"][0]["text"]
+    assert not supmod.supervisor.forwarded
 
 
 def test_open_session_rejects_unknown_mode(tmp_path):
@@ -663,15 +689,25 @@ def test_open_session_skips_warmup_when_flags_disabled(tmp_path):
     assert session.last_warmup is None
 
 
-def test_resolve_session_requires_database():
+def test_resolve_session_defaults_only_when_unambiguous(tmp_path):
     sup = _FakeSupervisor()
-    for value in (None, ""):
-        try:
-            sup.resolve_session(value)
-        except RuntimeError as e:
-            assert "database is required" in str(e)
-        else:
-            raise AssertionError(f"expected RuntimeError for database={value!r}")
+    with pytest.raises(RuntimeError, match="No database is open"):
+        sup.resolve_session(None)
+
+    first = tmp_path / "first.bin"
+    first.write_bytes(b"1")
+    sup.open_session(str(first), session_id="first")
+    assert sup.resolve_session(None).session_id == "first"
+    assert sup.resolve_session("").session_id == "first"
+
+    second = tmp_path / "second.bin"
+    second.write_bytes(b"2")
+    sup.open_session(str(second), session_id="second")
+    with pytest.raises(RuntimeError) as excinfo:
+        sup.resolve_session(None)
+    message = str(excinfo.value)
+    assert "2 databases are open" in message
+    assert '"filename": "first.bin"' in message and '"session_id": "second"' in message
 
 
 def test_tool_error_result_omits_structured_content():
@@ -740,21 +776,45 @@ def test_protocol_cancellation_routes_to_tracked_worker(monkeypatch):
     assert sup.forwarded[-1]["method"] == "notifications/cancelled"
     assert sup.forwarded[-1]["params"]["requestId"] == 41
 
-def test_resolve_session_only_accepts_session_id(tmp_path):
-    sample = tmp_path / "sample.bin"
+
+def test_resolve_session_accepts_filename_basename_path_and_id_prefix(tmp_path):
+    sample = tmp_path / "crackme03.elf"
     sample.write_bytes(b"x")
     sup = _FakeSupervisor()
-    sup.open_session(str(sample), session_id="sample")
+    sup.open_session(str(sample), session_id="0123456789abcdef")
+    other = tmp_path / "other.bin"
+    other.write_bytes(b"y")
+    sup.open_session(str(other), session_id="0123ffffffffffff")
 
-    assert sup.resolve_session("sample").session_id == "sample"
+    selectors = ["crackme03.elf", "crackme03", str(sample), str(sample) + ".i64", "0123456"]
+    if os.name == "nt":
+        selectors.append("CRACKME03.ELF")
+    for selector in selectors:
+        assert sup.resolve_session(selector).session_id == "0123456789abcdef", selector
+    with pytest.raises(RuntimeError, match="Session not found: 01234"):
+        sup.resolve_session("01234")  # shared 5-char prefix is below the alias minimum
 
-    for selector in ("sample.bin", str(sample), str(sample.resolve())):
-        try:
+
+def test_resolve_session_rejects_ambiguous_and_short_selectors(tmp_path):
+    left = tmp_path / "a" / "app.exe"
+    right = tmp_path / "b" / "app.exe"
+    left.parent.mkdir()
+    right.parent.mkdir()
+    left.write_bytes(b"1")
+    right.write_bytes(b"2")
+    sup = _FakeSupervisor()
+    sup.open_session(str(left), session_id="aaaaaaaa1")
+    sup.open_session(str(right), session_id="aaaaaaaa2")
+
+    for selector in ("app.exe", "app", "aaaaaaaa"):
+        with pytest.raises(RuntimeError) as excinfo:
             sup.resolve_session(selector)
-        except RuntimeError as e:
-            assert "not found" in str(e)
-        else:
-            raise AssertionError(f"expected RuntimeError for selector={selector!r}")
+        assert "ambiguous" in str(excinfo.value)
+        assert "aaaaaaaa1" in str(excinfo.value) and "aaaaaaaa2" in str(excinfo.value)
+    # The full path still disambiguates; a 5-char id prefix is not an alias.
+    assert sup.resolve_session(str(right)).session_id == "aaaaaaaa2"
+    with pytest.raises(RuntimeError, match="Session not found: aaaaa"):
+        sup.resolve_session("aaaaa")
 
 
 def test_open_session_uses_matching_gui_instance(tmp_path):
@@ -849,15 +909,45 @@ def test_resolve_session_removes_unreachable_worker(tmp_path):
 
     sup._session_is_reachable = fake_reachable
 
-    try:
+    with pytest.raises(RuntimeError) as excinfo:
         sup.resolve_session("sample")
-    except RuntimeError as e:
-        assert "not reachable" in str(e)
-    else:
-        raise AssertionError("expected RuntimeError")
+    message = str(excinfo.value)
+    assert "not reachable" in message
+    assert "sample.bin" in message and "idb_open(input_path=" in message
 
     assert "sample" not in sup.sessions
     assert session.process.returncode == 0
+    assert all(row["session_id"] != "sample" for row in sup.list_sessions())
+
+
+def test_resolve_session_keeps_busy_worker_that_misses_ping(tmp_path):
+    # A worker handles one request at a time; a ping queued behind a long call
+    # times out. That must not be mistaken for a dead worker and killed.
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    session = sup.open_session(str(sample), session_id="sample")
+    sup._session_is_reachable = lambda _session: False
+    sup._track_worker_request("transport", 7, session)
+
+    assert sup.resolve_session("sample") is session
+    assert session.process.returncode is None
+
+    sup._untrack_worker_request("transport", 7, session)
+    with pytest.raises(RuntimeError, match="not reachable"):
+        sup.resolve_session("sample")
+
+
+def test_list_sessions_drops_workers_whose_process_exited(tmp_path, monkeypatch):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    session = sup.open_session(str(sample), session_id="sample")
+    session.process.returncode = 1
+    monkeypatch.setattr(supmod._discovery, "discover_instances", lambda: [])
+
+    assert sup.list_sessions() == []
+    assert "sample" not in sup.sessions
 
 
 def test_open_session_prunes_unreachable_existing_mapping(tmp_path):
@@ -997,14 +1087,14 @@ def test_close_session_unknown_session_raises():
         raise AssertionError("expected RuntimeError for unknown session")
 
 
-def test_close_session_requires_database():
+def test_close_session_defaults_to_only_database(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
     sup = _FakeSupervisor()
-    try:
-        sup.close_session("")
-    except RuntimeError as e:
-        assert "database is required" in str(e)
-    else:
-        raise AssertionError("expected RuntimeError for empty database")
+    sup.open_session(str(sample), session_id="sample")
+    result = sup.close_session("", save=False)
+    assert result["session_id"] == "sample"
+    assert sup.sessions == {}
 
 
 def test_close_session_detaches_adopted_worker_without_killing(tmp_path):
@@ -1511,3 +1601,132 @@ def test_adoption_reads_token_sidecar(tmp_path, monkeypatch):
         assert (instances_dir / "instance_31415.token").exists()
     finally:
         restore()
+
+
+class _SlowOpenSupervisor(_FakeSupervisor):
+    """idb_open blocks until ``release`` is set, like a long auto-analysis."""
+
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+        self.fail_with: str | None = None
+
+    def call_worker_tool(self, worker, name, arguments=None, *, timeout=None):
+        if name == "idb_open":
+            assert self.release.wait(5)
+            if self.fail_with:
+                raise RuntimeError(self.fail_with)
+        return super().call_worker_tool(worker, name, arguments, timeout=timeout)
+
+
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition not reached")
+
+
+def _call(name, arguments):
+    return supmod._handle_tools_call(
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+    )
+
+
+def test_open_past_wait_budget_fails_fast_until_ready(tmp_path, monkeypatch):
+    sample = tmp_path / "big.exe"
+    sample.write_bytes(b"x")
+    sup = _SlowOpenSupervisor()
+    monkeypatch.setattr(supmod, "supervisor", sup)
+    monkeypatch.setattr(supmod._discovery, "discover_instances", lambda: [])
+    monkeypatch.setenv("IDA_MCP_OPEN_WAIT_SEC", "0.05")
+
+    opened = supmod.idb_open(str(sample), preferred_session_id="big")
+    assert opened["session"]["session_id"] == "big"
+    assert opened["session"]["state"] == "opening"
+    assert "wait budget" in opened["warning"]
+    # Re-opening the same path joins the pending open instead of spawning another.
+    assert supmod.idb_open(str(sample), wait=False)["session"]["session_id"] == "big"
+    assert [(row["session_id"], row["state"]) for row in sup.list_sessions()] == [("big", "opening")]
+
+    blocked = _call("decompile", {"addr": "0x1"})  # database defaults to the opening one
+    text = blocked["result"]["content"][0]["text"]
+    assert blocked["result"]["isError"] is True
+    assert "Session 'big.exe' is still analyzing (elapsed" in text and "idb_list" in text
+    assert not sup.forwarded
+
+    sup.release.set()
+    _wait_until(lambda: "big" in sup.sessions and not sup._open_jobs)
+    assert _call("decompile", {"addr": "0x1", "database": "big.exe"})["result"] == {"ok": True}
+    assert [row["state"] for row in sup.list_sessions()] == ["ready"]
+    assert len([name for name, _ in sup.opened]) == 1
+
+
+def test_open_failure_inside_budget_raises_and_leaves_no_job(tmp_path, monkeypatch):
+    sample = tmp_path / "bad.exe"
+    sample.write_bytes(b"x")
+    monkeypatch.setattr(supmod._discovery, "discover_instances", lambda: [])
+    sup = _SlowOpenSupervisor()
+    sup.fail_with = "boom"
+    sup.release.set()
+    with pytest.raises(RuntimeError, match="boom"):
+        sup.start_open(str(sample), wait_sec=5)
+    assert sup._open_jobs == {} and sup.sessions == {}
+
+
+def test_background_open_failure_is_listed_then_discarded(tmp_path, monkeypatch):
+    sample = tmp_path / "bad.exe"
+    sample.write_bytes(b"x")
+    monkeypatch.setattr(supmod._discovery, "discover_instances", lambda: [])
+    sup = _SlowOpenSupervisor()
+    sup.fail_with = "analysis crashed"
+    job = sup.start_open(str(sample), wait_sec=0, session_id="bad")
+    assert isinstance(job, supmod.OpenJob)
+    sup.release.set()
+    _wait_until(lambda: job.state == "failed")
+
+    [row] = sup.list_sessions()
+    assert row["state"] == "failed" and "analysis crashed" in row["error"]
+    with pytest.raises(RuntimeError, match="failed to open: analysis crashed"):
+        sup.resolve_session("bad.exe")
+    with pytest.raises(RuntimeError, match="No database is open"):
+        sup.resolve_session(None)  # a failed open is never the default
+    assert sup.close_session("bad")["success"] is True
+    assert sup.list_sessions() == []
+
+
+def test_binary_diff_resolves_left_and_right_aliases(tmp_path, monkeypatch):
+    old = tmp_path / "old.bin"
+    new = tmp_path / "new.bin"
+    old.write_bytes(b"1")
+    new.write_bytes(b"2")
+    sup = _FakeSupervisor()
+    sup.open_session(str(old), session_id="left1")
+    sup.open_session(str(new), session_id="right1")
+    monkeypatch.setattr(supmod, "supervisor", sup)
+
+    result = _call(
+        "analysis_run",
+        {"database": "old", "mode": "binary_diff", "options": {"right_database": "new.bin"}},
+    )["result"]
+    assert result["isError"] is False
+    data = result["structuredContent"]["data"]
+    assert (data["left_database"], data["right_database"]) == ("left1", "right1")
+    assert not sup.forwarded
+
+
+def test_initialize_returns_usage_instructions():
+    response = supmod.dispatch_supervisor(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}},
+        }
+    )
+    instructions = response["result"]["instructions"]
+    assert 'analysis_run(mode="triage")' in instructions
+    assert "database= is optional" in instructions
+    assert len(instructions.splitlines()) <= 25
+    assert "instructions" not in supmod.McpServer("plain")._mcp_initialize("2025-06-18", {}, {})

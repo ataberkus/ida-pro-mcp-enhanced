@@ -9,6 +9,7 @@ import pytest
 from ida_pro_mcp.vnext.audit import AuditLog, redact
 from ida_pro_mcp.vnext.auth import AuthPolicy, WorkspacePolicy, create_token
 from ida_pro_mcp.vnext.contracts import (
+    API_SCHEMA_VERSION,
     ErrorCode,
     JobState,
     MutationOperation,
@@ -82,6 +83,7 @@ def test_quick_profiles_bound_tools_and_scopes():
     )
     assert annotate_scopes == {SafetyScope.ANNOTATE}
     assert annotate_tools["investigation_add_finding"] is True
+    assert annotate_tools["mutation_commit"] is True  # annotate-only sessions can commit
     assert annotate_tools["patch"] is False
 
     modify_tools, modify_scopes = quick_profile_selection("modify", tools, registry)
@@ -477,3 +479,149 @@ def test_transaction_commit_accepts_unrelated_revision_bump_when_revalidated():
     assert applied == ["rename"]
     assert receipt.status == "committed"
     assert any("re-verified" in warning for warning in receipt.warnings)
+
+
+def _save_probing_lock(manager_ref: list, blocked: list):
+    """save_state that, like an IDA main-thread hop, needs the manager from another thread."""
+
+    def save(_state):
+        probe = threading.Thread(target=lambda: manager_ref[0].list(), daemon=True)
+        probe.start()
+        probe.join(2)
+        if probe.is_alive():
+            blocked.append(True)
+
+    return save
+
+
+def test_job_persistence_never_holds_manager_lock():
+    blocked: list = []
+    ref: list = []
+    manager = JobManager(max_workers=1, save_state=_save_probing_lock(ref, blocked))
+    ref.append(manager)
+    record = manager.submit("deep", lambda context: context.progress(0.5, "half") or "done")
+    deadline = time.monotonic() + 10
+    while manager.status(record.job_id)["state"] != JobState.COMPLETED.value and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager.result(record.job_id) == "done"
+    assert blocked == []
+    manager.shutdown()
+
+
+def test_investigation_persistence_never_holds_manager_lock():
+    blocked: list = []
+    ref: list = []
+    manager = InvestigationManager(save_state=_save_probing_lock(ref, blocked))
+    ref.append(manager)
+    record = manager.create("lock order", database="db")
+    manager.set_job(record.investigation_id, "job-1")
+    manager.add_finding(record.investigation_id, title="t", description="d")
+    manager.set_state(record.investigation_id, "completed")
+    assert blocked == []
+
+
+def test_concurrent_update_during_save_is_not_blocked_and_latest_state_wins():
+    saved: list = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def save(state):
+        saved.append(state)
+        if len(saved) == 1:
+            entered.set()
+            release.wait(2)
+
+    manager = InvestigationManager(save_state=save)
+    creator = threading.Thread(target=lambda: manager.create("x", database="db"))
+    creator.start()
+    assert entered.wait(2)
+    investigation_id = manager.list()[0]["investigation_id"]
+    started = time.monotonic()
+    manager.set_state(investigation_id, "completed")
+    assert time.monotonic() - started < 1  # coalesced into the in-flight save
+    release.set()
+    creator.join(2)
+    assert saved[-1][investigation_id]["state"] == "completed"
+
+
+def test_rollback_requires_the_committed_transaction_scopes():
+    registry = ToolPolicyRegistry()
+    register_builtin_policies(registry)
+    annotate = {SafetyScope.READ, SafetyScope.ANNOTATE}
+    registry.authorize("mutation_commit", annotate)
+    registry.authorize("mutation_rollback", annotate)
+
+    manager = TransactionManager(RevisionTracker(), ttl_seconds=30)
+    modify = annotate | {SafetyScope.MODIFY}
+    preview = manager.preview(
+        "db",
+        [MutationOperation("patch_bytes", {"patches": []}, SafetyScope.MODIFY)],
+        enabled_scopes=modify,
+        preview_operation=lambda op: {},
+    )
+    with pytest.raises(VNextError) as denied_commit:
+        manager.commit(preview.transaction_id, database="db", enabled_scopes=annotate, checkpoint=lambda _tx: None, apply_operation=lambda _op: None)
+    assert denied_commit.value.code is ErrorCode.PROFILE_DENIED
+    manager.commit(preview.transaction_id, database="db", enabled_scopes=modify, checkpoint=lambda _tx: None, apply_operation=lambda _op: None, undo=lambda: True)
+    with pytest.raises(VNextError) as denied:
+        manager.rollback(preview.transaction_id, rollback_undo=lambda: True, enabled_scopes=annotate)
+    assert denied.value.code is ErrorCode.PROFILE_DENIED
+    assert manager.rollback(preview.transaction_id, rollback_undo=lambda: True, enabled_scopes=modify).status == "rolled_back"
+
+
+def test_finding_evidence_accepts_aliases_and_rejects_empty_items():
+    manager = InvestigationManager()
+    record = manager.create("evidence", database="db")
+    finding = manager.add_finding(
+        record.investigation_id,
+        title="t",
+        description="d",
+        evidence=[
+            {"addr": "main", "text": "call site"},
+            {"ea": 0x401000, "data": {"k": 1}},
+            {"address": "bogus", "note": "unresolved"},
+            {"description": "context only"},
+        ],
+        resolve_address=lambda text: {"main": "0x401000"}[text],
+    )
+    assert [item.address for item in finding.evidence] == ["0x401000", "0x401000", "bogus", None]
+    assert [item.description for item in finding.evidence] == ["call site", '{"k": 1}', "unresolved", "context only"]
+    with pytest.raises(VNextError) as caught:
+        manager.add_finding(record.investigation_id, title="t", description="d", evidence=[{"source": "x"}])
+    assert caught.value.code is ErrorCode.INVALID_OPERATION
+    assert len(manager.get(record.investigation_id).findings) == 1
+
+
+def test_envelope_omits_default_fields():
+    assert ToolEnvelope({"x": 1}).to_dict() == {"data": {"x": 1}, "schema_version": API_SCHEMA_VERSION}
+    paged = ToolEnvelope([1], warnings=["w"], provenance={"engine": "e"}, truncated=True, next_cursor="c").to_dict()
+    assert paged == {
+        "data": [1],
+        "warnings": ["w"],
+        "provenance": {"engine": "e"},
+        "truncated": True,
+        "next_cursor": "c",
+        "schema_version": API_SCHEMA_VERSION,
+    }
+
+
+def test_preview_wire_form_carries_change_fields_on_each_operation():
+    manager = TransactionManager(RevisionTracker(), ttl_seconds=30)
+    arguments = {"func": [{"addr": "0x1", "name": "a"}]}
+    preview = manager.preview(
+        "db",
+        [MutationOperation("rename", arguments, SafetyScope.ANNOTATE)],
+        enabled_scopes={SafetyScope.READ, SafetyScope.ANNOTATE},
+        preview_operation=lambda op: {"validated": True, "before": {"func": [{"addr": "0x1", "name": "sub_1"}]}},
+    )
+    wire = preview.to_dict()
+    assert "changes" not in wire and "warnings" not in wire
+    assert wire["operations"] == [
+        {
+            "kind": "rename",
+            "arguments": arguments,
+            "scope": "annotate",
+            "validated": True,
+            "before": {"func": [{"addr": "0x1", "name": "sub_1"}]},
+        }
+    ]

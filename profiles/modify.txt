@@ -21,6 +21,7 @@ job_result
 investigation_start
 investigation_get
 investigation_add_finding
+investigation_export
 mutation_preview
 mutation_commit
 mutation_status

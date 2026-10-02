@@ -22,6 +22,8 @@ from ..api_composite import (
     analyze_component,
     trace_data_flow,
 )
+from ..api_analysis import decompile
+from ..api_vnext import analysis_run
 
 
 # ============================================================================
@@ -50,7 +52,6 @@ def test_analyze_function_returns_required_keys():
             "callees",
             "callers",
             "xrefs",
-            "comments",
             "basic_blocks",
         )
 
@@ -142,7 +143,7 @@ def test_analyze_function_by_name():
         if name and not name.startswith("sub_"):
             result = analyze_function(name)
             assert result["error"] is None
-            assert result["name"] == name
+            assert result["addr"] == hex(ea)
             return
 
     skip_test("no named functions found")
@@ -155,7 +156,8 @@ def test_analyze_function_crackme_main():
     assert result["error"] is None
     assert result["name"] == "main"
     # main calls check_pw
-    assert any("check_pw" in c for c in result["callees"])
+    assert "check_pw" in [c["name"] for c in result["callees"]]
+    assert result["callee_count"] >= len(result["callees"])
 
 
 @test(binary="crackme03.elf")
@@ -166,6 +168,48 @@ def test_analyze_function_crackme_check_pw():
     assert result["name"] == "check_pw"
     assert result["size"] > 0
     assert result["basic_blocks"]["count"] >= 1
+
+
+@test(binary="crackme03.elf")
+def test_analyze_function_excerpt_counts_statements_not_declarations():
+    """check_pw excerpt reaches the `do` loop; locals are summarized, not printed."""
+    import re
+
+    result = analyze_function("check_pw")
+    assert result["error"] is None
+    lines = result["decompiled"].split("\n")
+    assert any(re.match(r"\s*do\b", line) for line in lines), result["decompiled"]
+    assert result["declarations"] > 0
+    assert result["decompile_truncated"] is False
+    assert "comments" not in result
+
+    # A one-statement excerpt continues seamlessly through decompile paging.
+    short = analyze_function("check_pw", max_lines=1)
+    assert short["decompile_truncated"] is True
+    rest = decompile("check_pw", line_offset=short["next_line_offset"], include_declarations=False, line_limit=5000)
+    assert short["decompiled"] + "\n" + rest["code"] == "\n".join(lines)
+
+
+@test(binary="crackme03.elf")
+def test_analysis_run_batch_sections_select_output():
+    """batch options.sections limits each row to the requested sections; default is decompile+callees+strings."""
+    from ida_pro_mcp.vnext.contracts import VNextError
+
+    only = analysis_run("batch", ["main"], {"sections": ["callees"]})["data"][0]["analysis"]
+    assert "check_pw" in [c["name"] for c in only["callees"]]
+    assert not {"decompile", "strings", "constants", "basic_blocks", "disasm", "callers"} & only.keys()
+
+    default = analysis_run("batch", ["main"])["data"][0]["analysis"]
+    assert {"decompile", "callees", "strings"} <= default.keys()
+    assert not {"constants", "basic_blocks", "disasm", "callers", "xrefs"} & default.keys()
+    assert "check_pw" in default["decompile"]
+
+    try:
+        analysis_run("batch", ["main"], {"sections": ["bogus"]})
+    except VNextError as exc:
+        assert "Allowed:" in str(exc)
+    else:
+        raise AssertionError("unknown batch section accepted")
 
 
 # ============================================================================
@@ -437,3 +481,15 @@ def test_trace_data_flow_crackme_format_string():
     assert result["start"] == "0x201f"
     # Should find at least the starting node
     assert len(result["nodes"]) >= 1
+
+
+@test(binary="crackme03.elf")
+def test_analysis_run_deep_job_completes_through_main_loop():
+    """deep jobs reach IDA from a worker thread; job_status(wait_sec) services the idalib main loop until done."""
+    from ..api_vnext import job_result, job_status
+
+    job = analysis_run("deep", ["check_pw"])
+    status = job_status(job["job_id"], wait_sec=30)
+    assert status["state"] == "completed", status
+    (row,) = job_result(job["job_id"])["data"]["functions"]
+    assert row["target"] == "check_pw" and row["analysis"]["name"] == "check_pw"

@@ -12,6 +12,7 @@ import idaapi
 from .rpc import tool, unsafe
 from .sync import idasync
 from .utils import (
+    display_name,
     normalize_list_input,
     normalize_dict_list,
     paginate,
@@ -75,7 +76,7 @@ def enum_upsert(
         "Create enums if missing and upsert enum members without destructive replacement",
     ],
 ) -> list[dict]:
-    """Legacy enum upsert (no canonical equivalent; mutation_preview has no enum kind).
+    """Prefer mutation_preview(kind="upsert_enum", ...).
     WHEN: create a local enum if missing and add members without destructive replacement.
     RETURNS: [{name, enum_id, ok, created, bitfield, members[], summary{created, skipped, conflicts}}] per enum.
     LIMITS: name/member conflicts and bitfield mismatch return error entries, never overwrite."""
@@ -249,21 +250,18 @@ def read_struct(queries: list[StructRead] | StructRead) -> list[dict]:
                 )
                 continue
 
-            # Try to parse as address, then try name resolution
             try:
                 addr = parse_address(addr_str)
-            except Exception:
-                addr = idaapi.get_name_ea(idaapi.BADADDR, addr_str)
-                if addr == idaapi.BADADDR:
-                    results.append(
-                        {
-                            "addr": addr_str,
-                            "struct": struct_name,
-                            "members": None,
-                            "error": f"Failed to resolve address: {addr_str}",
-                        }
-                    )
-                    continue
+            except Exception as exc:
+                results.append(
+                    {
+                        "addr": addr_str,
+                        "struct": struct_name,
+                        "members": None,
+                        "error": f"Failed to resolve address: {exc}",
+                    }
+                )
+                continue
 
             # Auto-detect struct type from address if not provided
             if not struct_name:
@@ -473,10 +471,11 @@ def type_query(
         "Type catalog query with filtering, pagination, and optional relationships",
     ],
 ) -> list[dict]:
-    """Canonical type catalog (listed in CANONICAL_TOOLS).
-    WHEN: filtered/paginated listing of local types by kind with optional declarations, members, relationships.
-    RETURNS: [{kind, data[{ordinal, name, size, kind, declaration?, members?}], next_offset, total, error}] per query.
-    LIMITS: count max 5000, max_members max 4096; bad kind returns an error entry listing Allowed values."""
+    """List local types, or IDA's type guess for addresses.
+    WHEN: find a struct/enum/typedef/func type by name (catalog kinds), or kind="inferred" with targets=[addr|name] to see IDA's guessed type before set_type.
+    RETURNS: [{kind, data, next_offset, total, error}] per query. Catalog rows {ordinal, name, size, kind, declaration?, members?, related?}; inferred rows {addr, name, type, source(existing|hexrays|guess|size_based), confidence(high|medium|low|none), error?}.
+    LIMITS: count max 5000, max_members max 4096; "function" is accepted for "func"; bad kind returns an error listing allowed values.
+    NEXT: mutation_preview(kind="set_type") to apply a type; include_members=true for a struct's layout."""
     queries = normalize_dict_list(
         queries,
         lambda s: {
@@ -517,7 +516,26 @@ def type_query(
     for query in queries:
         filter_pattern = str(query.get("filter", "") or "")
         kind = str(query.get("kind", "any") or "any").lower()
-        allowed_kinds = {"any", "struct", "union", "enum", "typedef", "func", "ptr", "udt"}
+        if kind == "function":
+            kind = "func"
+        if kind == "inferred":
+            targets = normalize_list_input(query.get("targets") or [])
+            if not targets:
+                results.append({"kind": kind, "data": [], "next_offset": None, "total": 0, "error": "kind=inferred requires targets"})
+                continue
+            rows = []
+            for guess in infer_types(targets):
+                row = {"addr": guess["addr"], "type": guess["inferred_type"], "source": guess["method"], "confidence": guess["confidence"]}
+                if guess.get("error"):
+                    row["error"] = guess["error"]
+                else:
+                    ea = parse_address(guess["addr"])
+                    row["addr"] = hex(ea)
+                    row["name"] = display_name(ea)
+                rows.append(row)
+            results.append({"kind": kind, "data": rows, "next_offset": None, "total": len(rows), "error": None})
+            continue
+        allowed_kinds = {"any", "struct", "union", "enum", "typedef", "func", "ptr", "udt", "inferred"}
         if kind not in allowed_kinds:
             results.append(
                 {
@@ -940,10 +958,10 @@ def set_type(edits: list[TypeEdit] | TypeEdit) -> list[dict]:
 def infer_types(
     addrs: Annotated[list[str] | str, "Addresses to infer types for"],
 ) -> list[dict]:
-    """Legacy type inference (no canonical equivalent).
-    WHEN: guess and report the likely type at each address (Hex-Rays guess, existing tinfo, then size-based).
-    RETURNS: [{addr, inferred_type, method(hexrays|existing|size_based), confidence(high|low|none), error?}].
-    LIMITS: reports only; applies nothing. Low-confidence guesses are size-based (uint8_t/uint16_t/...)."""
+    """Legacy type inference; prefer type_query(kind="inferred").
+    WHEN: report the likely type at each address before set_type.
+    RETURNS: [{addr, inferred_type, method(existing|hexrays|guess|size_based), confidence(high|medium|low|none), error?}].
+    LIMITS: reports only; applies nothing. Order: applied type, Hex-Rays prototype (function starts), IDA's guess, item size."""
     addrs = normalize_list_input(addrs)
     results = []
 
@@ -952,28 +970,25 @@ def infer_types(
             ea = parse_address(addr)
             tif = ida_typeinf.tinfo_t()
 
-            # Try Hex-Rays inference
-            if compat.guess_tinfo(tif, ea):
-                results.append(
-                    {
-                        "addr": addr,
-                        "inferred_type": str(tif),
-                        "method": "hexrays",
-                        "confidence": "high",
-                    }
-                )
+            def found(text: str, method: str, confidence: str) -> None:
+                results.append({"addr": addr, "inferred_type": text, "method": method, "confidence": confidence})
+
+            if ida_nalt.get_tinfo(tif, ea):
+                found(str(tif), "existing", "high")
                 continue
 
-            # Try getting existing type info
-            if ida_nalt.get_tinfo(tif, ea):
-                results.append(
-                    {
-                        "addr": addr,
-                        "inferred_type": str(tif),
-                        "method": "existing",
-                        "confidence": "high",
-                    }
-                )
+            func = ida_funcs.get_func(ea)
+            if func is not None and func.start_ea == ea and ida_hexrays.init_hexrays_plugin():
+                try:
+                    cfunc = ida_hexrays.decompile(ea)
+                except ida_hexrays.DecompilationFailure:
+                    cfunc = None
+                if cfunc is not None:
+                    found(str(cfunc.type), "hexrays", "high")
+                    continue
+
+            if compat.guess_tinfo(tif, ea):
+                found(str(tif), "guess", "medium")
                 continue
 
             # Try to guess from size

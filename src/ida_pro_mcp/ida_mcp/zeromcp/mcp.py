@@ -643,6 +643,8 @@ class McpServer:
         self.resource_subscriptions_supported = False
         self.resource_list_changed_supported = False
         self.tool_list_changed_supported = False
+        # MCP `instructions`: usage guide returned from initialize when set.
+        self.instructions: str | None = None
 
         # Register MCP protocol methods with correct names
         self.registry = JsonRpcRegistry()
@@ -672,7 +674,7 @@ class McpServer:
     def prompt(self, func: Callable) -> Callable:
         return self.prompts.method(func)
 
-    def serve(self, host: str, port: int, *, background = True, threaded: bool | None = None, request_handler = McpHttpRequestHandler) -> int | None:
+    def serve(self, host: str, port: int, *, background = True, threaded: bool | None = None, request_handler = McpHttpRequestHandler, poll_interval: float = 0.5, idle_callback: Callable[[], None] | None = None) -> int | None:
         if self._running:
             logger.info("[MCP] Server is already running")
             if self._http_server is not None:
@@ -706,6 +708,9 @@ class McpServer:
         self._http_server.request_queue_size = 128
         # Set the MCPServer instance on the handler class
         setattr(self._http_server, "mcp_server", self)
+        if idle_callback is not None:
+            # socketserver runs service_actions after every poll/request.
+            self._http_server.service_actions = idle_callback  # type: ignore[method-assign]
         try:
             # Bind and activate in main thread - errors propagate synchronously
             self._http_server.server_bind()
@@ -723,7 +728,7 @@ class McpServer:
         logger.info("  SSE: http://%s:%s/sse", host, bound_port)
         def serve_forever():
             try:
-                self._http_server.serve_forever() # type: ignore
+                self._http_server.serve_forever(poll_interval) # type: ignore
             except Exception:
                 logger.exception("[MCP] Server error")
             finally:
@@ -890,7 +895,7 @@ class McpServer:
 
     def _mcp_initialize(self, protocolVersion: str, capabilities: dict, clientInfo: dict, _meta: dict | None = None) -> dict:
         """MCP initialize method"""
-        return {
+        result = {
             "protocolVersion": getattr(self._protocol_version, "data", protocolVersion),
             "capabilities": {
                 "tools": {"listChanged": self.tool_list_changed_supported},
@@ -905,6 +910,9 @@ class McpServer:
                 "version": self.version,
             },
         }
+        if self.instructions:
+            result["instructions"] = self.instructions
+        return result
 
     def _mcp_tools_list(self, _meta: dict | None = None) -> dict:
         """MCP tools/list method"""

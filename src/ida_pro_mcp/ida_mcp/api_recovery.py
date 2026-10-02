@@ -31,7 +31,7 @@ from ida_pro_mcp.vnext.contracts import ErrorCode, VNextError
 from . import compat
 from .rpc import tool, unsafe
 from .sync import idasync
-from .utils import normalize_dict_list, parse_address, resolve_address_or_name
+from .utils import normalize_dict_list, parse_address
 
 
 def _mnemonics(start_ea: int, cap: int) -> list[str]:
@@ -678,9 +678,13 @@ def _trigrams(mnems: list[str]) -> set[tuple[str, ...]]:
 def similar_functions(ea: int, limit: int = 20, min_score: float = 0.3) -> list[dict]:
     """Rank functions by mnemonic 3-gram Jaccard against the query function.
 
-    Per-function cost is bounded at 2000 instructions; the query function itself
-    always scores 1.0 and sorts first.
+    Per-function cost is bounded at 2000 instructions; candidates outside 0.5x-2x
+    the query's instruction count are skipped; the query function itself always
+    scores 1.0 and sorts first. Returned rows carry callee_count and up to 3
+    referenced strings so matches can be judged without another call.
     """
+    from .utils import _collect_callees, display_name, extract_function_strings
+
     # ponytail: O(n) scan per query, MinHash/LSH index if slow on large IDBs
     query = compat.get_func(int(ea))
     if query is None:
@@ -712,7 +716,13 @@ def similar_functions(ea: int, limit: int = 20, min_score: float = 0.3) -> list[
         if score >= float(min_score):
             rows.append({"addr": hex(cand_ea), "name": ida_funcs.get_func_name(cand_ea) or "", "score": score, "insn_count": count})
     rows.sort(key=lambda row: row["score"], reverse=True)
-    return rows[: max(0, int(limit))]
+    rows = rows[: max(0, int(limit))]
+    for row in rows:
+        func = compat.get_func(int(row["addr"], 16))
+        row["name"] = display_name(func.start_ea)
+        row["callee_count"] = len(_collect_callees(func, call_only=True))
+        row["strings"] = [s["string"] for s in extract_function_strings(func.start_ea)[:3]]
+    return rows
 
 
 # (algorithm, label, LE byte table). Byte tables catch static data and .rodata copies.
@@ -936,16 +946,10 @@ def resolve_switch_targets(query: dict[str, Any]) -> list[int] | None:
         if isinstance(item, dict):
             item = item.get("addr", "")
         try:
-            ea = resolve_address_or_name(item)
+            ea = parse_address(item)
         except Exception:
             continue
         func = compat.get_func(ea)
-        if func is None:
-            try:
-                ea = parse_address(item)
-            except Exception:
-                continue
-            func = compat.get_func(ea)
         if func is not None:
             eas.append(int(func.start_ea))
     return eas

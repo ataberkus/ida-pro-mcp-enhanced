@@ -36,10 +36,10 @@ def _hexrays():
 
 
 def _resolve(addr: str) -> int:
-    from .utils import resolve_address_or_name
+    from .utils import parse_address
 
     try:
-        return resolve_address_or_name(addr)
+        return parse_address(addr)
     except IDAError as exc:
         raise VNextError(ErrorCode.INVALID_OPERATION, str(exc)) from exc
 
@@ -164,13 +164,13 @@ def _num_matches(expr, value: int) -> bool:
 
 
 def _callee(call) -> tuple[int | None, str]:
-    import ida_name
+    from .utils import display_name
 
     hr = _hexrays()
     target = _strip_casts(call.x)
     if target.op == hr.cot_obj:
         ea = int(target.obj_ea)
-        return ea, ida_name.get_name(ea) or hex(ea)
+        return ea, display_name(ea)
     if target.op == hr.cot_helper:
         return None, str(target.helper)
     return None, _text(target)
@@ -236,7 +236,7 @@ def _scan(
     limit: int,
 ) -> dict[str, Any]:
     """Decompile candidates in order, collecting matches until the page plus one is filled."""
-    from .utils import DecompilationError, decompile_checked
+    from .utils import DecompilationError, decompile_checked, display_name
 
     hr = _hexrays()
     wanted = offset + limit + 1
@@ -258,7 +258,7 @@ def _scan(
             if len(errors) < _MAX_ERRORS:
                 errors.append({"func": hex(func_ea), "error": str(exc)})
             continue
-        func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+        func_name = display_name(func_ea)
         found: list[dict[str, Any]] = []
 
         class Visitor(hr.ctree_visitor_t):
@@ -305,7 +305,7 @@ def _callers_of(eas: set[int]) -> set[int]:
     return callers
 
 
-def _with_thunks(ea: int) -> set[int]:
+def with_thunks(ea: int) -> set[int]:
     """The target plus thunks one hop either way (ELF .plt stubs, j_ wrappers)."""
     targets = {ea}
     func = compat.get_func(ea)
@@ -324,14 +324,14 @@ def _with_thunks(ea: int) -> set[int]:
 @tool_timeout(120.0)
 def callsite_args(target: str, offset: int = 0, limit: int = 100) -> dict[str, Any]:
     """Every decompiled call to target with per-argument value/string/address."""
-    import ida_name
+    from .utils import display_name
 
     _hexrays()
     ea = _resolve(target)
     func = compat.get_func(ea)
     if func is not None:
         ea = int(func.start_ea)
-    targets = _with_thunks(ea)
+    targets = with_thunks(ea)
 
     def match(expr) -> dict[str, Any] | None:
         if expr.op != _hexrays().cot_call or _callee(expr)[0] not in targets:
@@ -339,7 +339,63 @@ def callsite_args(target: str, offset: int = 0, limit: int = 100) -> dict[str, A
         return _call_row(expr)
 
     result = _scan(_callers_of(targets), match, max(0, offset), max(1, limit))
-    return {"query": target, "addr": hex(ea), "name": ida_name.get_name(ea) or hex(ea), **result}
+    return {"query": target, "addr": hex(ea), "name": display_name(ea), **result}
+
+
+def _type_names(tif) -> set[str]:
+    names: set[str] = set()
+    for getter in ("get_type_name", "get_final_type_name"):
+        try:
+            name = getattr(tif, getter)()
+        except Exception:
+            name = None
+        if name:
+            names.add(str(name))
+    return names
+
+
+def field_accesses(struct_name: str, byte_offset: int, member_tid: int, limit: int) -> dict[str, Any]:
+    """Decompiled `s.f` / `p->f` accesses to one struct member (caller holds the IDA main thread).
+
+    Candidates: functions with IDA member xrefs, functions whose prototype names
+    the struct, and functions referencing globals typed with it.
+    """
+    import ida_bytes
+    import ida_nalt
+    import ida_typeinf
+
+    hr = _hexrays()
+    mentions = re.compile(rf"(?<![\w:]){re.escape(struct_name)}(?!\w)")
+    candidates: set[int] = set()
+
+    def add_func_of(ea: int) -> None:
+        func = compat.get_func(ea)
+        if func is not None:
+            candidates.add(int(func.start_ea))
+
+    if member_tid != idaapi.BADADDR:
+        for xref in idautils.XrefsTo(member_tid):
+            add_func_of(xref.frm)
+    tif = ida_typeinf.tinfo_t()
+    for ea in idautils.Functions():
+        if ida_nalt.get_tinfo(tif, ea) and mentions.search(str(tif)):
+            candidates.add(int(ea))
+    for ea, _name in idautils.Names():
+        if ida_bytes.is_code(ida_bytes.get_flags(ea)):
+            continue
+        if ida_nalt.get_tinfo(tif, ea) and mentions.search(str(tif)):
+            for xref in idautils.XrefsTo(ea):
+                add_func_of(xref.frm)
+
+    def match(expr) -> dict[str, Any] | None:
+        if expr.op not in (hr.cot_memptr, hr.cot_memref) or int(expr.m) != byte_offset:
+            return None
+        base = expr.x.type
+        if expr.op == hr.cot_memptr:
+            base = base.get_pointed_object()
+        return {} if struct_name in _type_names(base) else None
+
+    return _scan(candidates, match, 0, max(1, limit))
 
 
 def _pattern_candidates(spec: dict[str, Any]) -> set[int]:
@@ -355,7 +411,7 @@ def _pattern_candidates(spec: dict[str, Any]) -> set[int]:
         targets: set[int] = set()
         for ea, name in idautils.Names():
             if callee.search(name):
-                targets |= _with_thunks(int(ea))
+                targets |= with_thunks(int(ea))
         return _callers_of(targets)
     from .api_analysis import find
 

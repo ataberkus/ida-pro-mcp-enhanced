@@ -11,20 +11,25 @@ from .rpc import tool
 from .sync import idasync, tool_timeout, IDAError
 from .utils import (
     parse_address,
+    display_name,
     get_prototype,
     get_callees,
     get_callers,
-    get_all_xrefs,
     get_all_comments,
     extract_function_strings,
     extract_function_constants,
     decompile_function_safe,
     get_assembly_lines,
     normalize_list_input,
+    _collect_callees,
+    _collect_callers,
 )
+from .api_analysis import _capped, _display_rows, _xrefs_section, decompile_excerpt
 
-# Max decompile lines before truncation.
-_DECOMPILE_LINE_CAP = 100
+# Default statement lines in the decompile excerpt (declarations not counted).
+_DECOMPILE_BODY_LINES = 120
+# Cap for callers/callees/xrefs-per-side/comments lists.
+_LIST_CAP = 50
 # Max strings/constants returned in compact mode.
 _TOP_STRINGS = 10
 _TOP_CONSTANTS = 10
@@ -35,13 +40,6 @@ _BORING_CONSTANTS = frozenset({0, 1, -1, 0xFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFFFFF
 # ---------------------------------------------------------------------------
 # Internal helpers (no @tool — called from within @idasync context)
 # ---------------------------------------------------------------------------
-
-def _resolve_addr(addr: str) -> int:
-    """Resolve address or name to ea. Raises IDAError on failure."""
-    from .utils import resolve_address_or_name
-
-    return resolve_address_or_name(addr)
-
 
 def _basic_block_info(ea: int) -> dict:
     """Return block count and cyclomatic complexity for the function at *ea*."""
@@ -76,19 +74,6 @@ def _filter_constants(raw: list[dict], limit: int = _TOP_CONSTANTS) -> list[dict
     return out[:limit]
 
 
-def _cap_decompile(code: str | None) -> tuple[str | None, int | None]:
-    """Cap decompiled output at _DECOMPILE_LINE_CAP lines.
-    Returns (possibly_truncated_code, total_lines_or_None)."""
-    if code is None:
-        return None, None
-    lines = code.split("\n")
-    total = len(lines)
-    if total <= _DECOMPILE_LINE_CAP:
-        return code, None  # not truncated
-    truncated = "\n".join(lines[:_DECOMPILE_LINE_CAP])
-    return truncated, total
-
-
 def _compact_strings(raw: list[dict], limit: int = _TOP_STRINGS) -> list[str]:
     """Return just the string values, deduplicated, capped at limit."""
     seen: set[str] = set()
@@ -104,18 +89,23 @@ def _compact_strings(raw: list[dict], limit: int = _TOP_STRINGS) -> list[str]:
 
 
 def _compact_callees(raw: list[dict]) -> list[str]:
-    """Return just callee names/addresses as strings."""
-    return [c.get("name") or c.get("addr", "?") for c in raw]
+    """Return just callee display names (address when unnamed)."""
+    return [display_name(int(c["addr"], 16)) for c in raw]
 
 
-def _analyze_function_internal(ea: int, *, include_asm: bool = False) -> dict:
+def _analyze_function_internal(
+    ea: int,
+    *,
+    include_asm: bool = False,
+    include_declarations: bool = False,
+    include_comments: bool = False,
+    max_lines: int = _DECOMPILE_BODY_LINES,
+) -> dict:
     """Core analysis logic — must be called from an @idasync context.
 
-    Returns a compact response by default: decompilation capped at 100 lines,
-    top 10 strings as values only, top 10 non-trivial constants, no disassembly.
-    Pass include_asm=True to include full disassembly."""
-    import idaapi
-
+    Compact by default: decompile excerpt of max_lines statement lines (locals
+    summarized as a count), top strings/constants, capped callers/callees/xrefs,
+    no comments, no disassembly."""
     result: dict = {"addr": hex(ea), "error": None}
 
     try:
@@ -123,37 +113,35 @@ def _analyze_function_internal(ea: int, *, include_asm: bool = False) -> dict:
         if func is None:
             result["error"] = f"No function at {hex(ea)}"
             return result
-
-        result["name"] = idaapi.get_func_name(ea) or ""
+        ea = func.start_ea
+        result["addr"] = hex(ea)
+        result["name"] = display_name(ea)
         result["prototype"] = get_prototype(func)
         result["size"] = func.end_ea - func.start_ea
 
-        # Decompilation — capped at _DECOMPILE_LINE_CAP lines.
-        try:
-            raw_code = decompile_function_safe(ea)
-            code, total_lines = _cap_decompile(raw_code)
-            result["decompiled"] = code
-            if total_lines is not None:
-                result["decompile_truncated"] = total_lines
-        except Exception:
+        code = decompile_function_safe(ea)
+        if code is None:
             result["decompiled"] = None
+        else:
+            result.update(decompile_excerpt(code, max_lines, include_declarations))
 
-        # Assembly — opt-in only.
         if include_asm:
-            try:
-                result["assembly"] = get_assembly_lines(ea)
-            except Exception:
-                result["assembly"] = None
+            result["assembly"] = get_assembly_lines(ea)
 
-        # Strings — top 10 values only.
         result["strings"] = _compact_strings(extract_function_strings(ea))
-        # Constants — top 10 non-trivial.
         result["constants"] = _filter_constants(extract_function_constants(ea))
-        # Callees/callers — names only.
-        result["callees"] = _compact_callees(get_callees(hex(ea)))
-        result["callers"] = _compact_callees(get_callers(hex(ea)))
-        result["xrefs"] = get_all_xrefs(ea)
-        result["comments"] = get_all_comments(ea)
+        for section in (
+            _capped("callees", "callee_count", _collect_callees(func, call_only=True), _LIST_CAP),
+            _capped("callers", "caller_count", _collect_callers(func), _LIST_CAP),
+        ):
+            result.update(section)
+        result["callees"] = _display_rows(result["callees"])
+        result["callers"] = _display_rows(result["callers"])
+        result["xrefs"] = _xrefs_section(ea, _LIST_CAP)
+        if include_comments:
+            comments = get_all_comments(ea)
+            result["comments"] = dict(list(comments.items())[:_LIST_CAP])
+            result["comment_count"] = len(comments)
         result["basic_blocks"] = _basic_block_info(ea)
 
     except Exception as exc:
@@ -173,18 +161,27 @@ def _analyze_function_internal(ea: int, *, include_asm: bool = False) -> dict:
 def analyze_function(
     addr: Annotated[str, "Function address or name"],
     include_asm: Annotated[bool, "Include full disassembly (default: false, saves tokens)"] = False,
+    include_declarations: Annotated[bool, "Keep local-variable declarations in the excerpt"] = False,
+    include_comments: Annotated[bool, "Include instruction comments (IDA auto-comments included)"] = False,
+    max_lines: Annotated[int, "Statement lines in the decompile excerpt (default 120)"] = _DECOMPILE_BODY_LINES,
 ) -> dict:
     """Prefer analysis_run(mode="function", targets=[addr], ...) for canonical single-function analysis.
-    WHEN: compact single-function brief (capped pseudocode, top strings/constants, callers/callees, xrefs, block metrics).
-    RETURNS: {addr, name?, prototype?, size?, decompile?, strings?, constants?, callers?, callees?, xrefs?, blocks?, error?}.
-    LIMITS: decompile capped at 100 lines; pass include_asm=true only for raw instructions (crypto/shellcode/decompiler failure)."""
+    WHEN: compact single-function brief (pseudocode excerpt, top strings/constants, callers/callees, xrefs, block metrics).
+    RETURNS: {addr, name, prototype, size, decompiled, declarations, decompile_truncated, next_line_offset, strings, constants, callers[{addr,name}], caller_count, callees[{addr,name}], callee_count, xrefs{to,from,*_count}, comments?, basic_blocks, error}.
+    LIMITS: excerpt = header + max_lines statement lines; lists capped at 50 with totals; pass include_asm=true only for raw instructions."""
 
     try:
-        ea = _resolve_addr(addr)
+        ea = parse_address(addr)
     except IDAError as exc:
         return {"addr": addr, "error": str(exc)}
 
-    return _analyze_function_internal(ea, include_asm=include_asm)
+    return _analyze_function_internal(
+        ea,
+        include_asm=include_asm,
+        include_declarations=include_declarations,
+        include_comments=include_comments,
+        max_lines=max(0, int(max_lines)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +210,9 @@ def analyze_component(
     ea_map: dict[int, str] = {}
     for a in raw:
         try:
-            ea_map[_resolve_addr(a)] = a
-        except IDAError:
-            return {"error": f"Cannot resolve address: {a!r}"}
+            ea_map[parse_address(a)] = a
+        except IDAError as exc:
+            return {"error": str(exc)}
 
     ea_set = set(ea_map.keys())
 
@@ -240,7 +237,7 @@ def analyze_component(
                 entry["fallback"] = {"tool": "disassemble", "addr": hex(ea)}
             functions.append(entry)
             continue
-        name = idaapi.get_func_name(ea) or ""
+        name = display_name(ea)
         strings_raw = extract_function_strings(ea)
         top_strings = _compact_strings(strings_raw, limit=5)
         callee_list = _compact_callees(get_callees(hex(ea)))
@@ -271,7 +268,7 @@ def analyze_component(
                 edges.append({
                     "from": hex(ea),
                     "to": hex(callee_ea),
-                    "name": callee.get("name", ""),
+                    "name": display_name(callee_ea),
                 })
 
     # --- Shared globals ---
@@ -293,7 +290,7 @@ def analyze_component(
 
     global_refcount: dict[int, list[str]] = defaultdict(list)
     for ea, gset in func_globals.items():
-        fname = idaapi.get_func_name(ea) or hex(ea)
+        fname = display_name(ea)
         for g in gset:
             global_refcount[g].append(fname)
 
@@ -302,7 +299,7 @@ def analyze_component(
         if len(accessors) >= 2:
             shared_globals.append({
                 "addr": hex(g_ea),
-                "name": idaapi.get_name(g_ea) or hex(g_ea),
+                "name": display_name(g_ea),
                 "accessed_by": sorted(accessors),
             })
 
@@ -331,7 +328,7 @@ def analyze_component(
     # --- String usage across functions ---
     string_funcs: dict[str, set[str]] = defaultdict(set)
     for ea in ea_set:
-        fname = idaapi.get_func_name(ea) or hex(ea)
+        fname = display_name(ea)
         for s in (extract_function_strings(ea) or []):
             sval = s.get("value") or s.get("string", "")
             if sval:
@@ -384,7 +381,7 @@ def trace_data_flow(
         return {"error": f"direction must be 'forward', 'backward', or 'both', got {direction!r}"}
 
     try:
-        start_ea = _resolve_addr(addr)
+        start_ea = parse_address(addr)
     except IDAError as exc:
         return {"error": str(exc)}
 
