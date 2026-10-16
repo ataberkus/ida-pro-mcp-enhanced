@@ -426,6 +426,13 @@ def _apply_projection(items: list[dict], fields: list[str] | None) -> list[dict]
 def _build_health_payload() -> dict:
     auto_is_ok = getattr(ida_auto, "auto_is_ok", None)
     auto_analysis_ready = bool(auto_is_ok()) if callable(auto_is_ok) else None
+    # IDA 9.4 leaves auto_is_ok() False after Hex-Rays decompilation even when
+    # no analysis is queued (get_auto_state() == AU_NONE). Draining the empty
+    # queue returns immediately and clears the stale flag; real pending
+    # analysis keeps a non-AU_NONE state and is still reported as not ready.
+    if auto_analysis_ready is False and ida_auto.get_auto_state() == ida_auto.AU_NONE:
+        ida_auto.auto_wait()
+        auto_analysis_ready = bool(auto_is_ok())
 
     hexrays_ready = False
     try:
